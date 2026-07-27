@@ -8,6 +8,7 @@ import subprocess
 import sys
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -19,12 +20,15 @@ from rvw import __version__
 from rvw.adjudicate import AdjudicationOutcome, adjudicate
 from rvw.discover import DiscoverResult, discover, resolve_lane_path
 from rvw.dispatch import PlannedRun, lpt_sort_key
+from rvw.doctor import DoctorReport, diagnose
 from rvw.lane import Lane, load_lane
-from rvw.merge import merge
+from rvw.merge import MergeResult, merge
+from rvw.policy import evaluate, load_policy
 from rvw.publish import publish_review
 from rvw.registry import Registry, load_registry
 from rvw.report import render_report
 from rvw.runtimes.codex import CodexRuntime
+from rvw.sample import SampleReport, sample_lane
 from rvw.schema import Tier, Verdict, finding_schema, lane_output_schema
 from rvw.store import RunHandle, RunNotFound, RunStore, StageMissing
 from rvw.target import ResolvedTarget, TargetResolutionError, resolve_target
@@ -34,6 +38,7 @@ EXIT_NOT_FOUND = 1
 EXIT_USER_ERROR = 2
 EXIT_SYSTEM_ERROR = 3
 DEFAULT_REGISTRY_ROOT = Path("~/.hermes/review").expanduser()
+DEFAULT_AUTO_POLICY = Path("~/.hermes/review/policies/auto.yaml").expanduser()
 _PLAN_REPLICAS = 3
 DEFAULT_RUN_ROOT = Path("/tmp/rvw")
 
@@ -62,6 +67,17 @@ _console = Console()
 _error_console = Console(stderr=True)
 Option = cast(Callable[..., object], typer.Option)
 Argument = cast(Callable[..., object], typer.Argument)
+
+
+@dataclass(frozen=True)
+class _PipelineArtifacts:
+    run: RunHandle
+    target: ResolvedTarget
+    discovered: DiscoverResult
+    merged: MergeResult
+    outcome: AdjudicationOutcome | None
+    report_md: str
+    report_path: Path
 
 
 def _write_json(payload: Any) -> None:
@@ -394,11 +410,75 @@ async def _review_pipeline(
     publish: bool,
     dynamic_brief: Path | None,
 ) -> None:
+    resolved_target: ResolvedTarget | None = None
+    if publish:
+        resolved_target = _resolve_cli_target(target_spec)
+        if resolved_target.kind != "pr":
+            _error_console.print("--publish requires a PR target", markup=False)
+            raise typer.Exit(EXIT_USER_ERROR)
+    artifacts = await _execute_pipeline(
+        target_spec=target_spec,
+        repo_dir=repo_dir,
+        registry_root=registry_root,
+        replicas=replicas,
+        out_root=out_root,
+        pause=pause,
+        dynamic_brief=dynamic_brief,
+        resolved_target=resolved_target,
+    )
+    if artifacts is None:
+        return
+
+    publication_url: str | None = None
+    payload_path: Path | None = None
+    if artifacts.target.kind == "pr" and artifacts.target.pr_number is not None:
+        publication = publish_review(
+            run=artifacts.run,
+            repo=artifacts.target.repo,
+            pr_number=artifacts.target.pr_number,
+            report_md=artifacts.report_md,
+            merged=artifacts.merged,
+            outcome=artifacts.outcome,
+            execute=publish,
+        )
+        publication_url = publication.review_url
+        if not publish:
+            payload_path = artifacts.run.dir / "publish-payload.json"
+
+    if json_output:
+        _write_json(
+            {
+                "run_id": artifacts.run.run_id,
+                "report_path": str(artifacts.report_path),
+                "verdict_counts": _verdict_counts(artifacts.outcome),
+                "coverage_totals": _coverage_totals(artifacts.discovered),
+            }
+        )
+        return
+
+    _console.print(f"run id: {artifacts.run.run_id}", markup=False, soft_wrap=True)
+    _console.print(f"report: {artifacts.report_path}", markup=False, soft_wrap=True)
+    if payload_path is not None:
+        _console.print(f"dry-run payload: {payload_path}", markup=False, soft_wrap=True)
+    if publication_url is not None:
+        _console.print(f"review: {publication_url}", markup=False, soft_wrap=True)
+
+
+async def _execute_pipeline(
+    *,
+    target_spec: str,
+    repo_dir: Path | None,
+    registry_root: Path,
+    replicas: int,
+    out_root: Path,
+    pause: bool,
+    dynamic_brief: Path | None,
+    resolved_target: ResolvedTarget | None = None,
+) -> _PipelineArtifacts | None:
+    """Execute and persist common review stages without publishing or rendering CLI output."""
+
     registry, lanes_root = _load_registry_root(registry_root)
-    target = _resolve_cli_target(target_spec)
-    if publish and target.kind != "pr":
-        _error_console.print("--publish requires a PR target", markup=False)
-        raise typer.Exit(EXIT_USER_ERROR)
+    target = resolved_target or _resolve_cli_target(target_spec)
 
     run = RunStore(out_root).create(target)
     run.save_target(target)
@@ -425,7 +505,7 @@ async def _review_pipeline(
             f"paused after MERGE — resume: rvw report --run {run.run_id}",
             markup=False,
         )
-        return
+        return None
 
     outcome: AdjudicationOutcome | None = None
     if repo_dir is None:
@@ -455,40 +535,96 @@ async def _review_pipeline(
     )
     run.save_report(report_md)
     report_path = run.dir / "report.md"
+    return _PipelineArtifacts(
+        run=run,
+        target=target,
+        discovered=discovered,
+        merged=merged,
+        outcome=outcome,
+        report_md=report_md,
+        report_path=report_path,
+    )
 
-    publication_url: str | None = None
-    payload_path: Path | None = None
-    if target.kind == "pr" and target.pr_number is not None:
-        publication = publish_review(
-            run=run,
-            repo=target.repo,
-            pr_number=target.pr_number,
-            report_md=report_md,
-            merged=merged,
-            outcome=outcome,
-            execute=publish,
+
+@app.command()
+def auto(
+    target: Annotated[str, Option("--target")],
+    repo_dir: Annotated[
+        Path | None,
+        Option("--repo-dir", help="Provisioned checkout used for adjudication."),
+    ] = None,
+    policy_path: Annotated[Path, Option("--policy")] = DEFAULT_AUTO_POLICY,
+    publish: Annotated[bool | None, Option("--publish/--no-publish")] = None,
+    allow_approve: Annotated[bool, Option("--allow-approve")] = False,
+    json_output: Annotated[bool, Option("--json")] = False,
+) -> None:
+    if allow_approve:
+        _error_console.print(
+            "approve publishing is not implemented (ADR-009 Phase-5 opt-in placeholder)",
+            markup=False,
         )
-        publication_url = publication.review_url
-        if not publish:
-            payload_path = run.dir / "publish-payload.json"
+    asyncio.run(
+        _auto_pipeline(
+            target_spec=target,
+            repo_dir=repo_dir,
+            policy_path=policy_path,
+            publish=publish,
+            json_output=json_output,
+        )
+    )
 
+
+async def _auto_pipeline(
+    *,
+    target_spec: str,
+    repo_dir: Path | None,
+    policy_path: Path,
+    publish: bool | None,
+    json_output: bool,
+) -> None:
+    policy = load_policy(policy_path)
+    artifacts = await _execute_pipeline(
+        target_spec=target_spec,
+        repo_dir=repo_dir,
+        registry_root=DEFAULT_REGISTRY_ROOT,
+        replicas=_PLAN_REPLICAS,
+        out_root=DEFAULT_RUN_ROOT,
+        pause=False,
+        dynamic_brief=None,
+    )
+    if artifacts is None:
+        raise RuntimeError("auto pipeline stopped before report generation")
+
+    decision = evaluate(policy, artifacts.merged, artifacts.outcome)
+    should_publish = policy.publish_state == "comment" if publish is None else publish
+    if should_publish and artifacts.target.kind == "pr" and artifacts.target.pr_number is not None:
+        publish_review(
+            run=artifacts.run,
+            repo=artifacts.target.repo,
+            pr_number=artifacts.target.pr_number,
+            report_md=artifacts.report_md,
+            merged=artifacts.merged,
+            outcome=artifacts.outcome,
+            execute=True,
+        )
+
+    payload = {
+        "run_id": artifacts.run.run_id,
+        "verdict": decision.verdict,
+        "blocking": decision.blocking,
+        "dropped": decision.dropped,
+        "promoted": decision.promoted,
+        "considered": decision.considered,
+        "report_path": str(artifacts.report_path),
+    }
     if json_output:
-        _write_json(
-            {
-                "run_id": run.run_id,
-                "report_path": str(report_path),
-                "verdict_counts": _verdict_counts(outcome),
-                "coverage_totals": _coverage_totals(discovered),
-            }
-        )
-        return
-
-    _console.print(f"run id: {run.run_id}", markup=False, soft_wrap=True)
-    _console.print(f"report: {report_path}", markup=False, soft_wrap=True)
-    if payload_path is not None:
-        _console.print(f"dry-run payload: {payload_path}", markup=False, soft_wrap=True)
-    if publication_url is not None:
-        _console.print(f"review: {publication_url}", markup=False, soft_wrap=True)
+        _write_json(payload)
+    else:
+        _console.print(f"run id: {artifacts.run.run_id}", markup=False, soft_wrap=True)
+        _console.print(f"verdict: {decision.verdict}", markup=False)
+        _console.print(f"report: {artifacts.report_path}", markup=False, soft_wrap=True)
+    if decision.verdict == "BLOCK":
+        raise typer.Exit(EXIT_NOT_FOUND)
 
 
 @app.command()
@@ -641,15 +777,147 @@ def lanes_show(
     _console.print(path.read_text(encoding="utf-8"), markup=False, highlight=False, soft_wrap=True)
 
 
+def _print_doctor(report: DoctorReport) -> None:
+    _console.print(f"Runs scanned: {report.runs_scanned}", markup=False)
+    table = Table(title="Lane health")
+    table.add_column("Lane")
+    table.add_column("Runs", justify="right")
+    table.add_column("Invalid", justify="right")
+    table.add_column("Findings", justify="right")
+    table.add_column("Other rate", justify="right")
+    table.add_column("Flags")
+    for stat in report.lanes:
+        flags = []
+        if stat.invalid > 0:
+            flags.append("invalid")
+        if stat.other_rate > 0.2:
+            flags.append("other>20%")
+        table.add_row(
+            stat.lane_id,
+            str(stat.runs),
+            str(stat.invalid),
+            str(stat.findings),
+            f"{stat.other_rate:.1%}",
+            ", ".join(flags) or "—",
+        )
+    _console.print(table)
+    if report.adjudication is None:
+        _console.print("Adjudication: no outcome stages found", markup=False)
+        return
+    stat = report.adjudication
+    _console.print(
+        "Adjudication:\n"
+        f"  groups: {stat.groups}\n"
+        f"  confirmed: {stat.confirmed}\n"
+        f"  rejected: {stat.rejected}\n"
+        f"  uncertain/unresolved: {stat.uncertain_unresolved}\n"
+        f"  rejection rate: {stat.rejection_rate:.1%}\n"
+        f"  coerced rejections: {stat.coerced_rejections}",
+        markup=False,
+    )
+
+
 @app.command()
-def doctor() -> None:
-    _stub(5)
+def doctor(
+    store_root: Annotated[Path, Option("--store")] = DEFAULT_RUN_ROOT,
+    last: Annotated[int, Option("--last", min=1)] = 20,
+    json_output: Annotated[bool, Option("--json")] = False,
+) -> None:
+    report = diagnose(RunStore(store_root), last=last)
+    if json_output:
+        _write_json(report.model_dump(mode="json"))
+    else:
+        _print_doctor(report)
+
+
+def _fixture_diff(fixture: Path) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", "diff", "--no-index", "--", "/dev/null", str(fixture)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        raise ValueError(f"could not build fixture diff: {exc}") from exc
+    if completed.returncode not in {0, 1}:
+        detail = completed.stderr.strip() or f"git exited {completed.returncode}"
+        raise ValueError(f"could not build fixture diff: {detail}")
+    return completed.stdout
+
+
+def _print_sample(report: SampleReport) -> None:
+    table = Table(title=f"Lane sample: {report.lane_id}")
+    table.add_column("Variant")
+    table.add_column("Rule ID")
+    table.add_column("Line", justify="right")
+    table.add_column("Delta")
+    enum_only = set(report.enum_only)
+    free_only = set(report.free_only)
+    for rule_id, line in report.enum_findings:
+        table.add_row(
+            "enum",
+            rule_id,
+            str(line) if line is not None else "—",
+            "enum-only" if (rule_id, line) in enum_only else "",
+        )
+    for rule_id, line in report.free_findings:
+        table.add_row(
+            "free",
+            rule_id,
+            str(line) if line is not None else "—",
+            "free-only" if (rule_id, line) in free_only else "",
+        )
+    _console.print(table)
+    _console.print(f"Verdict: {report.verdict}", markup=False)
 
 
 @app.command()
 def sample(
-    lane: Annotated[str | None, Option("--lane")] = None,
-    fixture: Annotated[Path | None, Option("--fixture")] = None,
-    compare_free: Annotated[bool, Option("--compare-free")] = False,
+    lane_id: Annotated[str, Option("--lane")],
+    fixture: Annotated[Path, Option("--fixture")],
+    registry_root: Annotated[
+        Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")
+    ] = DEFAULT_REGISTRY_ROOT,
+    replicas: Annotated[int, Option("--replicas", min=1)] = 3,
+    out_root: Annotated[Path, Option("--out")] = Path("/tmp/rvw-sample"),
+    json_output: Annotated[bool, Option("--json")] = False,
 ) -> None:
-    _stub(5)
+    registry, lanes_root = _load_registry_root(registry_root)
+    owner = next(
+        (
+            (registered_id, tier)
+            for registered_id, tier in _registered_lane_owners(registry)
+            if registered_id == lane_id
+        ),
+        None,
+    )
+    if owner is None:
+        _error_console.print(f"unknown lane: {lane_id}", markup=False)
+        raise typer.Exit(EXIT_NOT_FOUND)
+    lane = load_lane(resolve_lane_path(lanes_root, owner[0], owner[1]))
+    try:
+        fixture_diff = _fixture_diff(fixture)
+    except ValueError as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_USER_ERROR) from exc
+    report = asyncio.run(
+        sample_lane(
+            lane,
+            fixture_diff=fixture_diff,
+            runtime=CodexRuntime(),
+            out_root=out_root,
+            replicas=replicas,
+        )
+    )
+    if json_output:
+        _write_json(asdict(report))
+    else:
+        _print_sample(report)
+        if report.verdict == "PASS":
+            _console.print(
+                f"lane '{lane.id}' may drop 'validation: pending' — edit the lane doc to promote it.",
+                markup=False,
+            )
+    if report.verdict == "REVIEW":
+        raise typer.Exit(EXIT_NOT_FOUND)

@@ -1,0 +1,261 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Literal, cast
+
+import pytest
+from typer.testing import CliRunner
+
+import rvw.cli as cli_module
+import rvw.publish as publish_module
+from rvw.adjudicate import AdjudicationOutcome
+from rvw.discover import DiscoverResult, EnrichedFinding
+from rvw.merge import merge
+from rvw.sample import SampleReport
+from rvw.schema import Tier, Verdict
+from rvw.store import RunStore
+from rvw.target import ResolvedTarget
+
+runner = CliRunner()
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def policy_file(tmp_path: Path, publish_state: str = "comment") -> Path:
+    path = tmp_path / "auto.yaml"
+    path.write_text(
+        f"""promote_to_blocker:
+  agreement_at_least: 2
+  severity_at_least: warning
+drop:
+  agreement_at_most: 1
+  severity_at_most: suggestion
+block_when:
+  severity_at_least: blocker
+publish_state: {publish_state}
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def target() -> ResolvedTarget:
+    return ResolvedTarget(
+        kind="pr",
+        repo="owner/repo",
+        base_sha="a" * 40,
+        head_sha="b" * 40,
+        changed_paths=["a.py"],
+        diff="diff --git a/a.py b/a.py\n",
+        pr_number=42,
+    )
+
+
+def fixture_artifacts(tmp_path: Path, *, adjudicated: bool) -> cli_module._PipelineArtifacts:
+    raw_findings = json.loads((FIXTURES / "smoke_1119_findings.json").read_text(encoding="utf-8"))
+    findings = [EnrichedFinding.model_validate(item) for item in raw_findings]
+    lane_tiers = {
+        finding.lane_id: (Tier.DYNAMIC if finding.lane_id.startswith("dynamic/") else Tier.BASE)
+        for finding in findings
+    }
+    merged = merge(findings, lane_tiers=lane_tiers)
+    outcome = None
+    if adjudicated:
+        raw = json.loads((FIXTURES / "smoke_1119_outcome.json").read_text(encoding="utf-8"))
+        outcome = AdjudicationOutcome(
+            verdicts={key: Verdict(value) for key, value in raw["verdicts"].items()},
+            reasons=raw["reasons"],
+            evidence=raw["evidence"],
+            replica_votes={
+                key: [Verdict(value) for value in votes]
+                for key, votes in raw["replica_votes"].items()
+            },
+            unresolved=raw["unresolved"],
+            coerced_rejections=raw["coerced_rejections"],
+        )
+    run = RunStore(tmp_path / "runs").create(target())
+    report_path = run.dir / "report.md"
+    report_path.write_text("# report\n", encoding="utf-8")
+    return cli_module._PipelineArtifacts(
+        run=run,
+        target=target(),
+        discovered=DiscoverResult(lane_results={}, findings=findings, coverage=[]),
+        merged=merged,
+        outcome=outcome,
+        report_md="# report\n",
+        report_path=report_path,
+    )
+
+
+def patch_pipeline(
+    monkeypatch: pytest.MonkeyPatch, artifacts: cli_module._PipelineArtifacts
+) -> None:
+    async def fake_execute_pipeline(**kwargs: object) -> cli_module._PipelineArtifacts:
+        del kwargs
+        return artifacts
+
+    monkeypatch.setattr(cli_module, "_execute_pipeline", fake_execute_pipeline)
+
+
+@pytest.mark.parametrize(
+    ("adjudicated", "verdict", "exit_code"),
+    [(False, "PASS", 0), (True, "BLOCK", 1)],
+)
+def test_auto_json_verdict_and_exit_mapping(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    adjudicated: bool,
+    verdict: str,
+    exit_code: int,
+) -> None:
+    artifacts = fixture_artifacts(tmp_path, adjudicated=adjudicated)
+    patch_pipeline(monkeypatch, artifacts)
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "auto",
+            "--target",
+            "42",
+            "--policy",
+            str(policy_file(tmp_path, "none")),
+            "--json",
+        ],
+    )
+    assert result.exit_code == exit_code, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["verdict"] == verdict
+    assert set(payload) == {
+        "run_id",
+        "verdict",
+        "blocking",
+        "dropped",
+        "promoted",
+        "considered",
+        "report_path",
+    }
+
+
+def test_auto_policy_none_skips_publish(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    patch_pipeline(monkeypatch, fixture_artifacts(tmp_path, adjudicated=False))
+
+    def forbidden_publish(**kwargs: object) -> None:
+        raise AssertionError(f"publish called: {kwargs}")
+
+    monkeypatch.setattr(cli_module, "publish_review", forbidden_publish)
+    result = runner.invoke(
+        cli_module.app,
+        ["auto", "--target", "42", "--policy", str(policy_file(tmp_path, "none"))],
+    )
+    assert result.exit_code == 0, result.stdout
+
+
+def test_allow_approve_is_placeholder_and_payload_remains_comment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    patch_pipeline(monkeypatch, fixture_artifacts(tmp_path, adjudicated=False))
+    payloads: list[dict[str, object]] = []
+
+    def fake_run(cmd: list[str], input_json: str) -> str:
+        del cmd
+        payloads.append(json.loads(input_json))
+        return json.dumps({"html_url": "https://example.test/review/1"})
+
+    monkeypatch.setattr(publish_module, "_run", fake_run)
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "auto",
+            "--target",
+            "42",
+            "--policy",
+            str(policy_file(tmp_path)),
+            "--allow-approve",
+        ],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "approve publishing is not implemented" in result.stderr
+    assert payloads and {payload["event"] for payload in payloads} == {"COMMENT"}
+
+
+@pytest.fixture
+def sample_registry(tmp_path: Path) -> Path:
+    root = tmp_path / "registry"
+    lanes = root / "lanes" / "base"
+    lanes.mkdir(parents=True)
+    (root / "layers.yaml").write_text(
+        "layers:\n  - id: base\n    tier: base\n    lanes: [test-lane]\n",
+        encoding="utf-8",
+    )
+    (lanes / "test-lane.md").write_text(
+        """---
+lane: test-lane
+tier: base
+rules: [test/rule]
+validation: pending
+---
+Find issues.
+""",
+        encoding="utf-8",
+    )
+    fixture = tmp_path / "fixture.py"
+    fixture.write_text("problem = True\n", encoding="utf-8")
+    return root
+
+
+@pytest.mark.parametrize(("verdict", "exit_code"), [("PASS", 0), ("REVIEW", 1)])
+def test_sample_exit_codes_and_pass_hint(
+    tmp_path: Path,
+    sample_registry: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    verdict: str,
+    exit_code: int,
+) -> None:
+    async def fake_sample(*args: object, **kwargs: object) -> SampleReport:
+        del args, kwargs
+        return SampleReport(
+            lane_id="test-lane",
+            enum_findings=[("test/rule", 1)],
+            free_findings=[("free/rule", 1)],
+            enum_only=[],
+            free_only=[] if verdict == "PASS" else [("free/extra", 2)],
+            verdict=cast(Literal["PASS", "REVIEW"], verdict),
+            replicas=3,
+        )
+
+    monkeypatch.setattr(cli_module, "sample_lane", fake_sample)
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "sample",
+            "--lane",
+            "test-lane",
+            "--fixture",
+            str(tmp_path / "fixture.py"),
+            "--registry",
+            str(sample_registry),
+        ],
+    )
+    assert result.exit_code == exit_code, result.stdout
+    assert ("may drop 'validation: pending'" in result.stdout) is (verdict == "PASS")
+
+
+def test_doctor_cli_empty_and_fixture_store(tmp_path: Path) -> None:
+    empty = runner.invoke(cli_module.app, ["doctor", "--store", str(tmp_path / "empty")])
+    run = tmp_path / "store" / "run"
+    run.mkdir(parents=True)
+    (run / "discover.json").write_text(
+        json.dumps(
+            {
+                "findings": [],
+                "coverage": [{"lane_id": "lane", "dispatched": 3, "valid": 2, "findings": 0}],
+                "budget": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+    populated = runner.invoke(cli_module.app, ["doctor", "--store", str(tmp_path / "store")])
+    assert empty.exit_code == 0
+    assert "Runs scanned: 0" in empty.stdout
+    assert populated.exit_code == 0
+    assert "lane" in populated.stdout
+    assert "invalid" in populated.stdout
