@@ -99,7 +99,6 @@ def pr_responses(number: int) -> dict[Command, str | Exception]:
         "title": "Fix widget race",
         "body": "Synchronizes widget updates.",
         "headRefOid": "head123",
-        "baseRefOid": "base123",
         "headRefName": "fix/widget-race",
     }
     return {
@@ -110,8 +109,12 @@ def pr_responses(number: int) -> dict[Command, str | Exception]:
             "view",
             str(number),
             "--json",
-            "number,title,body,headRefOid,baseRefOid,headRefName",
+            "number,title,body,headRefOid,headRefName",
         ): json.dumps(metadata),
+        # gh pr view --json does NOT expose baseRefOid (live-verified 2026-07-27);
+        # the recorded base SHA comes from the REST pulls endpoint instead.
+        ("gh", "api", f"repos/octo/widgets/pulls/{number}", "--jq", ".base.sha"): "base123\n",
+        ("gh", "api", f"repos/acme/rockets/pulls/{number}", "--jq", ".base.sha"): "base123\n",
         ("gh", "pr", "diff", str(number)): "pr diff\n",
         ("gh", "pr", "diff", str(number), "--name-only"): "src/widget.py\n",
     }

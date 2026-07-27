@@ -17,7 +17,7 @@ _PR_URL = re.compile(
     r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<name>[^/\s]+)/pull/(?P<number>\d+)"
     r"(?:[/?#]|$)"
 )
-_PR_FIELDS = "number,title,body,headRefOid,baseRefOid,headRefName"
+_PR_FIELDS = "number,title,body,headRefOid,headRefName"
 
 
 class ResolvedTarget(BaseModel):
@@ -56,7 +56,6 @@ class _PrView(BaseModel):
     title: str
     body: str | None
     headRefOid: str
-    baseRefOid: str
     headRefName: str
 
 
@@ -159,6 +158,17 @@ def _resolve_commit(spec: str, cwd: Path) -> ResolvedTarget:
     )
 
 
+def _pr_base_sha(number: int, repo: str, cwd: Path) -> str:
+    """Fetch the recorded base SHA via REST.
+
+    `gh pr view --json` does not expose `baseRefOid` (verified live 2026-07-27);
+    the REST pulls endpoint is the documented source for the recorded base SHA.
+    """
+
+    raw = _run(["gh", "api", f"repos/{repo}/pulls/{number}", "--jq", ".base.sha"], cwd)
+    return raw.strip()
+
+
 def _resolve_pr(number: int, cwd: Path, repo_from_url: str | None = None) -> ResolvedTarget:
     repo = repo_from_url or _repo_name(cwd)
     raw = _run(["gh", "pr", "view", str(number), "--json", _PR_FIELDS], cwd)
@@ -168,7 +178,7 @@ def _resolve_pr(number: int, cwd: Path, repo_from_url: str | None = None) -> Res
     return ResolvedTarget(
         kind="pr",
         repo=repo,
-        base_sha=metadata.baseRefOid,
+        base_sha=_pr_base_sha(number, repo, cwd),
         head_sha=metadata.headRefOid,
         changed_paths=[line for line in names.splitlines() if line],
         diff=diff,
