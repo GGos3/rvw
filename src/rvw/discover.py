@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from rvw.diffbudget import DiffBudgetReport, apply_diff_budget
 from rvw.dispatch import PlannedRun, dispatch
 from rvw.hunks import hunk_for_line, is_anchorable, parse_hunks
 from rvw.lane import load_lane
@@ -43,6 +44,7 @@ class DiscoverResult:
     lane_results: dict[str, list[RunResult]]
     findings: list[EnrichedFinding]
     coverage: list[LaneCoverage]
+    budget: DiffBudgetReport | None = None
 
 
 def resolve_lane_path(lanes_root: Path, lane_id: str, tier: Tier) -> Path:
@@ -111,11 +113,12 @@ async def discover(
     owners = _active_lane_owners(registry, target, lane_filter)
     lanes = [load_lane(resolve_lane_path(lanes_root, lane_id, tier)) for lane_id, tier in owners]
     effective_brief, effective_brief_source = _effective_brief(target, brief, brief_source)
+    review_diff, budget = apply_diff_budget(target.diff)
     covered_rules = {lane.id: lane.rules for lane in lanes}
     prompts = {
         lane.id: build_lane_prompt(
             lane,
-            diff=target.diff,
+            diff=review_diff,
             brief=effective_brief,
             brief_source=effective_brief_source,
             covered_rules=covered_rules,
@@ -173,7 +176,12 @@ async def discover(
             )
         )
 
-    return DiscoverResult(lane_results=lane_results, findings=enriched, coverage=coverage)
+    return DiscoverResult(
+        lane_results=lane_results,
+        findings=enriched,
+        coverage=coverage,
+        budget=budget,
+    )
 
 
 __all__: list[str] = [

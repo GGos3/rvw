@@ -292,3 +292,43 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
         "findings": 0,
     }
     assert len(runtime.calls) == 6  # two good + two initial bad + two retry bad
+
+
+async def test_diff_budget_filters_prompt_but_keeps_full_changed_paths(tmp_path: Path) -> None:
+    lanes_root = tmp_path / "lanes"
+    write_lane(lanes_root, "base-review", Tier.BASE)
+    source_diff = target().diff
+    generated_path = "runtime-snapshots/contract-graph.json"
+    generated_diff = (
+        f"diff --git a/{generated_path} b/{generated_path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{generated_path}\n"
+        "@@ -0,0 +1 @@\n"
+        "+generated\n"
+    )
+    budget_target = target().model_copy(
+        update={
+            "changed_paths": ["src/a.py", generated_path],
+            "diff": generated_diff + source_diff,
+        }
+    )
+    runtime = FakeRuntime()
+
+    result = await discover(
+        registry=registry(("base-review", Tier.BASE)),
+        lanes_root=lanes_root,
+        target=budget_target,
+        runtime=runtime,
+        out_root=tmp_path / "out",
+        replicas=1,
+    )
+
+    prompt = runtime.prompts[0][1]
+    assert source_diff in prompt
+    assert generated_diff not in prompt
+    assert "# rvw: 1 files excluded from review diff" in prompt
+    assert budget_target.changed_paths == ["src/a.py", generated_path]
+    assert result.budget is not None
+    assert result.budget.kept_files == ["src/a.py"]
+    assert result.budget.excluded_reason == {generated_path: "generated-path"}
