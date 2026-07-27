@@ -30,7 +30,7 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "pytest-cov>=5.0.0",
     "ruff>=0.6.0",
-    "pyright>=1.1.380",
+    "ty>=0.0.1a14",
     "pre-commit>=3.7.0",
     "types-pyyaml>=6.0.12",
 ]
@@ -67,12 +67,11 @@ ignore = [
 quote-style = "double"
 indent-style = "space"
 
-[tool.pyright]
+[tool.ty.environment]
+python-version = "3.11"
+
+[tool.ty.src]
 include = ["src", "tests"]
-exclude = ["**/__pycache__", ".venv"]
-pythonVersion = "3.11"
-typeCheckingMode = "strict"
-reportMissingTypeStubs = false
 
 [tool.pytest.ini_options]
 minversion = "8.0"

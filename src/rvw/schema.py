@@ -47,9 +47,7 @@ class RuntimeLaneOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     verdict: str
-    findings: list[RuntimeFinding] = Field(  # pyright: ignore[reportUnknownVariableType]
-        default_factory=list
-    )
+    findings: list[RuntimeFinding] = Field(default_factory=list)
 
 
 class Finding(BaseModel):
@@ -75,9 +73,7 @@ class LaneOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     verdict: str
-    findings: list[Finding] = Field(  # pyright: ignore[reportUnknownVariableType]
-        default_factory=list
-    )
+    findings: list[Finding] = Field(default_factory=list)
 
 
 def finding_schema() -> dict[str, Any]:

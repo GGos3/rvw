@@ -51,8 +51,8 @@ app.add_typer(lanes_app, name="lanes")
 
 _console = Console()
 _error_console = Console(stderr=True)
-Option = cast(Callable[..., object], typer.Option)  # pyright: ignore[reportUnknownMemberType]
-Argument = cast(Callable[..., object], typer.Argument)  # pyright: ignore[reportUnknownMemberType]
+Option = cast(Callable[..., object], typer.Option)
+Argument = cast(Callable[..., object], typer.Argument)
 
 
 def _write_json(payload: Any) -> None:
@@ -281,7 +281,7 @@ def _examples_callback(value: str | None) -> str | None:
 
 
 @app.callback()
-def main(  # pyright: ignore[reportUnusedFunction]
+def main(
     version: Annotated[
         bool,
         Option(
@@ -365,7 +365,7 @@ def publish(run_id: Annotated[str | None, Option("--run")] = None) -> None:
 
 
 @lanes_app.command("list")
-def lanes_list(  # pyright: ignore[reportUnusedFunction]
+def lanes_list(
     registry_root: Annotated[
         Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")
     ] = DEFAULT_REGISTRY_ROOT,
@@ -390,7 +390,7 @@ def lanes_list(  # pyright: ignore[reportUnusedFunction]
 
 
 @lanes_app.command("show")
-def lanes_show(  # pyright: ignore[reportUnusedFunction]
+def lanes_show(
     lane_id: Annotated[str, Argument(help="Lane ID to display.")],
     registry_root: Annotated[
         Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")

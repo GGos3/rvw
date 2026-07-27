@@ -27,7 +27,7 @@ def test_finding_requires_known_severity() -> None:
             file="a.ts",
             hunk_id="a.ts@@-1,4+1,6@@",
             line=4,
-            severity="catastrophic",  # pyright: ignore[reportArgumentType]
+            severity="catastrophic",
             body="x",  # type: ignore[arg-type]
         )
 
@@ -54,5 +54,5 @@ def test_finding_rejects_extra_fields() -> None:
             line=4,
             severity=Severity.WARNING,
             body="x",
-            bogus=1,  # type: ignore[call-arg]
+            bogus=1,  # ty: ignore[unknown-argument]
         )

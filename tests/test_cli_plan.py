@@ -146,7 +146,7 @@ def test_head_falls_back_to_local_git_when_no_remote(
 
     monkeypatch.setattr(cli_module, "resolve_target", unavailable_resolver)
 
-    resolved = cli_module._resolve_cli_target("HEAD")  # pyright: ignore[reportPrivateUsage]
+    resolved = cli_module._resolve_cli_target("HEAD")
 
     assert resolved.kind == "commit"
     assert resolved.repo == "rvw"
