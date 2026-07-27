@@ -1,0 +1,19 @@
+# tests/fixtures/layers_minimal.yaml
+layers:
+  - id: base
+    tier: base
+    lanes: [slop-hygiene, unscoped-sweep]
+  - id: project/bori
+    tier: project
+    when:
+      repo: clawroid/bori
+    lanes: [bori/changeset-gate]
+  - id: scope/bori/agent
+    tier: scope
+    when:
+      repo: clawroid/bori
+      paths: ["apps/agent-backend/**", "packages/contracts/**"]
+    lanes: [bori/agent/prompt-surface]
+  - id: dynamic
+    tier: dynamic
+    lanes: [dynamic/goal-parity, dynamic/undeclared-change]
