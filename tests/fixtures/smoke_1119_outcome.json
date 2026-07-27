@@ -1,0 +1,117 @@
+{
+  "verdicts": {
+    "481b74e181cca5bab3b2e7252c300f8d526b67fd": "CONFIRMED",
+    "e90479fe6c2ea107da23ee387f29106549e43691": "CONFIRMED",
+    "293eeebae652d78e971b9285f9a8548837db9393": "CONFIRMED",
+    "428ab652ab58581e91e63909766c63f78f14fb2b": "CONFIRMED",
+    "0679c0ea818933a9a399e8ceb79f45e384429027": "CONFIRMED",
+    "caa45924521108ea0d13acdf359734087dd99f58": "CONFIRMED",
+    "961a0ef21afdaff4e3c3f38b808b38f16a83eee1": "CONFIRMED",
+    "76dfd34fb2ee7fc6a8d9c07852c1c2cb5c1d3853": "CONFIRMED",
+    "7dd16702b68a35b1c9128e00ca978d0f4f6e1a68": "CONFIRMED",
+    "eed0b2bb2555dee8352f92585f680de0a400d480": "CONFIRMED",
+    "411f0fa92e9569bcdb4736d14da6389757e63194": "CONFIRMED",
+    "7a0b9e94abd6446c02beca0f648b5877dfb2e75a": "CONFIRMED",
+    "24c44de9e12948f297db83f52f4804a1c4a636e9": "CONFIRMED"
+  },
+  "reasons": {
+    "481b74e181cca5bab3b2e7252c300f8d526b67fd": "An inner retry can advance beyond the outer base, but neither the solver nor the next outer attempt learns that effective offset. Overlapping retry ranges can therefore reuse the challenged route exactly as claimed.",
+    "e90479fe6c2ea107da23ee387f29106549e43691": "The outer stride is 3 while each inner fetch permits 8 attempts. Consequently adjacent ranges overlap, and a challenge reached after transport retries can be revisited by the next outer attempt.",
+    "293eeebae652d78e971b9285f9a8548837db9393": "The retry and pool configuration is production-critical and wired into every GraphQL fetch, but the Demaecan provider contains no test file asserting either configuration or exercising transport failover.",
+    "428ab652ab58581e91e63909766c63f78f14fb2b": "The comment verbatim describes the removed stride-4, attempts-4 behavior and contradicts the active stride-3, attempts-8 configuration.",
+    "0679c0ea818933a9a399e8ceb79f45e384429027": "The tests inspect method/profile and outer offsets but never assert the retry object or simulate its transport loop. Reverting attempts or removing proxy_connect_failed would not fail these tests.",
+    "caa45924521108ea0d13acdf359734087dd99f58": "The changed assertion verifies retry only on the GET availability request. The search POST test checks only its method, and the autocomplete POST test likewise has no retry assertion.",
+    "961a0ef21afdaff4e3c3f38b808b38f16a83eee1": "The explicit array duplicates the documented base selection. Omitting the field selects base.errorCodes and avoids maintaining a provider-local copy.",
+    "76dfd34fb2ee7fc6a8d9c07852c1c2cb5c1d3853": "The source itself states that omitted errorCodes inherit the base. Because the local list contains no Demaecan-specific code, it unnecessarily shadows that source of truth.",
+    "7dd16702b68a35b1c9128e00ca978d0f4f6e1a68": "The array repeats the inherited transport codes. Leaving errorCodes undefined would use base.errorCodes and automatically follow SDK additions.",
+    "eed0b2bb2555dee8352f92585f680de0a400d480": "Replacement occurs only because the provider supplies the field. Omitting this non-specialized list would inherit the stealth base instead of duplicating it.",
+    "411f0fa92e9569bcdb4736d14da6389757e63194": "The modified test asserts only outer offsets. It neither inspects NAVER_MAP_STEALTH_RETRY nor executes a proxy-connect failure, so the inner outage fix can regress without failing it.",
+    "7a0b9e94abd6446c02beca0f648b5877dfb2e75a": "Neither POST-path test asserts its retry option. Removing the retry argument at the search or autocomplete call site would leave these expectations satisfied.",
+    "24c44de9e12948f297db83f52f4804a1c4a636e9": "The fetch has eight independently timed attempts and no aggregate deadline or abort signal in its options. The source itself confirms that a stall exceeds the operation's 60-second budget."
+  },
+  "evidence": {
+    "481b74e181cca5bab3b2e7252c300f8d526b67fd": "providers/naver-map/index.ts:\n`const NAVER_MAP_STEALTH_OFFSET_STRIDE = 3;`\n`  attempts: 8,`\n`    const proxyAttemptOffset = (attempt - 1) * NAVER_MAP_STEALTH_OFFSET_STRIDE;`\n`      retry: NAVER_MAP_STEALTH_RETRY,`\n`            proxyAttemptOffset,`\nThe captcha solver receives the original outer base, not the effective offset reached by the transport retries.",
+    "e90479fe6c2ea107da23ee387f29106549e43691": "providers/naver-map/index.ts:\n`// stride:3 (not 4) so the 4 outer bases are 0,3,6,9 — all distinct within the`\n`const NAVER_MAP_STEALTH_OFFSET_STRIDE = 3;`\n`  attempts: 8,`\n`    const proxyAttemptOffset = (attempt - 1) * NAVER_MAP_STEALTH_OFFSET_STRIDE;`",
+    "293eeebae652d78e971b9285f9a8548837db9393": "providers/demaecan/upstream/index.ts:\n`const DEMAECAN_READ_TRANSPORT_RETRY: HttpRetryOptions = {`\n`  attempts: 8,`\n`  methods: [\"POST\"],`\n`  errorCodes: [`\n`    \"transport_network_error\",`\n`    \"transport_timeout\",`\n`    \"proxy_connect_failed\",`\n`  ],`\n`  session: { affinity: \"operation\", lifetimeMinutes: 30, poolSize: 6 },`\n`      retry: DEMAECAN_READ_TRANSPORT_RETRY,`",
+    "428ab652ab58581e91e63909766c63f78f14fb2b": "providers/naver-map/index.ts:\n`  // proxy-attempt offset 6. The stealth loop walks base offsets 0,4,8,12 (outer`\n`  // attempt × inner retry span of NAVER_MAP_STEALTH_RETRY.attempts=4), so the`\n`  // second outer attempt (base 4, inner retries offsets 4–7) crosses into`\n\nThe active declarations are:\n`const NAVER_MAP_STEALTH_OFFSET_STRIDE = 3;`\n`  attempts: 8,`",
+    "0679c0ea818933a9a399e8ceb79f45e384429027": "providers/naver-map/__tests__/index.test.ts:\n`    expect(options.method).toBe(\"POST\");`\n`    expect(options.profile).toBe(\"chrome-146\");`\n`    expect(options.throwOnHttpError).toBe(false);`\n`    ).toEqual([0, 3]);`\n`    ).toEqual([0, 3, 6, 9]);`\n\nProduction sets:\n`  attempts: 8,`\n`    \"proxy_connect_failed\",`",
+    "caa45924521108ea0d13acdf359734087dd99f58": "providers/catchtable/__tests__/index.test.ts:\n`        if (url === \"https://ct-api.catchtable.co.kr/api/v6/search/list\") {`\n`          expect(options).toMatchObject({ method: \"POST\" });`\n\nThe retry assertion is under the availability branch and says:\n`            method: \"GET\",`\n`            retry: {`",
+    "961a0ef21afdaff4e3c3f38b808b38f16a83eee1": "providers/catchtable/constants.ts:\n`  errorCodes: [`\n`    \"transport_network_error\",`\n`    \"transport_timeout\",`\n`    \"proxy_connect_failed\",`\n`  ],`\n\nopenspec/runbooks/provider-proxy-egress.md documents the merge as:\n`    (`errorCodes: retry.errorCodes ?? base.errorCodes` in `proxy-retry-policy.ts`). A dead`",
+    "76dfd34fb2ee7fc6a8d9c07852c1c2cb5c1d3853": "providers/demaecan/upstream/index.ts:\n`  errorCodes: [`\n`    \"transport_network_error\",`\n`    \"transport_timeout\",`\n`    \"proxy_connect_failed\",`\n`  ],`\n`  // extending it (proxy-retry-policy: errorCodes = retry.errorCodes ?? base).`",
+    "7dd16702b68a35b1c9128e00ca978d0f4f6e1a68": "providers/naver-flight/index.ts:\n`  errorCodes: [`\n`    \"transport_network_error\",`\n`    \"transport_timeout\",`\n`    \"proxy_connect_failed\",`\n`  ],`\n\nThe documented merge is:\n`    (`errorCodes: retry.errorCodes ?? base.errorCodes` in `proxy-retry-policy.ts`). A dead`",
+    "eed0b2bb2555dee8352f92585f680de0a400d480": "providers/naver-map/index.ts:\n`  errorCodes: [`\n`    \"transport_network_error\",`\n`    \"transport_timeout\",`\n`    \"proxy_connect_failed\",`\n`  ],`\n`  // array replaces the stealth-injected base rather than extending it.`",
+    "411f0fa92e9569bcdb4736d14da6389757e63194": "providers/naver-map/__tests__/index.test.ts:\n`      stealthFetch.mock.calls.map(`\n`        (call) => (call[1] as StealthFetchOptions).proxyAttemptOffset,`\n`      ),`\n`    ).toEqual([0, 3]);`\n\nProduction independently declares:\n`  attempts: 8,`\n`    \"proxy_connect_failed\",`",
+    "7a0b9e94abd6446c02beca0f648b5877dfb2e75a": "providers/catchtable/__tests__/index.test.ts:\n`        if (url === \"https://ct-api.catchtable.co.kr/api/v6/search/list\") {`\n`          expect(options).toMatchObject({ method: \"POST\" });`\n\nFor autocomplete it only asserts:\n`        expect(options?.method).toBe(\"POST\");`\n`        expect(JSON.parse(String(options?.body))).toEqual({ query: \"스시\" });`",
+    "24c44de9e12948f297db83f52f4804a1c4a636e9": "providers/naver-flight/index.ts:\n`const SEARCH_FETCH_TIMEOUT_MS = 29_000;`\n`  attempts: 8,`\n`    const response = await getFlightStealthClient(ctx).fetch(endpoint, {`\n`      retry: SEARCH_TRANSPORT_RETRY,`\n`      timeout: SEARCH_FETCH_TIMEOUT_MS,`\n\nThe source explicitly acknowledges:\n`// the dominant vendor-death class), but NOT within the 60s operation budget on a`\n`// pure transport_timeout stall, since the 29s per-attempt timeout is floored by`"
+  },
+  "replica_votes": {
+    "481b74e181cca5bab3b2e7252c300f8d526b67fd": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "e90479fe6c2ea107da23ee387f29106549e43691": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "293eeebae652d78e971b9285f9a8548837db9393": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "428ab652ab58581e91e63909766c63f78f14fb2b": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "0679c0ea818933a9a399e8ceb79f45e384429027": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "caa45924521108ea0d13acdf359734087dd99f58": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "961a0ef21afdaff4e3c3f38b808b38f16a83eee1": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "76dfd34fb2ee7fc6a8d9c07852c1c2cb5c1d3853": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "7dd16702b68a35b1c9128e00ca978d0f4f6e1a68": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "eed0b2bb2555dee8352f92585f680de0a400d480": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "411f0fa92e9569bcdb4736d14da6389757e63194": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "7a0b9e94abd6446c02beca0f648b5877dfb2e75a": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ],
+    "24c44de9e12948f297db83f52f4804a1c4a636e9": [
+      "CONFIRMED",
+      "CONFIRMED",
+      "CONFIRMED"
+    ]
+  },
+  "unresolved": [],
+  "coerced_rejections": 0,
+  "wall_seconds": 196.65800453699194
+}

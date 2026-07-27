@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 import sys
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -14,11 +16,17 @@ from rich.console import Console
 from rich.table import Table
 
 from rvw import __version__
-from rvw.discover import resolve_lane_path
+from rvw.adjudicate import AdjudicationOutcome, adjudicate
+from rvw.discover import DiscoverResult, discover, resolve_lane_path
 from rvw.dispatch import PlannedRun, lpt_sort_key
 from rvw.lane import Lane, load_lane
+from rvw.merge import merge
+from rvw.publish import publish_review
 from rvw.registry import Registry, load_registry
-from rvw.schema import Tier, finding_schema, lane_output_schema
+from rvw.report import render_report
+from rvw.runtimes.codex import CodexRuntime
+from rvw.schema import Tier, Verdict, finding_schema, lane_output_schema
+from rvw.store import RunHandle, RunNotFound, RunStore, StageMissing
 from rvw.target import ResolvedTarget, TargetResolutionError, resolve_target
 
 EXIT_OK = 0
@@ -27,6 +35,7 @@ EXIT_USER_ERROR = 2
 EXIT_SYSTEM_ERROR = 3
 DEFAULT_REGISTRY_ROOT = Path("~/.hermes/review").expanduser()
 _PLAN_REPLICAS = 3
+DEFAULT_RUN_ROOT = Path("/tmp/rvw")
 
 _EXAMPLES: dict[str, list[str]] = {
     "review": [
@@ -316,12 +325,170 @@ def main(
 
 @app.command()
 def review(
-    target: Annotated[str | None, Option("--target")] = None,
+    target: Annotated[str, Option("--target")],
+    repo_dir: Annotated[
+        Path | None,
+        Option(
+            "--repo-dir",
+            help="Provisioned checkout used for adjudication (operator-owned in Phase 4).",
+        ),
+    ] = None,
+    registry_root: Annotated[
+        Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")
+    ] = DEFAULT_REGISTRY_ROOT,
+    replicas: Annotated[int, Option("--replicas", min=1)] = 3,
+    out_root: Annotated[Path, Option("--out")] = DEFAULT_RUN_ROOT,
     json_output: Annotated[bool, Option("--json")] = False,
     pause: Annotated[bool, Option("--pause")] = False,
+    publish: Annotated[bool, Option("--publish")] = False,
     dynamic_brief: Annotated[Path | None, Option("--dynamic-brief")] = None,
 ) -> None:
-    _stub(5)
+    asyncio.run(
+        _review_pipeline(
+            target_spec=target,
+            repo_dir=repo_dir,
+            registry_root=registry_root,
+            replicas=replicas,
+            out_root=out_root,
+            json_output=json_output,
+            pause=pause,
+            publish=publish,
+            dynamic_brief=dynamic_brief,
+        )
+    )
+
+
+def _optional_outcome(run: RunHandle) -> AdjudicationOutcome | None:
+    try:
+        return run.load_outcome()
+    except StageMissing:
+        return None
+
+
+def _coverage_totals(discovered: DiscoverResult) -> dict[str, int]:
+    return {
+        "dispatched": sum(item.dispatched for item in discovered.coverage),
+        "valid": sum(item.valid for item in discovered.coverage),
+        "findings": sum(item.findings for item in discovered.coverage),
+    }
+
+
+def _verdict_counts(outcome: AdjudicationOutcome | None) -> dict[str, int]:
+    counts = Counter(outcome.verdicts.values()) if outcome is not None else Counter()
+    return {
+        "CONFIRMED": counts[Verdict.CONFIRMED],
+        "REJECTED": counts[Verdict.REJECTED],
+        "UNCERTAIN": counts[Verdict.UNCERTAIN],
+    }
+
+
+async def _review_pipeline(
+    *,
+    target_spec: str,
+    repo_dir: Path | None,
+    registry_root: Path,
+    replicas: int,
+    out_root: Path,
+    json_output: bool,
+    pause: bool,
+    publish: bool,
+    dynamic_brief: Path | None,
+) -> None:
+    registry, lanes_root = _load_registry_root(registry_root)
+    target = _resolve_cli_target(target_spec)
+    if publish and target.kind != "pr":
+        _error_console.print("--publish requires a PR target", markup=False)
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    run = RunStore(out_root).create(target)
+    run.save_target(target)
+    brief = dynamic_brief.read_text(encoding="utf-8") if dynamic_brief is not None else None
+    discovered = await discover(
+        registry=registry,
+        lanes_root=lanes_root,
+        target=target,
+        runtime=CodexRuntime(),
+        out_root=run.dir / "discover-runtime",
+        brief=brief,
+        brief_source="operator" if dynamic_brief is not None else None,
+        replicas=replicas,
+    )
+    run.save_discover(discovered)
+
+    active_lanes = _load_active_lanes(registry, lanes_root, target)
+    lane_tiers = {lane.id: lane.tier for lane in active_lanes}
+    merged = merge(discovered.findings, lane_tiers=lane_tiers)
+    run.save_merge(merged)
+
+    if pause:
+        _console.print(
+            f"paused after MERGE — resume: rvw report --run {run.run_id}",
+            markup=False,
+        )
+        return
+
+    outcome: AdjudicationOutcome | None = None
+    if repo_dir is None:
+        _error_console.print(
+            "warning: --repo-dir omitted; skipping adjudication. "
+            "Checkout provisioning is the operator's job in Phase 4.",
+            markup=False,
+        )
+    else:
+        outcome = await adjudicate(
+            merged,
+            target=target,
+            runtime=CodexRuntime(),
+            repo_dir=repo_dir,
+            out_root=run.dir / "adjudicate-runtime",
+            replicas=replicas,
+        )
+        run.save_outcome(outcome)
+
+    report_md = render_report(
+        target=target,
+        merged=merged,
+        outcome=outcome,
+        coverage=discovered.coverage,
+        budget=discovered.budget,
+        synthesis=None,
+    )
+    run.save_report(report_md)
+    report_path = run.dir / "report.md"
+
+    publication_url: str | None = None
+    payload_path: Path | None = None
+    if target.kind == "pr" and target.pr_number is not None:
+        publication = publish_review(
+            run=run,
+            repo=target.repo,
+            pr_number=target.pr_number,
+            report_md=report_md,
+            merged=merged,
+            outcome=outcome,
+            execute=publish,
+        )
+        publication_url = publication.review_url
+        if not publish:
+            payload_path = run.dir / "publish-payload.json"
+
+    if json_output:
+        _write_json(
+            {
+                "run_id": run.run_id,
+                "report_path": str(report_path),
+                "verdict_counts": _verdict_counts(outcome),
+                "coverage_totals": _coverage_totals(discovered),
+            }
+        )
+        return
+
+    _console.print(f"run id: {run.run_id}", markup=False, soft_wrap=True)
+    _console.print(f"report: {report_path}", markup=False, soft_wrap=True)
+    if payload_path is not None:
+        _console.print(f"dry-run payload: {payload_path}", markup=False, soft_wrap=True)
+    if publication_url is not None:
+        _console.print(f"review: {publication_url}", markup=False, soft_wrap=True)
 
 
 @app.command()
@@ -349,19 +516,80 @@ def run(run_id: Annotated[str | None, Option("--run")] = None) -> None:
     _stub(1)
 
 
-@app.command()
-def adjudicate(run_id: Annotated[str | None, Option("--run")] = None) -> None:
+@app.command("adjudicate")
+def adjudicate_command(run_id: Annotated[str | None, Option("--run")] = None) -> None:
     _stub(3)
 
 
-@app.command()
-def report(run_id: Annotated[str | None, Option("--run")] = None) -> None:
-    _stub(4)
+@app.command("report")
+def report_command(
+    run_id: Annotated[str, Option("--run")],
+    synthesis: Annotated[Path | None, Option("--synthesis")] = None,
+    out_root: Annotated[Path, Option("--out")] = DEFAULT_RUN_ROOT,
+) -> None:
+    try:
+        run = RunStore(out_root).open(run_id)
+        target = run.load_target()
+        discovered = run.load_discover()
+        merged = run.load_merge()
+        outcome = _optional_outcome(run)
+    except (RunNotFound, StageMissing) as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_NOT_FOUND) from exc
+
+    synthesis_text = synthesis.read_text(encoding="utf-8") if synthesis is not None else None
+    report_md = render_report(
+        target=target,
+        merged=merged,
+        outcome=outcome,
+        coverage=discovered.coverage,
+        budget=discovered.budget,
+        synthesis=synthesis_text,
+    )
+    run.save_report(report_md)
+    _console.print(str(run.dir / "report.md"), markup=False, soft_wrap=True)
 
 
-@app.command()
-def publish(run_id: Annotated[str | None, Option("--run")] = None) -> None:
-    _stub(4)
+@app.command("publish")
+def publish_command(
+    run_id: Annotated[str, Option("--run")],
+    execute: Annotated[bool, Option("--execute")] = False,
+    out_root: Annotated[Path, Option("--out")] = DEFAULT_RUN_ROOT,
+) -> None:
+    try:
+        run = RunStore(out_root).open(run_id)
+        target = run.load_target()
+    except RunNotFound as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+    except StageMissing as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_NOT_FOUND) from exc
+
+    if target.kind != "pr" or target.pr_number is None:
+        _error_console.print("rvw publish requires a PR target", markup=False)
+        raise typer.Exit(EXIT_USER_ERROR)
+
+    try:
+        merged = run.load_merge()
+        outcome = _optional_outcome(run)
+        report_md = run.load_report()
+    except StageMissing as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_NOT_FOUND) from exc
+    result = publish_review(
+        run=run,
+        repo=target.repo,
+        pr_number=target.pr_number,
+        report_md=report_md,
+        merged=merged,
+        outcome=outcome,
+        execute=execute,
+    )
+    if execute:
+        _console.print(str(result.review_url), markup=False, soft_wrap=True)
+    else:
+        _console.print(str(run.dir / "publish-payload.json"), markup=False, soft_wrap=True)
 
 
 @lanes_app.command("list")
