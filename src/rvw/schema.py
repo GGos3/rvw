@@ -29,6 +29,29 @@ class Tier(StrEnum):
     DYNAMIC = "dynamic"
 
 
+class RuntimeFinding(BaseModel):
+    """One finding in the runtime-facing wire contract."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rule_id: str
+    file: str
+    line: int
+    severity: Severity
+    body: str
+
+
+class RuntimeLaneOutput(BaseModel):
+    """Strict JSON contract a lane runtime must satisfy (ADR-004 D5)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    verdict: str
+    findings: list[RuntimeFinding] = Field(  # pyright: ignore[reportUnknownVariableType]
+        default_factory=list
+    )
+
+
 class Finding(BaseModel):
     """One defect claim from one lane. Adjudication unit (ADR-003 D1)."""
 

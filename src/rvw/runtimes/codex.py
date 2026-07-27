@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from rvw.lane import Lane
 from rvw.runtimes import RunResult, RunStatus
-from rvw.schema import LaneOutput
+from rvw.schema import RuntimeLaneOutput
 
 _REPLICA_DIRECTORY = re.compile(r"r([1-9][0-9]*)")
 _COMPLETION_MARKER = "tokens used"
@@ -34,10 +34,10 @@ async def _spawn(cmd: list[str], stdin_text: str, log_path: Path) -> int:
     return process.returncode
 
 
-def validate_output(lane: Lane, raw: object) -> LaneOutput:
+def validate_output(lane: Lane, raw: object) -> RuntimeLaneOutput:
     """Validate the common output model and the lane-specific closed rule enum."""
 
-    output = LaneOutput.model_validate(raw)
+    output = RuntimeLaneOutput.model_validate(raw)
     prefix = lane.rules[0].split("/", maxsplit=1)[0]
     allowed_rule_ids = {*lane.rules, f"{prefix}/other"}
     if any(finding.rule_id not in allowed_rule_ids for finding in output.findings):

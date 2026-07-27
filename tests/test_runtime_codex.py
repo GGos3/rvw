@@ -148,7 +148,6 @@ async def test_out_of_enum_rule_id_is_invalid(
             {
                 "rule_id": "invented/not-in-lane",
                 "file": "tiny.py",
-                "hunk_id": "tiny.py@@-1,1+1,1@@",
                 "line": 1,
                 "severity": "warning",
                 "body": "A scripted finding.",

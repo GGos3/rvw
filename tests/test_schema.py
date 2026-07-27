@@ -1,7 +1,23 @@
 import pytest
 from pydantic import ValidationError
 
-from rvw.schema import SCHEMA_VERSION, Finding, Severity
+from rvw.schema import SCHEMA_VERSION, Finding, RuntimeFinding, Severity
+
+
+def test_runtime_finding_has_exact_wire_fields() -> None:
+    raw = {
+        "rule_id": "slop/dup",
+        "file": "a.ts",
+        "line": 4,
+        "severity": Severity.WARNING,
+        "body": "x",
+    }
+
+    finding = RuntimeFinding.model_validate(raw)
+
+    assert finding.model_dump() == raw
+    with pytest.raises(ValidationError):
+        RuntimeFinding.model_validate({**raw, "hunk_id": "a.ts@@-1,4+1,6@@"})
 
 
 def test_finding_requires_known_severity() -> None:

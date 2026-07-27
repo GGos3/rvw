@@ -7,7 +7,7 @@ from pathlib import Path
 from rvw.dispatch import PlannedRun, dispatch
 from rvw.lane import Lane
 from rvw.runtimes import RunResult, RunStatus, Runtime
-from rvw.schema import LaneOutput
+from rvw.schema import RuntimeLaneOutput
 
 
 def make_lane(lane_id: str, cost: str = "normal") -> Lane:
@@ -71,7 +71,7 @@ class FakeRuntime(Runtime):
             lane_id=lane.id,
             replica=replica,
             status=status,
-            output=LaneOutput(verdict="PASS") if status is RunStatus.VALID else None,
+            output=RuntimeLaneOutput(verdict="PASS") if status is RunStatus.VALID else None,
             invalid_reason="scripted_invalid" if status is RunStatus.INVALID else None,
             wall_seconds=self._delays.get(lane.id, 0.001),
             artifact_dir=run_dir,

@@ -10,29 +10,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from rvw.dispatch import PlannedRun, dispatch
 from rvw.hunks import hunk_for_line, is_anchorable, parse_hunks
-from rvw.lane import Lane, load_lane
+from rvw.lane import load_lane
 from rvw.prompts import build_lane_prompt
 from rvw.registry import Registry
 from rvw.runtimes import RunResult, RunStatus, Runtime
 from rvw.schema import Finding, Tier
 from rvw.target import ResolvedTarget
-
-
-class _DiscoverRuntimeLane(Lane):
-    """Bridge the runtime wire model until raw and enriched findings are separated."""
-
-    def output_schema(self) -> dict[str, object]:
-        schema = super().output_schema()
-        properties = schema["properties"]
-        findings = properties["findings"]
-        items = findings["items"]
-        finding_properties = items["properties"]
-        finding_properties["hunk_id"] = {
-            "type": "string",
-            "description": "Temporary value; DISCOVER recomputes it from file and line.",
-        }
-        items["required"].append("hunk_id")
-        return schema
 
 
 class EnrichedFinding(Finding):
@@ -126,12 +109,7 @@ async def discover(
         raise ValueError("replicas must be at least 1")
 
     owners = _active_lane_owners(registry, target, lane_filter)
-    lanes = [
-        _DiscoverRuntimeLane.model_validate(
-            load_lane(resolve_lane_path(lanes_root, lane_id, tier)).model_dump(by_alias=True)
-        )
-        for lane_id, tier in owners
-    ]
+    lanes = [load_lane(resolve_lane_path(lanes_root, lane_id, tier)) for lane_id, tier in owners]
     effective_brief, effective_brief_source = _effective_brief(target, brief, brief_source)
     covered_rules = {lane.id: lane.rules for lane in lanes}
     prompts = {
@@ -167,16 +145,8 @@ async def discover(
         if result.status is not RunStatus.VALID or result.output is None:
             continue
         for finding in result.output.findings:
-            hunk = (
-                hunk_for_line(hunks, finding.file, finding.line)
-                if finding.line is not None
-                else None
-            )
-            anchorable = (
-                is_anchorable(hunks, finding.file, finding.line)
-                if finding.line is not None
-                else False
-            )
+            hunk = hunk_for_line(hunks, finding.file, finding.line)
+            anchorable = is_anchorable(hunks, finding.file, finding.line)
             enriched.append(
                 EnrichedFinding.model_validate(
                     {

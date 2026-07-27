@@ -11,7 +11,7 @@ from rvw.dispatch import PlannedRun
 from rvw.lane import Lane
 from rvw.registry import Registry
 from rvw.runtimes import RunResult, RunStatus, Runtime
-from rvw.schema import Finding, LaneOutput, Severity, Tier
+from rvw.schema import RuntimeFinding, RuntimeLaneOutput, Severity, Tier
 from rvw.target import ResolvedTarget
 
 
@@ -67,7 +67,7 @@ class FakeRuntime(Runtime):
     def __init__(
         self,
         *,
-        findings: dict[str, list[Finding]] | None = None,
+        findings: dict[str, list[RuntimeFinding]] | None = None,
         invalid_lanes: set[str] | None = None,
     ) -> None:
         self.findings = findings or {}
@@ -101,7 +101,7 @@ class FakeRuntime(Runtime):
             lane_id=lane.id,
             replica=replica,
             status=RunStatus.VALID,
-            output=LaneOutput(verdict="PASS", findings=self.findings.get(lane.id, [])),
+            output=RuntimeLaneOutput(verdict="PASS", findings=self.findings.get(lane.id, [])),
             invalid_reason=None,
             wall_seconds=0,
             artifact_dir=run_dir,
@@ -226,18 +226,16 @@ async def test_enrichment_computes_hunks_anchors_and_off_diff_fallback(tmp_path:
     lanes_root = tmp_path / "lanes"
     write_lane(lanes_root, "base-review", Tier.BASE)
     raw_findings = [
-        Finding(
+        RuntimeFinding(
             rule_id="base-review/rule",
             file="src/a.py",
-            hunk_id="raw",
             line=1,
             severity=Severity.WARNING,
             body="Anchored issue",
         ),
-        Finding(
+        RuntimeFinding(
             rule_id="base-review/rule",
             file="elsewhere.py",
-            hunk_id="raw",
             line=99,
             severity=Severity.SUGGESTION,
             body="Off-diff issue",

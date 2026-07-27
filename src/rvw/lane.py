@@ -8,10 +8,9 @@ from typing import Any, Literal, cast
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from rvw.schema import LaneOutput, Severity, Tier
+from rvw.schema import RuntimeFinding, RuntimeLaneOutput, Severity, Tier
 
 _SEVERITY_ORDER = (Severity.SUGGESTION, Severity.WARNING, Severity.BLOCKER)
-_RUNTIME_FINDING_FIELDS = ("rule_id", "file", "line", "severity", "body")
 
 
 class Lane(BaseModel):
@@ -31,10 +30,9 @@ class Lane(BaseModel):
     def output_schema(self) -> dict[str, Any]:
         """Build the strict, self-contained schema consumed by lane runtimes."""
 
-        schema = LaneOutput.model_json_schema()
-        definitions = cast(dict[str, dict[str, Any]], schema.pop("$defs"))
-        finding_properties = definitions["Finding"]["properties"]
-        runtime_properties = {field: finding_properties[field] for field in _RUNTIME_FINDING_FIELDS}
+        schema = RuntimeLaneOutput.model_json_schema()
+        schema.pop("$defs")
+        runtime_properties = dict(RuntimeFinding.model_json_schema()["properties"])
 
         prefix = self.rules[0].split("/", maxsplit=1)[0]
         runtime_properties["rule_id"] = {
@@ -55,7 +53,7 @@ class Lane(BaseModel):
         schema["properties"]["findings"]["items"] = {
             "type": "object",
             "properties": runtime_properties,
-            "required": list(_RUNTIME_FINDING_FIELDS),
+            "required": list(runtime_properties),
             "additionalProperties": False,
         }
         return schema

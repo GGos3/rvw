@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Protocol
 
 from rvw.lane import Lane
-from rvw.schema import LaneOutput
+from rvw.schema import RuntimeLaneOutput
 
 
 class RunStatus(StrEnum):
@@ -21,7 +21,7 @@ class RunResult:
     lane_id: str
     replica: int
     status: RunStatus
-    output: LaneOutput | None
+    output: RuntimeLaneOutput | None
     invalid_reason: str | None
     wall_seconds: float
     artifact_dir: Path
