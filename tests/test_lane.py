@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import cast
 
 from rvw.lane import load_lane
 
@@ -45,14 +46,19 @@ def test_output_schema_satisfies_openai_strict_required() -> None:
 
     def assert_strict(node: object) -> None:
         if isinstance(node, dict):
-            if node.get("type") == "object" and "properties" in node:
-                assert set(node.get("required", [])) == set(node["properties"]), (
-                    f"strict-required violation at object with keys {list(node['properties'])}"
+            node_d = cast(dict[str, object], node)
+            props = node_d.get("properties")
+            if node_d.get("type") == "object" and isinstance(props, dict):
+                props_d = cast(dict[str, object], props)
+                required = node_d.get("required")
+                required_l = cast(list[str], required) if isinstance(required, list) else []
+                assert set(required_l) == set(props_d), (
+                    f"strict-required violation at object with keys {list(props_d)}"
                 )
-            for value in node.values():
+            for value in node_d.values():
                 assert_strict(value)
         elif isinstance(node, list):
-            for item in node:
+            for item in cast(list[object], node):
                 assert_strict(item)
 
     assert_strict(schema)
