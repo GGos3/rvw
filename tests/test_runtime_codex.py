@@ -1,0 +1,206 @@
+from __future__ import annotations
+
+import json
+import shutil
+from pathlib import Path
+
+import pytest
+
+import rvw.runtimes.codex as codex_module
+from rvw.lane import Lane, load_lane
+from rvw.runtimes import RunStatus
+from rvw.runtimes.codex import CodexRuntime
+
+FIXTURE = Path(__file__).parent / "fixtures" / "lanes" / "slop-hygiene.md"
+
+
+def valid_payload() -> dict[str, object]:
+    return {"verdict": "PASS", "findings": []}
+
+
+def install_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    run_dir: Path,
+    exit_code: int = 0,
+    payload: object | None = None,
+    log_text: str = "tokens used: 42\n",
+) -> list[list[str]]:
+    calls: list[list[str]] = []
+
+    async def fake_spawn(cmd: list[str], stdin_text: str, log_path: Path) -> int:
+        assert stdin_text
+        calls.append(cmd)
+        log_path.write_text(log_text, encoding="utf-8")
+        if payload is not None:
+            (run_dir / "out.json").write_text(json.dumps(payload), encoding="utf-8")
+        return exit_code
+
+    monkeypatch.setattr(codex_module, "_spawn", fake_spawn)
+    return calls
+
+
+async def execute_fixture(lane: Lane, run_dir: Path, prompt: str = "Review this tiny diff."):
+    return await CodexRuntime().execute(
+        lane=lane,
+        prompt=prompt,
+        run_dir=run_dir,
+        deadline_seconds=60,
+    )
+
+
+async def test_valid_run_materializes_artifacts_and_command(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "slop-hygiene" / "r2"
+    calls = install_spawn(monkeypatch, run_dir=run_dir, payload=valid_payload())
+
+    result = await execute_fixture(lane, run_dir)
+
+    assert result.lane_id == lane.id
+    assert result.replica == 2
+    assert result.status is RunStatus.VALID
+    assert result.output is not None
+    assert result.output.verdict == "PASS"
+    assert result.invalid_reason is None
+    assert result.wall_seconds >= 0
+    assert result.artifact_dir == run_dir
+    assert (run_dir / "prompt.md").read_text(encoding="utf-8") == "Review this tiny diff."
+    assert json.loads((run_dir / "schema.json").read_text(encoding="utf-8")) == lane.output_schema()
+    assert calls == [
+        [
+            "timeout",
+            "--foreground",
+            "--signal=TERM",
+            "--kill-after=30s",
+            "60s",
+            "codex",
+            "exec",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "-c",
+            "features.multi_agent=false",
+            "-c",
+            "features.collaboration_modes=false",
+            "--output-schema",
+            str(run_dir / "schema.json"),
+            "-o",
+            str(run_dir / "out.json"),
+            "-",
+        ]
+    ]
+
+
+async def test_exit_124_is_invalid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "r1"
+    install_spawn(monkeypatch, run_dir=run_dir, exit_code=124, payload=valid_payload())
+
+    result = await execute_fixture(lane, run_dir)
+
+    assert result.status is RunStatus.INVALID
+    assert result.output is None
+    assert result.invalid_reason == "exit_nonzero:124"
+
+
+async def test_missing_output_artifact_is_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "r1"
+    install_spawn(monkeypatch, run_dir=run_dir)
+
+    result = await execute_fixture(lane, run_dir)
+
+    assert result.status is RunStatus.INVALID
+    assert result.invalid_reason == "missing_artifact"
+
+
+async def test_malformed_json_is_invalid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "r1"
+
+    async def fake_spawn(cmd: list[str], stdin_text: str, log_path: Path) -> int:
+        del cmd, stdin_text
+        log_path.write_text("tokens used: 1\n", encoding="utf-8")
+        (run_dir / "out.json").write_text("{not json", encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(codex_module, "_spawn", fake_spawn)
+
+    result = await execute_fixture(lane, run_dir)
+
+    assert result.status is RunStatus.INVALID
+    assert result.invalid_reason == "json_parse_error"
+
+
+async def test_out_of_enum_rule_id_is_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "r1"
+    payload = {
+        "verdict": "ISSUES",
+        "findings": [
+            {
+                "rule_id": "invented/not-in-lane",
+                "file": "tiny.py",
+                "hunk_id": "tiny.py@@-1,1+1,1@@",
+                "line": 1,
+                "severity": "warning",
+                "body": "A scripted finding.",
+            }
+        ],
+    }
+    install_spawn(monkeypatch, run_dir=run_dir, payload=payload)
+
+    result = await execute_fixture(lane, run_dir)
+
+    assert result.status is RunStatus.INVALID
+    assert result.invalid_reason == "schema_validation_error"
+
+
+async def test_missing_completion_marker_is_invalid(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "r1"
+    install_spawn(
+        monkeypatch,
+        run_dir=run_dir,
+        payload=valid_payload(),
+        log_text="codex exited without its terminal marker\n",
+    )
+
+    result = await execute_fixture(lane, run_dir)
+
+    assert result.status is RunStatus.INVALID
+    assert result.invalid_reason == "no_completion_marker"
+
+
+@pytest.mark.live
+async def test_real_codex_returns_valid_result(tmp_path: Path) -> None:
+    if shutil.which("codex") is None:
+        pytest.skip("codex CLI is not installed")
+
+    lane = load_lane(FIXTURE)
+    fixture = tmp_path / "tiny.py"
+    fixture.write_text("answer = 42\n", encoding="utf-8")
+    prompt = (
+        "Review this known-clean one-line fixture and return verdict PASS with no findings. "
+        "Do not inspect any other files.\n\n"
+        f"File: {fixture.name}\n```python\n{fixture.read_text(encoding='utf-8')}```"
+    )
+
+    result = await CodexRuntime().execute(
+        lane=lane,
+        prompt=prompt,
+        run_dir=tmp_path / "live" / "r1",
+        deadline_seconds=90,
+    )
+
+    assert result.status is RunStatus.VALID, result.invalid_reason
+    assert result.output is not None
