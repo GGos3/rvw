@@ -3,14 +3,15 @@ name = "rvw"
 version = "0.1.0"
 description = "Layered, replicated, self-adjudicating code review orchestrator"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Soju06" }]
 requires-python = ">=3.11"
 keywords = ["cli", "code-review", "llm", "orchestrator", "static-analysis"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
@@ -38,6 +39,11 @@ dev = [
 [project.scripts]
 # IMPORTANT: target the Typer app object, not a main() function.
 rvw = "rvw.cli:app"
+
+[project.urls]
+Repository = "https://github.com/Soju06/rvw"
+Issues = "https://github.com/Soju06/rvw/issues"
+Changelog = "https://github.com/Soju06/rvw/releases"
 
 [build-system]
 requires = ["uv_build>=0.10.9,<0.13.0"]
