@@ -197,6 +197,32 @@ adjudicated.
    so the adjudicator sees both. Accepted as a cost of hunk granularity; if it
    fires often, add `--anchor-granularity line`.
 
+### Amendment A (2026-07-27) — two display fold layers over collapse groups
+
+**Status:** Decided (extension; adjudication unit unchanged)
+
+Evidence from the first real-PR smoke (apifuse #1119, 21 findings → 13 collapse
+groups): two genuine cohesion signals exist above the collapse key, and naive
+transitive merging of both signals produced one 8-group / 4-rule mega-cluster —
+unusable as a review comment. Fold is therefore display-only, two independent
+layers, no transitive chaining:
+
+| Fold | Key | Report rendering |
+|---|---|---|
+| Pattern cluster | same `rule_id` + ≥1 shared backtick identifier + different files | one item: "1 defect × N locations" |
+| Region cluster | same file, line distance ≤ 15 (rule-agnostic) | adjacent placement + cross-lane corroboration badge |
+
+Rules:
+- Adjudication verdicts attach to collapse groups only; folds never merge
+  verdicts (D1 unchanged).
+- Pattern and region edges must not chain through each other (union-find over
+  the combined edge set is forbidden — measured mega-cluster failure).
+- Pattern folds add a third deterministic corroboration axis: `repetition` =
+  location count (smoke: four 1/3-agreement findings of the same pattern across
+  four providers are jointly stronger than their individual agreement).
+  Priority axes: `agreement` (replica), `cross_layer` (lane), `repetition`
+  (location).
+
 ### Verification
 
 - A fixture where two lanes report the same hunk yields 2 findings, 1 site,
