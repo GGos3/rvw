@@ -1,4 +1,13 @@
-"""Deterministic finding collapse, site grouping, and display-only folds."""
+"""Deterministic finding collapse, site grouping, and display-only folds.
+
+Pattern edges require same-rule groups in different files to have backtick-token
+Jaccard similarity of at least 0.40.  The threshold is measured from the real
+1119 fixture on backtick-only token sets: genuine pairs sit at 0.50-1.00 (the
+catchtable retry pair is 0.50; the ``errorCodes`` component keeps all four
+members connected through 0.50/0.667/1.00 edges even though its two weakest
+pairs measure 0.333), while every incidental ``proxy_connect_failed`` link is
+0.25-0.333.  0.40 separates the two edge populations with margin.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +23,7 @@ from rvw.discover import EnrichedFinding
 from rvw.schema import Severity, Tier
 
 _BACKTICK_TOKEN = re.compile(r"`([^`\n]+)`")
+_PATTERN_JACCARD_THRESHOLD = 0.40
 _SEVERITY_PRIORITY = {
     Severity.SUGGESTION: 1,
     Severity.WARNING: 2,
@@ -165,6 +175,13 @@ def _tokens(group: CollapseGroup) -> set[str]:
     return {token for body in group.bodies for token in _BACKTICK_TOKEN.findall(body)}
 
 
+def _jaccard(left: set[str], right: set[str]) -> float:
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
+
+
 def _components(nodes: Sequence[str], edges: Sequence[tuple[str, str]]) -> list[list[str]]:
     adjacent: dict[str, set[str]] = {node: set() for node in nodes}
     for left, right in edges:
@@ -232,7 +249,10 @@ def _pattern_folds(groups: Sequence[CollapseGroup]) -> list[PatternFold]:
         edges: list[tuple[str, str]] = []
         for index, left in enumerate(ordered):
             for right in ordered[index + 1 :]:
-                if left.file != right.file and tokens[left.key] & tokens[right.key]:
+                if (
+                    left.file != right.file
+                    and _jaccard(tokens[left.key], tokens[right.key]) >= _PATTERN_JACCARD_THRESHOLD
+                ):
                     edges.append((left.key, right.key))
 
         for component in _distinct_file_components(ordered, edges):

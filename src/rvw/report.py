@@ -65,32 +65,52 @@ def render_group_item(
 def _render_pattern_item(
     fold: PatternFold,
     groups: dict[str, CollapseGroup],
-    outcome: AdjudicationOutcome,
+    outcome: AdjudicationOutcome | None,
     priority_index: dict[str, int],
     region_labels: Sequence[str],
 ) -> str:
     representative = groups[fold.group_keys[0]]
-    highest = min(
+    members = sorted(
         (groups[key] for key in fold.group_keys), key=lambda item: priority_index[item.key]
     )
+    highest = members[0]
+    if outcome is None:
+        member_content = {
+            member.key: member.bodies[0].strip() if member.bodies else "" for member in members
+        }
+    else:
+        member_content = {
+            member.key: outcome.reasons.get(member.key, "").strip() for member in members
+        }
+    differing_content = len(set(member_content.values())) > 1
+
     suffix = "" if not region_labels else f" {' '.join(region_labels)}"
     parts = [f"### {fold.rule_id} — {fold.repetition}개 위치 (반복 패턴){suffix}"]
     parts.extend(
-        f"- `{groups[key].file}:{groups[key].line if groups[key].line is not None else 'unknown'}`"
-        for key in fold.group_keys
+        f"- `{member.file}:{member.line if member.line is not None else 'unknown'}`"
+        for member in members
     )
     if fold.shared_identifiers:
         identifiers = ", ".join(f"`{identifier}`" for identifier in fold.shared_identifiers)
         parts.append(f"공유 식별자: {identifiers}")
     parts.append(f"복제 동의 {highest.agreement}/3 · 판정 {_votes(outcome, highest.key)}")
-    reason = outcome.reasons.get(highest.key, "")
-    evidence = outcome.evidence.get(highest.key, "")
-    if reason:
-        parts.append(f"판정 사유: {reason}")
-    if evidence:
-        parts.extend(["근거:", f"```\n{evidence}\n```"])
-    if representative.bodies:
-        parts.append(representative.bodies[0])
+
+    if differing_content:
+        for member in members:
+            line = member.line if member.line is not None else "unknown"
+            parts.append(f"**{member.file}:{line}** — {member_content[member.key]}")
+            if outcome is not None and (evidence := outcome.evidence.get(member.key, "").strip()):
+                parts.extend(["근거:", f"```\n{evidence}\n```"])
+    else:
+        if outcome is not None:
+            reason = member_content[highest.key]
+            evidence = outcome.evidence.get(highest.key, "")
+            if reason:
+                parts.append(f"판정 사유: {reason}")
+            if evidence:
+                parts.extend(["근거:", f"```\n{evidence}\n```"])
+        if representative.bodies:
+            parts.append(representative.bodies[0])
     return "\n\n".join(parts)
 
 
@@ -102,19 +122,20 @@ class _DisplayUnit:
     pattern: PatternFold | None = None
 
 
-def _confirmed_items(merged: MergeResult, outcome: AdjudicationOutcome) -> list[str]:
+def _folded_items(
+    merged: MergeResult,
+    outcome: AdjudicationOutcome | None,
+    included: set[str],
+) -> list[str]:
     groups = {group.key: group for group in merged.groups}
     priority_index = {group.key: index for index, group in enumerate(merged.groups)}
-    confirmed = {
-        group.key for group in merged.groups if outcome.verdicts.get(group.key) is Verdict.CONFIRMED
-    }
     active_patterns = [
-        fold for fold in merged.pattern_folds if all(key in confirmed for key in fold.group_keys)
+        fold for fold in merged.pattern_folds if all(key in included for key in fold.group_keys)
     ]
     pattern_by_key = {key: fold for fold in active_patterns for key in fold.group_keys}
 
     units: dict[str, _DisplayUnit] = {}
-    for key in confirmed:
+    for key in included:
         pattern = pattern_by_key.get(key)
         if pattern is None:
             units[f"group:{key}"] = _DisplayUnit(
@@ -181,16 +202,15 @@ def _confirmed_items(merged: MergeResult, outcome: AdjudicationOutcome) -> list[
     return rendered
 
 
+def _confirmed_items(merged: MergeResult, outcome: AdjudicationOutcome) -> list[str]:
+    confirmed = {
+        group.key for group in merged.groups if outcome.verdicts.get(group.key) is Verdict.CONFIRMED
+    }
+    return _folded_items(merged, outcome, confirmed)
+
+
 def _unadjudicated_items(merged: MergeResult) -> list[str]:
-    groups = {group.key: group for group in merged.groups}
-    labels: dict[str, list[str]] = {group.key: [] for group in merged.groups}
-    for fold in merged.region_folds:
-        label = _region_label(fold, groups)
-        for key in fold.group_keys:
-            labels[key].append(label)
-    return [
-        render_group_item(group, None, region_labels=labels[group.key]) for group in merged.groups
-    ]
+    return _folded_items(merged, None, {group.key for group in merged.groups})
 
 
 def _unresolved_items(merged: MergeResult, outcome: AdjudicationOutcome) -> list[str]:

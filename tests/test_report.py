@@ -124,6 +124,107 @@ def _synthetic_merged() -> MergeResult:
     return merge(findings, lane_tiers={"lane": Tier.BASE})
 
 
+def _pattern_merged(*, bodies: tuple[str, str]) -> MergeResult:
+    findings = [
+        EnrichedFinding(
+            rule_id="test-ci/critical-flaw",
+            file=file,
+            hunk_id=f"{file}@@-1,1+1,1@@",
+            line=line,
+            severity=Severity.WARNING,
+            body=body,
+            anchorable=True,
+            lane_id="test-ci-integrity",
+            replica=1,
+        )
+        for file, line, body in zip(("a.ts", "b.ts"), (10, 20), bodies, strict=True)
+    ]
+    return merge(findings, lane_tiers={"test-ci-integrity": Tier.BASE})
+
+
+def _confirmed_pattern_outcome(
+    merged: MergeResult,
+    *,
+    reasons: dict[str, str],
+    evidence: dict[str, str],
+) -> AdjudicationOutcome:
+    return AdjudicationOutcome(
+        verdicts=dict.fromkeys(reasons, Verdict.CONFIRMED),
+        reasons=reasons,
+        evidence=evidence,
+        replica_votes={key: [Verdict.CONFIRMED] * 3 for key in reasons},
+        unresolved=[],
+        coerced_rejections=0,
+    )
+
+
+def test_pattern_fold_renders_each_member_when_reasons_differ() -> None:
+    merged = _pattern_merged(
+        bodies=("representative A with `shared`", "representative B with `shared`")
+    )
+    by_file = {group.file: group for group in merged.groups}
+    outcome = _confirmed_pattern_outcome(
+        merged,
+        reasons={
+            by_file["a.ts"].key: "first reason",
+            by_file["b.ts"].key: " second reason ",
+        },
+        evidence={by_file["a.ts"].key: "first evidence", by_file["b.ts"].key: ""},
+    )
+
+    report = render_report(
+        target=target_fixture(), merged=merged, outcome=outcome, coverage=[], budget=None
+    )
+
+    first = "**a.ts:10** — first reason"
+    second = "**b.ts:20** — second reason"
+    assert first in report
+    assert second in report
+    assert report.index(first) < report.index(second)
+    assert "first evidence" in report
+    assert report.count("```") == 2
+    assert "representative A" not in report
+    assert "representative B" not in report
+
+
+def test_pattern_fold_renders_one_reason_when_all_members_match() -> None:
+    merged = _pattern_merged(
+        bodies=("representative A with `shared`", "representative B with `shared`")
+    )
+    by_file = {group.file: group for group in merged.groups}
+    outcome = _confirmed_pattern_outcome(
+        merged,
+        reasons={
+            by_file["a.ts"].key: " same reason ",
+            by_file["b.ts"].key: "same reason",
+        },
+        evidence={by_file["a.ts"].key: "shared evidence", by_file["b.ts"].key: ""},
+    )
+
+    report = render_report(
+        target=target_fixture(), merged=merged, outcome=outcome, coverage=[], budget=None
+    )
+
+    assert report.count("판정 사유: same reason") == 1
+    assert "**a.ts:10** —" not in report
+    assert "**b.ts:20** —" not in report
+
+
+def test_unadjudicated_pattern_fold_renders_differing_member_bodies() -> None:
+    merged = _pattern_merged(bodies=("first body `shared`", "second body `shared`"))
+
+    report = render_report(
+        target=target_fixture(), merged=merged, outcome=None, coverage=[], budget=None
+    )
+
+    first = "**a.ts:10** — first body `shared`"
+    second = "**b.ts:20** — second body `shared`"
+    assert first in report
+    assert second in report
+    assert report.index(first) < report.index(second)
+    assert report.count("### test-ci/critical-flaw — 2개 위치 (반복 패턴)") == 1
+
+
 def test_rejected_unresolved_and_unadjudicated_modes() -> None:
     merged = _synthetic_merged()
     confirmed, rejected, uncertain = merged.groups

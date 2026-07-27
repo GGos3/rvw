@@ -106,14 +106,26 @@ def test_site_cross_layer_requires_distinct_tiers() -> None:
     assert same_layer.cross_layer is False
 
 
-def test_smoke_pattern_fold_joins_four_error_codes_locations() -> None:
+def test_smoke_pattern_folds_match_measured_fixture_clusters() -> None:
     result = merge(smoke_findings(), lane_tiers=SMOKE_TIERS)
+
+    assert sorted((fold.rule_id, fold.repetition) for fold in result.pattern_folds) == [
+        ("slop/sot-violation", 4),
+        ("test-ci/critical-flaw", 2),
+    ]
 
     fold = next(fold for fold in result.pattern_folds if fold.rule_id == "slop/sot-violation")
     groups = {group.key: group for group in result.groups}
-    assert fold.repetition == 4
     assert len({groups[group_key].file for group_key in fold.group_keys}) == 4
-    assert "errorCodes" in fold.shared_identifiers
+    assert fold.shared_identifiers == ["errorCodes"]
+
+    catchtable = next(
+        fold for fold in result.pattern_folds if fold.rule_id == "test-ci/critical-flaw"
+    )
+    assert catchtable.shared_identifiers == ["retry"]
+    assert not any(
+        "proxy_connect_failed" in fold.shared_identifiers for fold in result.pattern_folds
+    )
 
 
 def test_pattern_fold_never_repeats_a_file() -> None:
