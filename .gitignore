@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# rvw runtime artifacts
+/tmp/
+.hermes/plans/*.lock
+
+# IDE
+.idea/
+.vscode/
