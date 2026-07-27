@@ -23,6 +23,9 @@ class Lane(BaseModel):
     rules: list[str] = Field(min_length=1)
     severity_cap: Severity = Severity.BLOCKER
     covered_by_others: Literal["inject"] | None = None
+    # Lane lifecycle: "pending" = not yet gated by `rvw sample --compare-free`
+    # (ADR-004 verification). None = validated / pre-dates the gate.
+    validation: Literal["pending"] | None = None
     prompt_body: str
 
     def output_schema(self) -> dict[str, Any]:

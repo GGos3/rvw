@@ -62,3 +62,8 @@ def test_output_schema_satisfies_openai_strict_required() -> None:
                 assert_strict(item)
 
     assert_strict(schema)
+
+
+def test_validation_lifecycle_field() -> None:
+    lane = load_lane(FIXTURE)
+    assert lane.validation is None  # fixture pre-dates the sample gate
