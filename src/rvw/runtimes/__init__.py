@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Generic, Protocol, TypeVar
+
+from pydantic import BaseModel
 
 from rvw.lane import Lane
 from rvw.schema import RuntimeLaneOutput
+
+_OutputT = TypeVar("_OutputT", bound=BaseModel)
 
 
 class RunStatus(StrEnum):
@@ -17,11 +22,11 @@ class RunStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class RunResult:
+class RunResult(Generic[_OutputT]):
     lane_id: str
     replica: int
     status: RunStatus
-    output: RuntimeLaneOutput | None
+    output: _OutputT | None
     invalid_reason: str | None
     wall_seconds: float
     artifact_dir: Path
@@ -48,7 +53,18 @@ class Runtime(Protocol):
         prompt: str,
         run_dir: Path,
         deadline_seconds: int,
-    ) -> RunResult: ...
+    ) -> RunResult[RuntimeLaneOutput]: ...
+
+    async def execute_raw(
+        self,
+        *,
+        schema: dict[str, Any],
+        prompt: str,
+        run_dir: Path,
+        deadline_seconds: int,
+        workdir: Path | None = None,
+        validate: Callable[[object], BaseModel],
+    ) -> RunResult[BaseModel]: ...
 
 
 __all__: list[str] = ["RunResult", "RunStatus", "Runtime"]

@@ -6,9 +6,11 @@ import asyncio
 import json
 import re
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, cast
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from rvw.lane import Lane
 from rvw.runtimes import RunResult, RunStatus
@@ -18,7 +20,9 @@ _REPLICA_DIRECTORY = re.compile(r"r([1-9][0-9]*)")
 _COMPLETION_MARKER = "tokens used"
 
 
-async def _spawn(cmd: list[str], stdin_text: str, log_path: Path) -> int:
+async def _spawn(
+    cmd: list[str], stdin_text: str, log_path: Path, *, cwd: Path | None = None
+) -> int:
     """Run a command without a shell and combine its output in one log."""
 
     with log_path.open("wb") as log_file:
@@ -27,6 +31,7 @@ async def _spawn(cmd: list[str], stdin_text: str, log_path: Path) -> int:
             stdin=asyncio.subprocess.PIPE,
             stdout=log_file,
             stderr=asyncio.subprocess.STDOUT,
+            cwd=cwd,
         )
         await process.communicate(stdin_text.encode("utf-8"))
     if process.returncode is None:
@@ -62,10 +67,48 @@ class CodexRuntime:
         prompt: str,
         run_dir: Path,
         deadline_seconds: int,
-    ) -> RunResult:
+    ) -> RunResult[RuntimeLaneOutput]:
+        result = await self.execute_raw(
+            schema=lane.output_schema(),
+            prompt=prompt,
+            run_dir=run_dir,
+            deadline_seconds=deadline_seconds,
+            validate=lambda raw: validate_output(lane, raw),
+        )
+        if result.status is RunStatus.VALID:
+            return RunResult(
+                lane_id=lane.id,
+                replica=result.replica,
+                status=result.status,
+                output=cast(RuntimeLaneOutput, result.output),
+                invalid_reason=None,
+                wall_seconds=result.wall_seconds,
+                artifact_dir=result.artifact_dir,
+            )
+        return RunResult(
+            lane_id=lane.id,
+            replica=result.replica,
+            status=result.status,
+            output=None,
+            invalid_reason=result.invalid_reason,
+            wall_seconds=result.wall_seconds,
+            artifact_dir=result.artifact_dir,
+        )
+
+    async def execute_raw(
+        self,
+        *,
+        schema: dict[str, Any],
+        prompt: str,
+        run_dir: Path,
+        deadline_seconds: int,
+        workdir: Path | None = None,
+        validate: Callable[[object], BaseModel],
+    ) -> RunResult[BaseModel]:
         if deadline_seconds < 1:
             raise ValueError("deadline_seconds must be at least 1")
         replica = _replica_from_run_dir(run_dir)
+        run_id = run_dir.parent.name
 
         run_dir.mkdir(parents=True, exist_ok=True)
         prompt_path = run_dir / "prompt.md"
@@ -74,7 +117,7 @@ class CodexRuntime:
         log_path = run_dir / "run.log"
         prompt_path.write_text(prompt, encoding="utf-8")
         schema_path.write_text(
-            json.dumps(lane.output_schema(), indent=2, sort_keys=True),
+            json.dumps(schema, indent=2, sort_keys=True),
             encoding="utf-8",
         )
         output_path.unlink(missing_ok=True)
@@ -104,10 +147,10 @@ class CodexRuntime:
 
         started = time.perf_counter()
         try:
-            exit_code = await _spawn(command, prompt, log_path)
+            exit_code = await _spawn(command, prompt, log_path, cwd=workdir)
         except OSError as error:
             return self._invalid_result(
-                lane=lane,
+                run_id=run_id,
                 replica=replica,
                 reason=f"spawn_error:{type(error).__name__}",
                 started=started,
@@ -116,7 +159,7 @@ class CodexRuntime:
 
         if exit_code != 0:
             return self._invalid_result(
-                lane=lane,
+                run_id=run_id,
                 replica=replica,
                 reason=f"exit_nonzero:{exit_code}",
                 started=started,
@@ -124,7 +167,7 @@ class CodexRuntime:
             )
         if not output_path.is_file() or output_path.stat().st_size == 0:
             return self._invalid_result(
-                lane=lane,
+                run_id=run_id,
                 replica=replica,
                 reason="missing_artifact",
                 started=started,
@@ -135,7 +178,7 @@ class CodexRuntime:
             raw: object = json.loads(output_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return self._invalid_result(
-                lane=lane,
+                run_id=run_id,
                 replica=replica,
                 reason="json_parse_error",
                 started=started,
@@ -143,10 +186,10 @@ class CodexRuntime:
             )
 
         try:
-            output = validate_output(lane, raw)
+            output = validate(raw)
         except (ValidationError, ValueError):
             return self._invalid_result(
-                lane=lane,
+                run_id=run_id,
                 replica=replica,
                 reason="schema_validation_error",
                 started=started,
@@ -159,7 +202,7 @@ class CodexRuntime:
             completed = False
         if not completed:
             return self._invalid_result(
-                lane=lane,
+                run_id=run_id,
                 replica=replica,
                 reason="no_completion_marker",
                 started=started,
@@ -167,7 +210,7 @@ class CodexRuntime:
             )
 
         return RunResult(
-            lane_id=lane.id,
+            lane_id=run_id,
             replica=replica,
             status=RunStatus.VALID,
             output=output,
@@ -179,14 +222,14 @@ class CodexRuntime:
     @staticmethod
     def _invalid_result(
         *,
-        lane: Lane,
+        run_id: str,
         replica: int,
         reason: str,
         started: float,
         run_dir: Path,
-    ) -> RunResult:
+    ) -> RunResult[BaseModel]:
         return RunResult(
-            lane_id=lane.id,
+            lane_id=run_id,
             replica=replica,
             status=RunStatus.INVALID,
             output=None,

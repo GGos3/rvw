@@ -5,6 +5,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from pydantic import BaseModel, ConfigDict
 
 import rvw.runtimes.codex as codex_module
 from rvw.lane import Lane, load_lane
@@ -25,12 +26,14 @@ def install_spawn(
     exit_code: int = 0,
     payload: object | None = None,
     log_text: str = "tokens used: 42\n",
-) -> list[list[str]]:
-    calls: list[list[str]] = []
+) -> list[tuple[list[str], Path | None]]:
+    calls: list[tuple[list[str], Path | None]] = []
 
-    async def fake_spawn(cmd: list[str], stdin_text: str, log_path: Path) -> int:
+    async def fake_spawn(
+        cmd: list[str], stdin_text: str, log_path: Path, *, cwd: Path | None = None
+    ) -> int:
         assert stdin_text
-        calls.append(cmd)
+        calls.append((cmd, cwd))
         log_path.write_text(log_text, encoding="utf-8")
         if payload is not None:
             (run_dir / "out.json").write_text(json.dumps(payload), encoding="utf-8")
@@ -69,28 +72,31 @@ async def test_valid_run_materializes_artifacts_and_command(
     assert (run_dir / "prompt.md").read_text(encoding="utf-8") == "Review this tiny diff."
     assert json.loads((run_dir / "schema.json").read_text(encoding="utf-8")) == lane.output_schema()
     assert calls == [
-        [
-            "timeout",
-            "--foreground",
-            "--signal=TERM",
-            "--kill-after=30s",
-            "60s",
-            "codex",
-            "exec",
-            "--sandbox",
-            "read-only",
-            "--color",
-            "never",
-            "-c",
-            "features.multi_agent=false",
-            "-c",
-            "features.collaboration_modes=false",
-            "--output-schema",
-            str(run_dir / "schema.json"),
-            "-o",
-            str(run_dir / "out.json"),
-            "-",
-        ]
+        (
+            [
+                "timeout",
+                "--foreground",
+                "--signal=TERM",
+                "--kill-after=30s",
+                "60s",
+                "codex",
+                "exec",
+                "--sandbox",
+                "read-only",
+                "--color",
+                "never",
+                "-c",
+                "features.multi_agent=false",
+                "-c",
+                "features.collaboration_modes=false",
+                "--output-schema",
+                str(run_dir / "schema.json"),
+                "-o",
+                str(run_dir / "out.json"),
+                "-",
+            ],
+            None,
+        )
     ]
 
 
@@ -123,7 +129,10 @@ async def test_malformed_json_is_invalid(monkeypatch: pytest.MonkeyPatch, tmp_pa
     lane = load_lane(FIXTURE)
     run_dir = tmp_path / "r1"
 
-    async def fake_spawn(cmd: list[str], stdin_text: str, log_path: Path) -> int:
+    async def fake_spawn(
+        cmd: list[str], stdin_text: str, log_path: Path, *, cwd: Path | None = None
+    ) -> int:
+        del cwd
         del cmd, stdin_text
         log_path.write_text("tokens used: 1\n", encoding="utf-8")
         (run_dir / "out.json").write_text("{not json", encoding="utf-8")
@@ -178,6 +187,36 @@ async def test_missing_completion_marker_is_invalid(
 
     assert result.status is RunStatus.INVALID
     assert result.invalid_reason == "no_completion_marker"
+
+
+async def test_execute_raw_uses_custom_schema_validator_and_workdir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class RawOutput(BaseModel):
+        model_config = ConfigDict(extra="forbid")
+
+        answer: str
+
+    run_dir = tmp_path / "raw" / "r3"
+    workdir = tmp_path / "checkout"
+    workdir.mkdir()
+    schema = RawOutput.model_json_schema()
+    calls = install_spawn(monkeypatch, run_dir=run_dir, payload={"answer": "yes"})
+
+    result = await CodexRuntime().execute_raw(
+        schema=schema,
+        prompt="Decide this candidate.",
+        run_dir=run_dir,
+        deadline_seconds=45,
+        workdir=workdir,
+        validate=RawOutput.model_validate,
+    )
+
+    assert result.status is RunStatus.VALID
+    assert isinstance(result.output, RawOutput)
+    assert result.output.answer == "yes"
+    assert json.loads((run_dir / "schema.json").read_text(encoding="utf-8")) == schema
+    assert calls[0][1] == workdir
 
 
 @pytest.mark.live

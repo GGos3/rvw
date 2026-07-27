@@ -50,6 +50,25 @@ class RuntimeLaneOutput(BaseModel):
     findings: list[RuntimeFinding] = Field(default_factory=list)
 
 
+class RuntimeAdjudicationItem(BaseModel):
+    """One evidence-bearing adjudicator verdict."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_key: str
+    verdict: Verdict
+    reason: str
+    evidence: str
+
+
+class RuntimeAdjudication(BaseModel):
+    """Strict runtime wire contract for an adjudication batch."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[RuntimeAdjudicationItem]
+
+
 class Finding(BaseModel):
     """One defect claim from one lane. Adjudication unit (ADR-003 D1)."""
 
