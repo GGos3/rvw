@@ -13,6 +13,12 @@ from rvw.runtimes import RunResult, RunStatus, Runtime
 _COST_ORDER = {"heavy": 0, "normal": 1, "light": 2}
 
 
+def lpt_sort_key(lane_cost: str) -> int:
+    """Return the shared longest-processing-time-first key for a lane cost."""
+
+    return _COST_ORDER[lane_cost]
+
+
 @dataclass(frozen=True, slots=True)
 class PlannedRun:
     lane: Lane
@@ -58,7 +64,7 @@ async def dispatch(
             return result
 
     async def execute_wave(wave_runs: Sequence[PlannedRun]) -> list[RunResult]:
-        ordered = sorted(wave_runs, key=lambda run: _COST_ORDER[run.lane.cost])
+        ordered = sorted(wave_runs, key=lambda run: lpt_sort_key(run.lane.cost))
         tasks = [asyncio.create_task(execute_one(run)) for run in ordered]
         return list(await asyncio.gather(*tasks))
 
@@ -81,4 +87,4 @@ async def dispatch(
     return sorted(final_by_key.values(), key=lambda result: (result.lane_id, result.replica))
 
 
-__all__: list[str] = ["PlannedRun", "dispatch"]
+__all__: list[str] = ["PlannedRun", "dispatch", "lpt_sort_key"]
