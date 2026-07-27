@@ -1,0 +1,83 @@
+[project]
+name = "rvw"
+version = "0.1.0"
+description = "Layered, replicated, self-adjudicating code review orchestrator"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+keywords = ["cli", "code-review", "llm", "orchestrator", "static-analysis"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "typer>=0.12.0",
+    "rich>=13.7.0",
+    "pydantic>=2.7.0",
+    "pyyaml>=6.0.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.6.0",
+    "pyright>=1.1.380",
+    "pre-commit>=3.7.0",
+    "types-pyyaml>=6.0.12",
+]
+
+[project.scripts]
+# IMPORTANT: target the Typer app object, not a main() function.
+rvw = "rvw.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.10.9,<0.11.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+    "RUF", # ruff-specific
+]
+ignore = [
+    "E501", # line too long (formatter handles)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.pyright]
+include = ["src", "tests"]
+exclude = ["**/__pycache__", ".venv"]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra --strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "live: requires a real codex CLI invocation (deselect with -m 'not live')",
+]
