@@ -6,14 +6,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Protocol
 
 from pydantic import BaseModel
 
 from rvw.lane import Lane
 from rvw.schema import RuntimeLaneOutput
-
-_OutputT = TypeVar("_OutputT", bound=BaseModel)
 
 
 class RunStatus(StrEnum):
@@ -22,11 +20,11 @@ class RunStatus(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
-class RunResult(Generic[_OutputT]):
+class RunResult[OutputT: BaseModel]:
     lane_id: str
     replica: int
     status: RunStatus
-    output: _OutputT | None
+    output: OutputT | None
     invalid_reason: str | None
     wall_seconds: float
     artifact_dir: Path

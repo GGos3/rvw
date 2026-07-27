@@ -39,7 +39,7 @@ free-form ids (ADR-004).
 pip install rvw          # or: uv tool install rvw
 ```
 
-Requires Python 3.11+ and a working [Codex CLI](https://github.com/openai/codex)
+Requires Python 3.12+ and a working [Codex CLI](https://github.com/openai/codex)
 (`codex exec`) as the review runtime.
 
 ## Quickstart
