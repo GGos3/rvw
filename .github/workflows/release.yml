@@ -9,7 +9,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v9.0.0
         with:
           python-version: "3.14"
       - run: uv sync --all-extras
@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v9
+      - uses: astral-sh/setup-uv@v9.0.0
       - name: Verify tag matches package version
         run: |
           PKG_VERSION=$(uv run --no-sync python -c "from rvw._version import __version__; print(__version__)" 2>/dev/null || sed -n 's/^__version__ = "\(.*\)"/\1/p' src/rvw/_version.py)
