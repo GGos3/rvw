@@ -46,6 +46,7 @@ build-backend = "uv_build"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = [".hermes"]
 
 [tool.ruff.lint]
 select = [
