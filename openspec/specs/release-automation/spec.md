@@ -15,23 +15,28 @@ The project MUST use release-please with the Python release type to derive relea
 - **WHEN** releasable Conventional Commits accumulate on `main`
 - **THEN** release-please opens or updates a release PR in which every checked-in rvw version surface has the same proposed version
 
-### Requirement: Automated releases do not require an additional secret
+### Requirement: Automated releases use a personal access token
 
-The release-please workflow MUST use `RELEASE_PLEASE_TOKEN` when configured and MUST otherwise use the repository `github.token` while retaining a direct reusable-workflow path to publication.
+The release-please workflow MUST authenticate with the `RELEASE_PLEASE_TOKEN` personal access token so that the tags it pushes trigger the tag-event release workflow, and it MUST NOT fall back to the repository `github.token` or publish through a reusable-workflow call.
 
-#### Scenario: No release-please PAT is configured
+#### Scenario: Release PR is merged
 
-- **WHEN** a release PR is merged using only the repository token
-- **THEN** the created release directly invokes the reusable release chain without depending on a token-generated tag event to start another workflow
+- **WHEN** a release PR is merged and release-please pushes the version tag with the personal access token
+- **THEN** the pushed tag itself triggers the release workflow without any workflow-call chain
+
+#### Scenario: PyPI trusted publishing rejects reusable callers
+
+- **WHEN** the publish job requests its OIDC identity token
+- **THEN** the token claims identify the tag-triggered release workflow itself, which PyPI trusted publishing accepts, rather than a reusable workflow invocation, which PyPI rejects
 
 ### Requirement: Automated and emergency releases share one verified chain
 
-The release chain MUST be callable by release-please with an explicit tag and MUST remain triggerable by a pushed `v*` tag, and both entry points MUST run the same gates, tag-to-package version checks, build, PyPI publish, and GitHub release-asset stages.
+The release workflow MUST be triggered by pushed `v*` tags as its only entry point, whether release-please or a maintainer pushes the tag, and every release MUST run the same gates, tag-to-package version checks, build, PyPI publish, and GitHub release-asset stages.
 
 #### Scenario: Release-please creates a release
 
-- **WHEN** release-please reports `release_created` with a tag
-- **THEN** it calls the reusable release workflow with that tag and grants the OIDC publication job `id-token: write`
+- **WHEN** release-please pushes a release tag after the release PR merges
+- **THEN** the tag-triggered release workflow runs the full chain and grants the OIDC publication job `id-token: write`
 
 #### Scenario: Maintainer pushes an emergency tag
 

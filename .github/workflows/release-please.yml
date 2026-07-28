@@ -16,24 +16,16 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
       - name: Run release-please
         id: release
         uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v4 — same pin as codex-lb; v5 silently no-ops the uv.lock toml updater
         with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
+          # RELEASE_PLEASE_TOKEN is a required PAT (codex-lb pattern): tags it
+          # pushes trigger release.yml via the tag event. PyPI Trusted
+          # Publishing rejects OIDC claims from reusable-caller chains, and
+          # tags created by the default repository token never start
+          # workflows, so neither alternative can publish.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: .github/release-please-config.json
           manifest-file: .github/release-please-manifest.json
-
-  publish-release:
-    needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
-    uses: ./.github/workflows/release.yml
-    with:
-      tag: ${{ needs.release-please.outputs.tag_name }}
-    permissions:
-      contents: write
-      id-token: write
