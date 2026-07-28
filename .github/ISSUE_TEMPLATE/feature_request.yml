@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose an rvw capability or contract change
+title: "feat: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What review workflow or reliability problem should rvw solve?
+    validations:
+      required: true
+
+  - type: textarea
+    id: desired_behavior
+    attributes:
+      label: Desired behavior
+      description: Describe the expected CLI, schema, artifact, policy, or release contract.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Discovery and lanes
+        - Merge and finding model
+        - Adjudication
+        - Reporting and publication
+        - PR gate and targets
+        - Registry and diagnostics
+        - Packaging and release infrastructure
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What can users do today, and why is it insufficient?
+
+  - type: textarea
+    id: openspec
+    attributes:
+      label: OpenSpec considerations
+      description: Identify affected capabilities, invariants, compatibility constraints, or migration concerns if known.

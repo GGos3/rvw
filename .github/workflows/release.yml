@@ -3,12 +3,31 @@ name: release
 on:
   push:
     tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag (for example, v0.3.0)"
+        required: true
+        type: string
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   gates:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
       - uses: astral-sh/setup-uv@v9.0.0
         with:
           python-version: "3.14"
@@ -23,13 +42,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ env.RELEASE_TAG }}
       - uses: astral-sh/setup-uv@v9.0.0
-      - name: Verify tag matches package version
+        with:
+          python-version: "3.14"
+      - name: Verify tag matches package versions
+        shell: bash
+        env:
+          PYTHONPATH: src
         run: |
-          PKG_VERSION=$(uv run --no-sync python -c "from rvw._version import __version__; print(__version__)" 2>/dev/null || sed -n 's/^__version__ = "\(.*\)"/\1/p' src/rvw/_version.py)
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match package version $PKG_VERSION"
+          set -euo pipefail
+          PACKAGE_VERSION=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          RUNTIME_VERSION=$(python -c 'from rvw._version import __version__; print(__version__)')
+          TAG_VERSION="${RELEASE_TAG#v}"
+          if [ "$PACKAGE_VERSION" != "$TAG_VERSION" ] || [ "$RUNTIME_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag $RELEASE_TAG does not match package=$PACKAGE_VERSION runtime=$RUNTIME_VERSION"
             exit 1
           fi
       - run: uv build
@@ -46,13 +75,15 @@ jobs:
       name: pypi
       url: https://pypi.org/p/rvw
     permissions:
-      id-token: write   # OIDC trusted publishing — no API token anywhere
+      id-token: write
     steps:
       - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
 
   github-release:
     needs: publish
@@ -61,10 +92,22 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_TAG }}
       - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
-      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+      - name: Create release or upload artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --title "$RELEASE_TAG" --generate-notes
+          fi
         env:
           GH_TOKEN: ${{ github.token }}

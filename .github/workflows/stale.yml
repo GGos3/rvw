@@ -1,0 +1,39 @@
+name: Stale issues and PRs
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Mark stale issues and PRs
+        uses: actions/stale@v11
+        with:
+          days-before-issue-stale: 60
+          days-before-issue-close: 14
+          days-before-pr-stale: 60
+          days-before-pr-close: 14
+          stale-issue-label: "stale"
+          stale-pr-label: "stale"
+          close-issue-reason: "not_planned"
+          stale-issue-message: |
+            This issue has had no activity for 60 days and is now marked stale. It will close in 14 days unless new information is added.
+          close-issue-message: |
+            Closing after 14 additional days without activity. Reopen with current reproduction details if the issue is still relevant.
+          stale-pr-message: |
+            This pull request has had no activity for 60 days and is now marked stale. It will close in 14 days unless it is updated.
+          close-pr-message: |
+            Closing after 14 additional days without activity. A current, rebased pull request is welcome if the work continues.
+          exempt-issue-labels: "pinned,security"
+          exempt-pr-labels: "pinned,security,autorelease: pending"
+          operations-per-run: 100
+          remove-stale-when-updated: true
+          ascending: true
