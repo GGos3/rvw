@@ -26,10 +26,18 @@ def _glob_match(path: str, pattern: str) -> bool:
     return fnmatch.fnmatchcase(normalized_path, normalized_pattern)
 
 
+def _repo_match(repo: str, patterns: str | list[str]) -> bool:
+    """Match a repository against one or more case-sensitive glob patterns."""
+
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    return any(fnmatch.fnmatchcase(repo, pattern) for pattern in patterns)
+
+
 class LayerPredicate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    repo: str | None = None
+    repo: str | list[str] | None = None
     paths: list[str] | None = None
 
 
@@ -55,7 +63,7 @@ class Registry(BaseModel):
             for layer in self.layers
             if layer.when is None
             or (
-                (layer.when.repo is None or layer.when.repo == repo)
+                (layer.when.repo is None or _repo_match(repo, layer.when.repo))
                 and (
                     layer.when.paths is None
                     or any(
