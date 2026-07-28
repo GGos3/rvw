@@ -1,0 +1,93 @@
+# runtime-contract
+
+## Purpose
+
+Define strict runtime schemas, validity classification, artifact seams, and the boundary between runtime wire output and enriched pipeline models.
+
+## Requirements
+
+### Requirement: Lane schemas close rule identifiers
+
+Every lane runtime schema MUST restrict `rule_id` to the lane's declared rules plus one `<rule-namespace>/other` value derived from the first declared rule.
+
+#### Scenario: Lane declares security rules
+
+- **WHEN** a lane's first rule is `security/exposure`
+- **THEN** its runtime schema allows declared rule IDs and `security/other` but no arbitrary string
+
+### Requirement: Severity respects the lane cap
+
+Every lane runtime schema MUST enumerate only severities at or below the lane's configured severity cap.
+
+#### Scenario: Sweep is warning-capped
+
+- **WHEN** a lane declares `severity_cap: warning`
+- **THEN** its schema allows `warning` and `suggestion` and excludes `blocker`
+
+### Requirement: Runtime output is strict JSON
+
+Lane and adjudication runtime schemas MUST reject extra object properties and MUST list every property at every object level in `required` for OpenAI strict structured-output compatibility.
+
+#### Scenario: Defaulted output property
+
+- **WHEN** Pydantic would normally omit a defaulted property from JSON Schema `required`
+- **THEN** schema generation adds that property to `required` before passing the schema to Codex
+
+### Requirement: Runtime findings use the wire shape
+
+A lane runtime output MUST contain a verdict string and a findings list whose items contain exactly `rule_id`, `file`, integer new-side `line`, `severity`, and `body`.
+
+#### Scenario: Runtime includes enrichment fields
+
+- **WHEN** runtime output includes `hunk_id`, `lane_id`, or `anchorable`
+- **THEN** strict wire validation marks the output invalid because enrichment belongs downstream
+
+### Requirement: Validity requires four signals
+
+A runtime execution MUST be VALID only when the process exits zero, a non-empty output artifact exists, the artifact parses and validates against the supplied schema validator, and the combined run log contains the terminal completion marker `tokens used`.
+
+#### Scenario: Schema-valid artifact without completion marker
+
+- **WHEN** Codex exits zero and writes valid JSON but its log lacks `tokens used`
+- **THEN** the result is INVALID with reason `no_completion_marker`
+
+#### Scenario: Process times out
+
+- **WHEN** the timeout wrapper exits nonzero
+- **THEN** the result is INVALID with reason `exit_nonzero:<code>` and has no promoted output
+
+### Requirement: Invalidity is machine-readable
+
+Every INVALID result MUST have no output and a non-empty `invalid_reason`, while every VALID result MUST have output and no invalid reason.
+
+#### Scenario: Artifact is missing
+
+- **WHEN** a zero-exit execution does not produce a non-empty `out.json`
+- **THEN** the result records `missing_artifact` and cannot be represented as VALID
+
+### Requirement: Runtime artifacts are persisted per replica
+
+The Codex adapter MUST write `prompt.md`, `schema.json`, `out.json`, and `run.log` beneath an `r<replica>` artifact directory before or during execution and MUST derive the replica number from that directory name.
+
+#### Scenario: Malformed run directory
+
+- **WHEN** the adapter is given a directory not ending in `r<positive-integer>`
+- **THEN** execution fails before assigning an ambiguous replica number
+
+### Requirement: Raw execution supports stage-specific schemas and workdirs
+
+The runtime protocol MUST provide `execute_raw` with a caller-supplied schema, validator, optional working directory, deadline, prompt, and artifact directory so adjudication and sampling can reuse the same validity contract.
+
+#### Scenario: Adjudication reads checked-out source
+
+- **WHEN** adjudication calls `execute_raw` with a provisioned repository directory
+- **THEN** Codex runs read-only with that directory as its process working directory and validates the adjudication-specific output model
+
+### Requirement: Codex execution is read-only and bounded
+
+The Codex adapter SHALL invoke `codex exec` through a foreground timeout, SHALL select the read-only sandbox, and SHALL disable multi-agent and collaboration modes for each runtime execution.
+
+#### Scenario: Deadline expires
+
+- **WHEN** a run exceeds its configured deadline
+- **THEN** the wrapper sends TERM, allows a 30-second kill-after window, and the nonzero result is classified INVALID

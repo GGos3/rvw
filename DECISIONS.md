@@ -1,5 +1,11 @@
 # rvw — Decision Records
 
+Normative behavior has moved to [`openspec/specs/`](openspec/specs/). The records below are retained unchanged as historical design evidence; when they differ from the current OpenSpec requirements and implementation, OpenSpec is authoritative.
+
+## Archived original (pre-OpenSpec)
+
+# rvw — Decision Records
+
 Layered, replicated, self-adjudicating code review orchestrator.
 
 Append-only. Never edit a committed ADR in place; supersede it with a new one.

@@ -1,0 +1,56 @@
+# Operation modes context
+
+## Purpose and scope
+
+This capability defines how operators and CI enter the common pipeline, how YAML policy converts findings into PASS/BLOCK, how lane quality is sampled and monitored, and which review knowledge belongs inside rvw. Normative behavior is in [spec.md](spec.md).
+
+## Key decisions and measured basis
+
+- ADR-009 keeps one stage implementation while providing `review` and `auto` command surfaces. Policy handles reproducible inclusion/severity decisions after model-based factual adjudication.
+- The implemented pause point is after MERGE. This supersedes ADR-009 D2's original wording that pause occurred after ADJUDICATE.
+- Approval is not expressible. Policy allows only `comment` or `none`; `--allow-approve` prints a placeholder warning and does not change publication event type.
+- ADR-013 chose a standalone Python CLI. The current package floor is Python 3.12+ (not the ADR's original 3.11+), built with uv, Typer, and Pydantic v2 and published under `rvw`.
+- The lane sampling gate follows the measured enum/free parity experiment: five findings in each condition with near-identical text. PASS requires no site found only by the free variant.
+- Doctor exposes the feedback loop implied by ADR-004/005: invalid counts, `/other` rates, adjudication rejection rate, unresolved residue, and evidence coercions.
+- ADR-014 keeps review execution mechanics in rvw while implementation delegation stays in external executor profiles. Skill/docs diet is safe only after real review coverage is proven; PR #1119 provided a 39/39-valid run with 410s discovery and 197s adjudication.
+
+## Constraints
+
+- `review` does not itself apply the auto YAML policy; `auto` calls the shared pipeline and then evaluates policy.
+- Without `--repo-dir`, the common pipeline skips adjudication and renders unadjudicated findings; a confirmed-only auto policy therefore cannot block those groups.
+- The `auto` command uses the default external registry and default run root rather than exposing all review command overrides.
+- Sample equivalence is based on `(file, line)` site presence, not semantic equivalence of body text or rule names.
+- Doctor reads only persisted runs with `discover.json` and defaults to the newest 20.
+
+## Failure modes
+
+- A permissive drop/promote/block policy can produce an unintended PASS.
+- Missing policy files fail before the pipeline runs.
+- `--allow-approve` can mislead callers if they ignore the warning; it has no enabling effect.
+- Sampling is model-driven and can vary between runs despite equal replica counts.
+- Doctor's rates can be distorted by a small recent-run sample and do not validate registry predicates.
+- Premature removal of external review guidance can leave a repo without a proven rvw lane replacement.
+
+## Concrete example
+
+```yaml
+promote_to_blocker:
+  agreement_at_least: 2
+  severity_at_least: warning
+drop:
+  agreement_at_most: 1
+  severity_at_most: suggestion
+block_when:
+  severity_at_least: blocker
+  confirmed_only: true
+publish_state: comment
+```
+
+A one-replica suggestion is dropped. A two-replica confirmed warning is promoted to blocker and makes `rvw auto` exit 1. A REJECTED blocker is excluded, and an unresolved blocker does not block while `confirmed_only` is true. Publication, if enabled, remains a COMMENT review.
+
+## Historical deltas
+
+- ADR-009 D1 described `rvw review` as default auto plus `--pause`; implementation exposes separate `review` and `auto` commands over shared internals.
+- ADR-009 D2's post-ADJUDICATE pause is superseded by the implemented post-MERGE pause.
+- ADR-009 mentioned explicit approval opt-in; approval is currently impossible, and `--allow-approve` is only a warning placeholder.
+- ADR-013 specified Python 3.11+ and pyright; current packaging requires Python 3.12+ and uses `ty check`.

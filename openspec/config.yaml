@@ -1,0 +1,18 @@
+schema: spec-driven
+
+context: |
+  Process: rvw uses OpenSpec as the behavioral source of truth. Always read AGENTS.md.
+  Tech stack: Python 3.12+, uv, Typer, Pydantic v2, PyYAML, Rich, pytest, ruff, and ty.
+  Domain: layered and replicated LLM code-review orchestration, deterministic finding merge, source-grounded adjudication, reporting, and GitHub COMMENT publication.
+  Runtime registry: ~/.hermes/review/ is the runtime source of truth and is versioned outside this repository.
+  Documentation split: spec.md is requirements-only; narrative and evidence belong in the adjacent context.md.
+
+rules:
+  specs:
+    - Keep spec.md normative and limited to testable requirements with MUST or SHALL language.
+    - Every requirement must include at least one WHEN/THEN scenario.
+    - Describe implemented behavior, not future work.
+  context_docs:
+    - Include purpose/scope, key decisions and measured basis, constraints, failure modes, and at least one concrete example.
+    - Record material differences between historical ADR text and current implementation.
+    - Do not duplicate normative requirements; link to spec.md.

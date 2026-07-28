@@ -1,0 +1,102 @@
+# operation-modes
+
+## Purpose
+
+Define interactive review, deterministic auto policy, lane health gates, packaging, and the boundary between rvw execution mechanics and external executor guidance.
+
+## Requirements
+
+### Requirement: Review and auto share one pipeline
+
+The `review` and `auto` commands MUST use the same target-resolution, DISCOVER, MERGE, optional ADJUDICATE, and REPORT implementation rather than forked stage logic.
+
+#### Scenario: Auto review runs
+
+- **WHEN** `rvw auto` is invoked for a target
+- **THEN** it executes the common pipeline and then evaluates the persisted merged groups with an auto policy
+
+### Requirement: Pause stops after MERGE
+
+The `review --pause` mode MUST persist target, discovery, and merge artifacts, MUST stop immediately after MERGE, and MUST perform neither adjudication, report generation, nor publication.
+
+#### Scenario: Operator pauses a review
+
+- **WHEN** `rvw review --pause` finishes merge
+- **THEN** the CLI prints a resume hint using `rvw report --run <run-id>` and returns without later stages
+
+### Requirement: Auto policy is strict YAML
+
+An auto policy MUST strictly define `promote_to_blocker`, `drop`, `block_when`, and `publish_state`, and `publish_state` MUST accept only `comment` or `none`.
+
+#### Scenario: Policy attempts approval
+
+- **WHEN** a policy sets `publish_state: approve`
+- **THEN** policy validation fails because approval is not expressible
+
+### Requirement: Policy evaluation is deterministic
+
+Policy evaluation MUST exclude REJECTED groups, MUST drop groups matching the configured agreement/severity ceiling, MUST promote eligible non-blockers, and MUST block only groups meeting the configured effective-severity and confirmation rule.
+
+#### Scenario: Confirmed warning is promoted
+
+- **WHEN** a confirmed warning meets the promotion agreement threshold and blocker is the block threshold
+- **THEN** its key appears in both promoted and blocking results
+
+#### Scenario: Unresolved group under confirmed-only policy
+
+- **WHEN** a blocker group is unresolved and `confirmed_only: true`
+- **THEN** it is considered but does not block
+
+### Requirement: Auto exposes a CI exit contract
+
+The auto command MUST exit 0 for policy verdict PASS and MUST exit 1 for policy verdict BLOCK.
+
+#### Scenario: Blocking keys exist
+
+- **WHEN** deterministic evaluation returns BLOCK
+- **THEN** CLI output identifies the verdict and the process exits 1
+
+### Requirement: Approval cannot be emitted
+
+Neither review nor auto mode SHALL emit an approving review, and `--allow-approve` MUST remain a non-enabling placeholder while publication stays COMMENT-only.
+
+#### Scenario: Caller passes allow-approve
+
+- **WHEN** `rvw auto --allow-approve` is invoked
+- **THEN** the CLI warns that approval is not implemented and continues without enabling an APPROVE payload
+
+### Requirement: Sampling compares enum and free variants
+
+The sampling gate MUST execute closed-enum and free-rule-ID variants with equal replica counts in one bounded wave, MUST compare their unique `(file, line)` sites, and MUST report PASS only when `free_only` is empty.
+
+#### Scenario: Free variant finds an extra site
+
+- **WHEN** the free schema produces a file/line site absent from every enum run
+- **THEN** sampling reports REVIEW and exits 1
+
+### Requirement: Doctor reports lane and adjudication health
+
+The doctor command MUST aggregate recent persisted runs into per-lane run count, invalid count, finding count, and `/other` rate plus adjudication group counts, rejection rate, unresolved count, and coerced rejection count when outcomes exist.
+
+#### Scenario: Lane emits other findings
+
+- **WHEN** two of ten stored findings for a lane end in `/other`
+- **THEN** doctor reports `other_rate` 0.2 for that lane
+
+### Requirement: Packaging exposes the rvw CLI
+
+The project MUST package as the PyPI distribution `rvw`, MUST require Python 3.12 or newer, and MUST expose the Typer app at the `rvw` console entry point through the uv-managed build.
+
+#### Scenario: Installed package is invoked
+
+- **WHEN** the distribution is installed in a supported Python environment
+- **THEN** the `rvw` command resolves to `rvw.cli:app`
+
+### Requirement: Review mechanics stay inside rvw
+
+Review runtime concerns such as strict schemas, replication, deadlines, artifacts, and validity classification MUST live in rvw, while external executor documentation SHALL remain responsible for implementation-task delegation and post-delegation verification.
+
+#### Scenario: Runtime behavior changes
+
+- **WHEN** Codex completion validation or replication behavior changes
+- **THEN** the change is made in rvw's runtime/pipeline contract rather than duplicated into lane prompts or external executor profiles

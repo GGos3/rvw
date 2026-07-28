@@ -73,6 +73,11 @@ The registry lives outside the package (default `~/.hermes/review/`):
 Everything is referenced by name so documents, lanes, and runtimes can be
 swapped without touching code.
 
+## Specs
+
+Normative behavior lives in the [OpenSpec capability specifications](openspec/specs/).
+This README remains the public overview and is not the behavioral source of truth.
+
 ## Pipeline guarantees
 
 - **Validity contract** — a run counts only if: exit 0, artifact exists,
