@@ -8,6 +8,13 @@ import pytest
 import rvw.publish as publish_module
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.discover import EnrichedFinding
+from rvw.gate import (
+    DispositionDecision,
+    DispositionDocument,
+    DispositionRecord,
+    build_gate_verdict,
+    render_gate_verdict,
+)
 from rvw.merge import MergeResult, merge
 from rvw.publish import PublishError, publish_review
 from rvw.report import render_report
@@ -229,3 +236,57 @@ def test_non_422_error_is_not_retried(tmp_path: Path, monkeypatch: pytest.Monkey
         )
 
     assert calls == 1
+
+
+def test_gate_verdict_uses_comment_only_bounded_fallback_and_keeps_dispositions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run, merged, outcome, _ = prepared_run(tmp_path)
+    document = DispositionDocument(
+        schema_version=1,
+        dispositions=[
+            DispositionRecord(
+                finding_id=group.key,
+                decision=DispositionDecision.ACCEPTED,
+                reason=f"accepted {group.rule_id}",
+            )
+            for group in merged.groups
+            if outcome.verdicts[group.key] is Verdict.CONFIRMED
+        ],
+    )
+    verdict = build_gate_verdict(
+        run_id=run.run_id,
+        target=target_fixture(),
+        coverage=[],
+        merged=merged,
+        outcome=outcome,
+        dispositions=document,
+        actor="repo-owner",
+        actor_permission="admin",
+    )
+    payloads: list[dict[str, object]] = []
+
+    def fake_run(cmd: list[str], input_json: str) -> str:
+        del cmd
+        payloads.append(json.loads(input_json))
+        if len(payloads) == 1:
+            raise PublishError("anchor rejected", status_code=422)
+        return json.dumps({"html_url": "https://example.test/review/gate"})
+
+    monkeypatch.setattr(publish_module, "_run", fake_run)
+    result = publish_review(
+        run=run,
+        repo="owner/repo",
+        pr_number=42,
+        report_md=render_gate_verdict(verdict),
+        merged=merged,
+        outcome=outcome,
+        execute=True,
+    )
+
+    assert len(payloads) == 2
+    assert payloads[0]["event"] == payloads[1]["event"] == "COMMENT"
+    assert "comments" not in payloads[1]
+    assert "accepted rule/inline" in str(payloads[1]["body"])
+    assert merged.groups[0].key in str(payloads[1]["body"])
+    assert result.review_url == "https://example.test/review/gate"

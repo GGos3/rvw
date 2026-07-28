@@ -9,7 +9,7 @@ This capability owns the stable vocabulary and the name-indirection boundary bet
 - ADR-001 separates Rule, Lane, Layer, Runtime, and Run so review content, activation, execution mechanics, and publication policy do not collapse into one kind of document.
 - ADR-002 fixes four increasingly specific tiers. Base is the structural always-on floor; project and scope use repository/path predicates; dynamic carries per-target intent.
 - ADR-011 places the live registry at `~/.hermes/review/` and makes call sites refer to IDs. A lane document is YAML frontmatter plus its prompt body.
-- `validation: pending` makes lane promotion explicit. The gate compares a closed-enum run with a free-rule-ID run and passes only when `free_only` is empty. The original measured enum/free experiment produced five findings in each condition with near-identical content, supporting parity rather than suppressed recall.
+- `validation: pending` makes lane promotion explicit. The gate compares a closed-enum run with a free-rule-ID run and passes when the free union contains no rule outside the closed enum. The original parity experiment found five findings in each condition; a later 19-lane batch showed eight apparent site gaps but zero novel rule IDs, establishing those differences as replica variance rather than vocabulary recall loss.
 
 ## Constraints
 

@@ -48,6 +48,7 @@ def render_group_item(
     suffix = "" if not region_labels else f" {' '.join(region_labels)}"
     parts = [
         f"### [{group.severity.value}] {group.rule_id} — {group.file}:{line}{suffix}",
+        f"Finding ID: `{group.key}`",
         f"복제 동의 {group.agreement}/3 · 판정 {_votes(outcome, group.key)}",
     ]
     if outcome is not None:
@@ -87,7 +88,10 @@ def _render_pattern_item(
     suffix = "" if not region_labels else f" {' '.join(region_labels)}"
     parts = [f"### {fold.rule_id} — {fold.repetition}개 위치 (반복 패턴){suffix}"]
     parts.extend(
-        f"- `{member.file}:{member.line if member.line is not None else 'unknown'}`"
+        (
+            f"- `{member.file}:{member.line if member.line is not None else 'unknown'}` "
+            f"— Finding ID: `{member.key}`"
+        )
         for member in members
     )
     if fold.shared_identifiers:
@@ -239,6 +243,8 @@ def _rejected_items(merged: MergeResult, outcome: AdjudicationOutcome) -> list[s
                 [
                     "<details>",
                     f"<summary>{group.rule_id} — {group.file}:{line}</summary>",
+                    "",
+                    f"Finding ID: `{group.key}`",
                     "",
                     f"```\n{evidence}\n```",
                     "</details>",

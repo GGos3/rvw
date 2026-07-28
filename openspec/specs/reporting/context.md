@@ -12,6 +12,7 @@ This capability makes the review inspectable before any network action and trans
 - PR #1119 supplied concrete scale: 39/39 discovery runs produced 21 findings, merge produced 13 groups, and folds rendered five review items. DISCOVER took about 410s and ADJUDICATE about 197s.
 - That run excluded 2,846,073 generated characters (about 2.84 MB) and reviewed 26,195 source characters, making the exclusion accounting a material report fact rather than a hidden prompt optimization.
 - One rejected inline anchor causes GitHub to reject the entire review with 422. Bulk body fallback bounds publication at two API calls instead of probing N comments.
+- Gate verdicts are rendered from persisted typed artifacts rather than handwritten aggregate prose. Their finding table retains the public group key and disposition even when a CONFIRMED finding is also emitted as an inline comment.
 
 ## Constraints
 
@@ -23,7 +24,7 @@ This capability makes the review inspectable before any network action and trans
 
 ## Failure modes
 
-- A moved PR head can make saved inline anchors stale.
+- Ordinary `publish` can still use a moved PR head; `gate` closes this failure mode by revalidating both base and head before reaching publication.
 - GitHub errors without a recognizable status code cannot trigger the 422 fallback.
 - If the report heading structure is manually changed, body removal for inline findings may not find `## 확정 발견 (CONFIRMED)`.
 - A run can legitimately lack `outcome.json`; the report then renders findings as unadjudicated and publication creates no inline comments.

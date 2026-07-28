@@ -54,6 +54,9 @@ rvw plan --target 1119 --json
 # Deterministic gate for CI: exit 0 PASS / 1 BLOCK
 rvw auto --target 1119 --repo-dir /path/to/checkout
 
+# Anchored PR gate: disposable checkout, exact coverage, keyed dispositions
+rvw gate --target 1119
+
 # Publish the report as a GitHub review (dry-run by default)
 rvw publish --run <run-id> --execute
 ```
@@ -100,7 +103,7 @@ This README remains the public overview and is not the behavioral source of trut
 ```bash
 rvw lanes list                 # registry overview
 rvw sample --lane slop-hygiene --fixture tests/fixtures/deep.ts
-                               # enum-vs-free A/B gate for new lanes
+                               # novel-rule gap + replica site variance
 rvw doctor                     # INVALID rate, /other rate, rejection rate
 ```
 

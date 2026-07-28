@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from rvw.lane import Lane
 from rvw.runtimes import RunResult, RunStatus
-from rvw.sample import free_variant_schema, sample_lane, validate_output_free
+from rvw.sample import SampleSiteVariance, free_variant_schema, sample_lane, validate_output_free
 from rvw.schema import RuntimeFinding, RuntimeLaneOutput, Severity, Tier
 
 
@@ -113,7 +113,7 @@ def test_free_variant_schema_relaxes_only_rule_id_enum() -> None:
 @pytest.mark.parametrize("replicas", [1, 3])
 async def test_identical_sites_pass(replicas: int, tmp_path: Path) -> None:
     enum = [output(("test/one", "a.py", 4)) for _ in range(replicas)]
-    free = [output(("free/name", "a.py", 4)) for _ in range(replicas)]
+    free = [output(("test/one", "a.py", 4)) for _ in range(replicas)]
     runtime = FakeRuntime(enum, free)
     report = await sample_lane(
         lane_fixture(),
@@ -125,6 +125,8 @@ async def test_identical_sites_pass(replicas: int, tmp_path: Path) -> None:
     assert report.verdict == "PASS"
     assert report.enum_only == []
     assert report.free_only == []
+    assert report.novel_rule_ids == []
+    assert report.site_variance == []
     assert len(runtime.calls) == replicas * 2
     assert len({prompt for _, _, prompt in runtime.calls}) == 1
 
@@ -143,12 +145,75 @@ async def test_free_extra_site_requires_review(tmp_path: Path) -> None:
     )
     assert report.verdict == "REVIEW"
     assert report.free_only == [("free/extra", 9)]
+    assert report.novel_rule_ids == ["free/extra", "free/same"]
+    assert report.site_variance == []
+
+
+async def test_novel_rule_at_shared_site_requires_review(tmp_path: Path) -> None:
+    runtime = FakeRuntime(
+        [output(("test/one", "a.py", 4))],
+        [output(("invented/rule", "a.py", 4))],
+    )
+
+    report = await sample_lane(
+        lane_fixture(),
+        fixture_diff="fixture",
+        runtime=runtime,
+        out_root=tmp_path,
+        replicas=1,
+    )
+
+    assert report.enum_only == []
+    assert report.free_only == []
+    assert report.novel_rule_ids == ["invented/rule"]
+    assert report.verdict == "REVIEW"
+
+
+async def test_in_enum_site_difference_is_non_failing_variance(tmp_path: Path) -> None:
+    runtime = FakeRuntime(
+        [output(("test/one", "a.py", 4))],
+        [output(("test/one", "b.py", 9))],
+    )
+
+    report = await sample_lane(
+        lane_fixture(),
+        fixture_diff="fixture",
+        runtime=runtime,
+        out_root=tmp_path,
+        replicas=1,
+    )
+
+    assert report.verdict == "PASS"
+    assert report.novel_rule_ids == []
+    assert report.site_variance == [
+        SampleSiteVariance(variant="enum_only", rule_id="test/one", file="a.py", line=4),
+        SampleSiteVariance(variant="free_only", rule_id="test/one", file="b.py", line=9),
+    ]
+
+
+async def test_generated_other_rule_is_not_novel(tmp_path: Path) -> None:
+    runtime = FakeRuntime(
+        [output(("test/one", "a.py", 4))],
+        [output(("test/other", "b.py", 9))],
+    )
+
+    report = await sample_lane(
+        lane_fixture(),
+        fixture_diff="fixture",
+        runtime=runtime,
+        out_root=tmp_path,
+        replicas=1,
+    )
+
+    assert report.verdict == "PASS"
+    assert report.novel_rule_ids == []
+    assert [item.rule_id for item in report.site_variance] == ["test/one", "test/other"]
 
 
 async def test_invalid_replicas_are_ignored_in_union(tmp_path: Path) -> None:
     runtime = FakeRuntime(
         [None, output(("test/one", "a.py", 4)), None],
-        [None, output(("free/same", "a.py", 4)), None],
+        [None, output(("test/one", "a.py", 4)), None],
     )
     report = await sample_lane(
         lane_fixture(),
@@ -159,4 +224,4 @@ async def test_invalid_replicas_are_ignored_in_union(tmp_path: Path) -> None:
     )
     assert report.verdict == "PASS"
     assert report.enum_findings == [("test/one", 4)]
-    assert report.free_findings == [("free/same", 4)]
+    assert report.free_findings == [("test/one", 4)]

@@ -67,12 +67,22 @@ Neither review nor auto mode SHALL emit an approving review, and `--allow-approv
 
 ### Requirement: Sampling compares enum and free variants
 
-The sampling gate MUST execute closed-enum and free-rule-ID variants with equal replica counts in one bounded wave, MUST compare their unique `(file, line)` sites, and MUST report PASS only when `free_only` is empty.
+The sampling gate MUST execute closed-enum and free-rule-ID variants with equal replica counts in one bounded wave, MUST report sorted free-variant rule IDs absent from the lane's closed enum as `novel_rule_ids`, and MUST report in-enum enum-only and free-only `(file, line)` sites separately as site variance. It MUST retain the `PASS` and `REVIEW` verdict values, MUST report `REVIEW` and exit 1 only when `novel_rule_ids` is nonempty, and MUST otherwise report `PASS` and exit 0 even when site variance exists.
 
-#### Scenario: Free variant finds an extra site
+#### Scenario: Free variant invents a rule ID
 
-- **WHEN** the free schema produces a file/line site absent from every enum run
-- **THEN** sampling reports REVIEW and exits 1
+- **WHEN** any valid free-variant replica emits a rule ID outside the lane's generated closed enum
+- **THEN** sampling lists that ID in `novel_rule_ids`, reports `REVIEW`, and exits 1
+
+#### Scenario: Replicas find an existing rule at different sites
+
+- **WHEN** free-only or enum-only sites use rule IDs contained in the lane's closed enum and no novel rule ID is emitted
+- **THEN** sampling records those sites as variance, reports `PASS`, and exits 0
+
+#### Scenario: Novel rule appears at an enum-covered site
+
+- **WHEN** the free variant emits an out-of-enum rule ID at a `(file, line)` also found by the enum variant
+- **THEN** sampling still reports that rule ID as novel because gap detection is independent of site-set difference
 
 ### Requirement: Doctor reports lane and adjudication health
 

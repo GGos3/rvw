@@ -19,6 +19,7 @@ This capability turns runtime-authored claims into deterministic, inspectable me
 - A pattern component cannot contain two groups from the same file.
 - Line-less findings cannot enter region folds.
 - SHA-1 is used as a stable compact identifier, not as a security boundary.
+- Public finding IDs are stable only for unchanged base/head anchors because the hunk ID is part of the digest input. Gate dispositions therefore bind to an anchored run and cannot survive a stale rebase silently.
 
 ## Failure modes
 

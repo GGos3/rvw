@@ -29,12 +29,22 @@ def validate_output_free(raw: object) -> RuntimeLaneOutput:
 
 
 @dataclass(frozen=True)
+class SampleSiteVariance:
+    variant: Literal["enum_only", "free_only"]
+    rule_id: str
+    file: str
+    line: int | None
+
+
+@dataclass(frozen=True)
 class SampleReport:
     lane_id: str
     enum_findings: list[tuple[str, int | None]]
     free_findings: list[tuple[str, int | None]]
     enum_only: list[tuple[str, int | None]]
     free_only: list[tuple[str, int | None]]
+    novel_rule_ids: list[str]
+    site_variance: list[SampleSiteVariance]
     verdict: Literal["PASS", "REVIEW"]
     replicas: int
 
@@ -63,6 +73,43 @@ def _ordered_values(
     ]
 
 
+def _rule_ids(results: list[RunResult[Any]]) -> set[str]:
+    rule_ids: set[str] = set()
+    for result in results:
+        if result.status is not RunStatus.VALID or result.output is None:
+            continue
+        output = cast(RuntimeLaneOutput, result.output)
+        rule_ids.update(finding.rule_id for finding in output.findings)
+    return rule_ids
+
+
+def _site_variance(
+    *,
+    enum_sites: dict[tuple[str, int | None], tuple[str, int | None]],
+    free_sites: dict[tuple[str, int | None], tuple[str, int | None]],
+    closed_rule_ids: set[str],
+) -> list[SampleSiteVariance]:
+    variance: list[SampleSiteVariance] = []
+    for variant, sites, selected in (
+        ("enum_only", enum_sites, set(enum_sites) - set(free_sites)),
+        ("free_only", free_sites, set(free_sites) - set(enum_sites)),
+    ):
+        for file, line in sorted(
+            selected, key=lambda item: (item[0], item[1] is None, item[1] or 0)
+        ):
+            rule_id = sites[(file, line)][0]
+            if rule_id in closed_rule_ids:
+                variance.append(
+                    SampleSiteVariance(
+                        variant=variant,
+                        rule_id=rule_id,
+                        file=file,
+                        line=line,
+                    )
+                )
+    return variance
+
+
 async def sample_lane(
     lane: Lane,
     *,
@@ -72,7 +119,7 @@ async def sample_lane(
     replicas: int = 3,
     deadline_seconds: int = 600,
 ) -> SampleReport:
-    """Run enum and free-schema variants in one wave and compare site recall."""
+    """Run enum and free-schema variants and separate rule gaps from site variance."""
 
     if replicas < 1:
         raise ValueError("replicas must be at least 1")
@@ -119,15 +166,30 @@ async def sample_lane(
     free_sites = _sites(free_results)
     enum_only_sites = set(enum_sites) - set(free_sites)
     free_only_sites = set(free_sites) - set(enum_sites)
+    rule_schema = lane.output_schema()["properties"]["findings"]["items"]["properties"]["rule_id"]
+    closed_rule_ids = set(cast(list[str], rule_schema["enum"]))
+    novel_rule_ids = sorted(_rule_ids(free_results) - closed_rule_ids)
     return SampleReport(
         lane_id=lane.id,
         enum_findings=_ordered_values(enum_sites),
         free_findings=_ordered_values(free_sites),
         enum_only=_ordered_values(enum_sites, enum_only_sites),
         free_only=_ordered_values(free_sites, free_only_sites),
-        verdict="PASS" if not free_only_sites else "REVIEW",
+        novel_rule_ids=novel_rule_ids,
+        site_variance=_site_variance(
+            enum_sites=enum_sites,
+            free_sites=free_sites,
+            closed_rule_ids=closed_rule_ids,
+        ),
+        verdict="REVIEW" if novel_rule_ids else "PASS",
         replicas=replicas,
     )
 
 
-__all__ = ["SampleReport", "free_variant_schema", "sample_lane", "validate_output_free"]
+__all__ = [
+    "SampleReport",
+    "SampleSiteVariance",
+    "free_variant_schema",
+    "sample_lane",
+    "validate_output_free",
+]

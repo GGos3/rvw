@@ -12,7 +12,7 @@ import rvw.publish as publish_module
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.discover import DiscoverResult, EnrichedFinding
 from rvw.merge import merge
-from rvw.sample import SampleReport
+from rvw.sample import SampleReport, SampleSiteVariance
 from rvw.schema import Tier, Verdict
 from rvw.store import RunStore
 from rvw.target import ResolvedTarget
@@ -217,7 +217,20 @@ def test_sample_exit_codes_and_pass_hint(
             enum_findings=[("test/rule", 1)],
             free_findings=[("free/rule", 1)],
             enum_only=[],
-            free_only=[] if verdict == "PASS" else [("free/extra", 2)],
+            free_only=[("test/rule", 2)] if verdict == "PASS" else [("free/extra", 2)],
+            novel_rule_ids=[] if verdict == "PASS" else ["free/extra"],
+            site_variance=(
+                [
+                    SampleSiteVariance(
+                        variant="free_only",
+                        rule_id="test/rule",
+                        file="fixture.py",
+                        line=2,
+                    )
+                ]
+                if verdict == "PASS"
+                else []
+            ),
             verdict=cast(Literal["PASS", "REVIEW"], verdict),
             replicas=3,
         )
@@ -237,6 +250,62 @@ def test_sample_exit_codes_and_pass_hint(
     )
     assert result.exit_code == exit_code, result.stdout
     assert ("may drop 'validation: pending'" in result.stdout) is (verdict == "PASS")
+    if verdict == "PASS":
+        assert "site variance" in result.stdout
+
+
+def test_sample_json_separates_novel_rules_and_site_variance(
+    tmp_path: Path,
+    sample_registry: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_sample(*args: object, **kwargs: object) -> SampleReport:
+        del args, kwargs
+        return SampleReport(
+            lane_id="test-lane",
+            enum_findings=[("test/rule", 1)],
+            free_findings=[("test/rule", 2)],
+            enum_only=[("test/rule", 1)],
+            free_only=[("test/rule", 2)],
+            novel_rule_ids=[],
+            site_variance=[
+                SampleSiteVariance(
+                    variant="free_only",
+                    rule_id="test/rule",
+                    file="fixture.py",
+                    line=2,
+                )
+            ],
+            verdict="PASS",
+            replicas=3,
+        )
+
+    monkeypatch.setattr(cli_module, "sample_lane", fake_sample)
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "sample",
+            "--lane",
+            "test-lane",
+            "--fixture",
+            str(tmp_path / "fixture.py"),
+            "--registry",
+            str(sample_registry),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["novel_rule_ids"] == []
+    assert payload["site_variance"] == [
+        {
+            "variant": "free_only",
+            "rule_id": "test/rule",
+            "file": "fixture.py",
+            "line": 2,
+        }
+    ]
 
 
 def test_doctor_cli_empty_and_fixture_store(tmp_path: Path) -> None:

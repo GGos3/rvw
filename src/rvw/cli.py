@@ -6,6 +6,7 @@ import asyncio
 import json
 import subprocess
 import sys
+import tempfile
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
@@ -21,10 +22,29 @@ from rvw.adjudicate import AdjudicationOutcome, adjudicate
 from rvw.discover import DiscoverResult, discover, resolve_lane_path
 from rvw.dispatch import PlannedRun, lpt_sort_key
 from rvw.doctor import DoctorReport, diagnose
+from rvw.gate import (
+    DispositionDocument,
+    GateAnchor,
+    GateInvariantError,
+    GatePlan,
+    GateVerdict,
+    build_gate_verdict,
+    github_actor_permission,
+    load_dispositions,
+    load_gate_plan,
+    provision_checkout,
+    query_pull_request,
+    requires_owner_authorization,
+    save_gate_plan,
+    save_gate_verdict,
+    validate_coverage,
+    verify_pull_request,
+    write_disposition_template,
+)
 from rvw.lane import Lane, load_lane
 from rvw.merge import MergeResult, merge
 from rvw.policy import evaluate, load_policy
-from rvw.publish import publish_review
+from rvw.publish import PublishError, publish_review
 from rvw.registry import Registry, load_registry
 from rvw.report import render_report
 from rvw.runtimes.codex import CodexRuntime
@@ -49,6 +69,10 @@ _EXAMPLES: dict[str, list[str]] = {
         "rvw review --target HEAD --json",
     ],
     "plan": ["rvw plan --target 123 --json"],
+    "gate": [
+        "rvw gate --target 123",
+        "rvw gate --run <run-id> --dispositions dispositions.yaml",
+    ],
     "lanes": ["rvw lanes list", "rvw lanes show slop-hygiene"],
     "doctor": ["rvw doctor"],
 }
@@ -186,6 +210,17 @@ def _load_active_lanes(registry: Registry, lanes_root: Path, target: ResolvedTar
                 lanes.append(load_lane(resolve_lane_path(lanes_root, lane_id, layer.tier)))
                 seen.add(lane_id)
     return lanes
+
+
+def _gate_plan(registry_root: Path, target: ResolvedTarget, replicas: int) -> GatePlan:
+    registry, lanes_root = _load_registry_root(registry_root)
+    lane_ids = [lane.id for lane in _load_active_lanes(registry, lanes_root, target)]
+    if not lane_ids:
+        raise GateInvariantError("activated gate plan must contain at least one lane")
+    return GatePlan(
+        lane_ids=lane_ids,
+        replicas=replicas,
+    )
 
 
 def _brief_source(target: ResolvedTarget, dynamic_brief: Path | None) -> str | None:
@@ -546,6 +581,253 @@ async def _execute_pipeline(
     )
 
 
+def _load_gate_artifacts(run_id: str, out_root: Path) -> _PipelineArtifacts:
+    run = RunStore(out_root).open(run_id)
+    target = run.load_target()
+    discovered = run.load_discover()
+    merged = run.load_merge()
+    outcome = run.load_outcome()
+    report_md = run.load_report()
+    return _PipelineArtifacts(
+        run=run,
+        target=target,
+        discovered=discovered,
+        merged=merged,
+        outcome=outcome,
+        report_md=report_md,
+        report_path=run.dir / "report.md",
+    )
+
+
+def _gate_failure_verdict(artifacts: _PipelineArtifacts, message: str) -> GateVerdict:
+    target = artifacts.target
+    if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
+        raise GateInvariantError("gate failure artifact requires a PR target")
+    return GateVerdict(
+        run_id=artifacts.run.run_id,
+        repo=target.repo,
+        pr_number=target.pr_number,
+        anchor=GateAnchor(base_sha=target.base_sha, head_sha=target.head_sha),
+        counts=_verdict_counts(artifacts.outcome),
+        coverage=artifacts.discovered.coverage,
+        findings=[],
+        verdict="BLOCK",
+        failures=[message],
+    )
+
+
+def _gate_invariant_failure(artifacts: _PipelineArtifacts, exc: GateInvariantError) -> None:
+    save_gate_verdict(artifacts.run.dir, _gate_failure_verdict(artifacts, str(exc)))
+    _error_console.print(str(exc), markup=False)
+    raise typer.Exit(EXIT_NOT_FOUND) from exc
+
+
+@app.command()
+def gate(
+    target: Annotated[str | None, Option("--target")] = None,
+    run_id: Annotated[str | None, Option("--run")] = None,
+    dispositions_path: Annotated[Path | None, Option("--dispositions")] = None,
+    registry_root: Annotated[
+        Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")
+    ] = DEFAULT_REGISTRY_ROOT,
+    replicas: Annotated[int, Option("--replicas", min=1)] = _PLAN_REPLICAS,
+    out_root: Annotated[Path, Option("--out")] = DEFAULT_RUN_ROOT,
+    execute: Annotated[bool, Option("--execute")] = False,
+    json_output: Annotated[bool, Option("--json")] = False,
+) -> None:
+    """Run or resume a fail-closed, artifact-backed pull-request gate."""
+
+    if (target is None) == (run_id is None):
+        _error_console.print("gate requires exactly one of --target or --run", markup=False)
+        raise typer.Exit(EXIT_USER_ERROR)
+    asyncio.run(
+        _gate_pipeline(
+            target_spec=target,
+            run_id=run_id,
+            dispositions_path=dispositions_path,
+            registry_root=registry_root,
+            replicas=replicas,
+            out_root=out_root,
+            execute=execute,
+            json_output=json_output,
+        )
+    )
+
+
+async def _gate_pipeline(
+    *,
+    target_spec: str | None,
+    run_id: str | None,
+    dispositions_path: Path | None,
+    registry_root: Path,
+    replicas: int,
+    out_root: Path,
+    execute: bool,
+    json_output: bool,
+) -> None:
+    artifacts: _PipelineArtifacts
+    plan: GatePlan
+    if target_spec is not None:
+        try:
+            resolved = _resolve_cli_target(target_spec)
+        except (TargetResolutionError, ValueError) as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_USER_ERROR) from exc
+        try:
+            if resolved.kind != "pr" or resolved.pr_number is None or resolved.base_sha is None:
+                _error_console.print("rvw gate requires a PR target", markup=False)
+                raise typer.Exit(EXIT_USER_ERROR)
+            plan = _gate_plan(registry_root, resolved, replicas)
+            with tempfile.TemporaryDirectory(prefix="rvw-gate-") as temporary_root:
+                checkout = provision_checkout(
+                    repo=resolved.repo,
+                    pr_number=resolved.pr_number,
+                    head_sha=resolved.head_sha,
+                    destination=Path(temporary_root) / "checkout",
+                )
+                executed = await _execute_pipeline(
+                    target_spec=target_spec,
+                    repo_dir=checkout,
+                    registry_root=registry_root,
+                    replicas=replicas,
+                    out_root=out_root,
+                    pause=False,
+                    dynamic_brief=None,
+                    resolved_target=resolved,
+                )
+            if executed is None:
+                raise RuntimeError("gate review stopped before report generation")
+            artifacts = executed
+            save_gate_plan(artifacts.run.dir, plan)
+        except typer.Exit:
+            raise
+        except GateInvariantError as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_NOT_FOUND) from exc
+        except (OSError, subprocess.CalledProcessError, RuntimeError, ValueError) as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+    else:
+        assert run_id is not None
+        try:
+            artifacts = _load_gate_artifacts(run_id, out_root)
+            plan = load_gate_plan(artifacts.run.dir)
+        except (RunNotFound, StageMissing, OSError, ValueError) as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_NOT_FOUND) from exc
+
+    target = artifacts.target
+    if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
+        _error_console.print("rvw gate requires persisted PR artifacts", markup=False)
+        raise typer.Exit(EXIT_USER_ERROR)
+    anchor = GateAnchor(base_sha=target.base_sha, head_sha=target.head_sha)
+    try:
+        current = query_pull_request(target.repo, target.pr_number)
+        verify_pull_request(anchor, current)
+        coverage = validate_coverage(
+            plan.lane_ids,
+            artifacts.discovered.coverage,
+            replicas=plan.replicas,
+        )
+    except GateInvariantError as exc:
+        _gate_invariant_failure(artifacts, exc)
+    except (OSError, subprocess.CalledProcessError, ValueError, json.JSONDecodeError) as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+
+    if artifacts.outcome is None:
+        _gate_invariant_failure(artifacts, GateInvariantError("adjudication outcome is required"))
+    outcome = cast(AdjudicationOutcome, artifacts.outcome)
+
+    if dispositions_path is None:
+        template_path = write_disposition_template(artifacts.run.dir, artifacts.merged, outcome)
+        if any(
+            verdict in {Verdict.CONFIRMED, Verdict.UNCERTAIN}
+            for verdict in outcome.verdicts.values()
+        ):
+            save_gate_verdict(
+                artifacts.run.dir,
+                _gate_failure_verdict(
+                    artifacts, "actionable findings require explicit dispositions"
+                ),
+            )
+            _console.print(
+                "actionable findings require dispositions — edit "
+                f"{template_path} then resume: rvw gate --run {artifacts.run.run_id} "
+                f"--dispositions {template_path}",
+                markup=False,
+                soft_wrap=True,
+            )
+            raise typer.Exit(EXIT_NOT_FOUND)
+        dispositions = DispositionDocument(schema_version=1, dispositions=[])
+    else:
+        try:
+            dispositions = load_dispositions(dispositions_path)
+        except (OSError, ValueError) as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_USER_ERROR) from exc
+
+    actor: str | None = None
+    permission: str | None = None
+    try:
+        if requires_owner_authorization(artifacts.merged, outcome, dispositions):
+            actor, permission = github_actor_permission(target.repo)
+        verdict = build_gate_verdict(
+            run_id=artifacts.run.run_id,
+            target=target,
+            coverage=coverage,
+            merged=artifacts.merged,
+            outcome=outcome,
+            dispositions=dispositions,
+            actor=actor,
+            actor_permission=permission,
+        )
+    except GateInvariantError as exc:
+        _gate_invariant_failure(artifacts, exc)
+    except (OSError, subprocess.CalledProcessError, ValueError) as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+
+    verdict_path, markdown_path = save_gate_verdict(artifacts.run.dir, verdict)
+    verdict_markdown = markdown_path.read_text(encoding="utf-8")
+    try:
+        publication = publish_review(
+            run=artifacts.run,
+            repo=target.repo,
+            pr_number=target.pr_number,
+            report_md=verdict_markdown,
+            merged=artifacts.merged,
+            outcome=outcome,
+            execute=execute,
+        )
+    except (OSError, subprocess.CalledProcessError, PublishError) as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+    payload = {
+        "run_id": artifacts.run.run_id,
+        "verdict": verdict.verdict,
+        "verdict_path": str(verdict_path),
+        "publish_payload_path": str(artifacts.run.dir / "publish-payload.json"),
+        "review_url": publication.review_url,
+    }
+    if json_output:
+        _write_json(payload)
+    else:
+        _console.print(f"run id: {artifacts.run.run_id}", markup=False)
+        _console.print(f"verdict: {verdict.verdict}", markup=False)
+        _console.print(f"gate artifact: {verdict_path}", markup=False, soft_wrap=True)
+        if not execute:
+            _console.print(
+                f"dry-run payload: {artifacts.run.dir / 'publish-payload.json'}",
+                markup=False,
+                soft_wrap=True,
+            )
+        elif publication.review_url is not None:
+            _console.print(f"review: {publication.review_url}", markup=False, soft_wrap=True)
+    if verdict.verdict == "BLOCK":
+        raise typer.Exit(EXIT_NOT_FOUND)
+
+
 @app.command()
 def auto(
     target: Annotated[str, Option("--target")],
@@ -869,6 +1151,23 @@ def _print_sample(report: SampleReport) -> None:
             "free-only" if (rule_id, line) in free_only else "",
         )
     _console.print(table)
+    if report.novel_rule_ids:
+        _console.print(f"Novel rule IDs: {', '.join(report.novel_rule_ids)}", markup=False)
+    if report.site_variance:
+        variance_table = Table(title="Replica site variance (non-gap)")
+        variance_table.add_column("Variant")
+        variance_table.add_column("Rule ID")
+        variance_table.add_column("File")
+        variance_table.add_column("Line", justify="right")
+        for item in report.site_variance:
+            variance_table.add_row(
+                item.variant,
+                item.rule_id,
+                item.file,
+                str(item.line) if item.line is not None else "—",
+            )
+        _console.print(variance_table)
+        _console.print(f"site variance: {len(report.site_variance)}", markup=False)
     _console.print(f"Verdict: {report.verdict}", markup=False)
 
 

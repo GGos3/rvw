@@ -10,7 +10,7 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 - The implemented pause point is after MERGE. This supersedes ADR-009 D2's original wording that pause occurred after ADJUDICATE.
 - Approval is not expressible. Policy allows only `comment` or `none`; `--allow-approve` prints a placeholder warning and does not change publication event type.
 - ADR-013 chose a standalone Python CLI. The current package floor is Python 3.12+ (not the ADR's original 3.11+), built with uv, Typer, and Pydantic v2 and published under `rvw`.
-- The lane sampling gate follows the measured enum/free parity experiment: five findings in each condition with near-identical text. PASS requires no site found only by the free variant.
+- The lane sampling gate follows the measured enum/free parity experiment and the 2026-07-28 19-lane batch. Eight site-based REVIEW results contained zero novel free rule IDs; they were replica site variance, so PASS now means no free rule ID falls outside the actual closed enum.
 - Doctor exposes the feedback loop implied by ADR-004/005: invalid counts, `/other` rates, adjudication rejection rate, unresolved residue, and evidence coercions.
 - ADR-014 keeps review execution mechanics in rvw while implementation delegation stays in external executor profiles. Skill/docs diet is safe only after real review coverage is proven; PR #1119 provided a 39/39-valid run with 410s discovery and 197s adjudication.
 
@@ -19,7 +19,7 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 - `review` does not itself apply the auto YAML policy; `auto` calls the shared pipeline and then evaluates policy.
 - Without `--repo-dir`, the common pipeline skips adjudication and renders unadjudicated findings; a confirmed-only auto policy therefore cannot block those groups.
 - The `auto` command uses the default external registry and default run root rather than exposing all review command overrides.
-- Sample equivalence is based on `(file, line)` site presence, not semantic equivalence of body text or rule names.
+- Sample gap detection compares rule-ID sets against the lane enum. `(file, line)` differences remain a separate variance signal and body text is not semantically compared.
 - Doctor reads only persisted runs with `discover.json` and defaults to the newest 20.
 
 ## Failure modes
@@ -28,6 +28,7 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 - Missing policy files fail before the pipeline runs.
 - `--allow-approve` can mislead callers if they ignore the warning; it has no enabling effect.
 - Sampling is model-driven and can vary between runs despite equal replica counts.
+- Existing consumers still see only `PASS` or `REVIEW`; they must inspect `site_variance` when they need replica-distribution detail.
 - Doctor's rates can be distorted by a small recent-run sample and do not validate registry predicates.
 - Premature removal of external review guidance can leave a repo without a proven rvw lane replacement.
 
