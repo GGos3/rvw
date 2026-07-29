@@ -68,6 +68,22 @@ def canned_target() -> ResolvedTarget:
     )
 
 
+def large_target() -> ResolvedTarget:
+    paths = [f"src/chunk-{index}.ts" for index in range(3)]
+    diff = "".join(
+        (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            f"+{'x' * 149_900}\n"
+        )
+        for path in paths
+    )
+    return canned_target().model_copy(update={"changed_paths": paths, "diff": diff})
+
+
 def test_plan_json_shape_tier_zero_predicates_and_lpt_order(
     monkeypatch: pytest.MonkeyPatch, registry_root: Path
 ) -> None:
@@ -91,6 +107,7 @@ def test_plan_json_shape_tier_zero_predicates_and_lpt_order(
         "pr_number": None,
     }
     assert payload["brief_source"] is None
+    assert payload["chunk_count"] == 1
     assert payload["total_runs"] == 9
     assert {lane["lane"] for lane in payload["lanes"]} >= {
         "slop-hygiene",
@@ -133,6 +150,26 @@ def test_plan_json_shape_tier_zero_predicates_and_lpt_order(
             "replicas": 3,
         },
     ]
+
+
+def test_plan_reports_chunk_expanded_total_runs(
+    monkeypatch: pytest.MonkeyPatch, registry_root: Path
+) -> None:
+    def fake_resolve_target(spec: str, *, cwd: Path) -> ResolvedTarget:
+        del spec, cwd
+        return large_target()
+
+    monkeypatch.setattr(cli_module, "resolve_target", fake_resolve_target)
+
+    result = runner.invoke(
+        app,
+        ["plan", "--target", "HEAD", "--json", "--registry", str(registry_root)],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["chunk_count"] == 2
+    assert payload["total_runs"] == 18
 
 
 def test_head_falls_back_to_local_git_when_no_remote(

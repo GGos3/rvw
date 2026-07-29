@@ -9,6 +9,7 @@ import rvw.discover as discover_module
 from rvw.discover import discover, resolve_lane_path
 from rvw.dispatch import PlannedRun
 from rvw.lane import Lane
+from rvw.merge import merge
 from rvw.registry import Registry
 from rvw.runtimes import RunResult, RunStatus, Runtime
 from rvw.schema import RuntimeFinding, RuntimeLaneOutput, Severity, Tier
@@ -74,6 +75,7 @@ class FakeRuntime(Runtime):
         self.invalid_lanes = invalid_lanes or set()
         self.prompts: list[tuple[str, str]] = []
         self.calls: list[tuple[str, int]] = []
+        self.run_dirs: list[Path] = []
 
     async def execute(
         self,
@@ -87,6 +89,7 @@ class FakeRuntime(Runtime):
         replica = int(run_dir.name.removeprefix("r"))
         self.prompts.append((lane.id, prompt))
         self.calls.append((lane.id, replica))
+        self.run_dirs.append(run_dir)
         if lane.id in self.invalid_lanes:
             return RunResult(
                 lane_id=lane.id,
@@ -284,12 +287,32 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
         "dispatched": 2,
         "valid": 2,
         "findings": 0,
+        "runs": [
+            {
+                "replica": replica,
+                "chunk": 1,
+                "valid": True,
+                "findings": 0,
+                "invalid_reason": None,
+            }
+            for replica in (1, 2)
+        ],
     }
     assert coverage["bad"].model_dump() == {
         "lane_id": "bad",
         "dispatched": 2,
         "valid": 0,
         "findings": 0,
+        "runs": [
+            {
+                "replica": replica,
+                "chunk": 1,
+                "valid": False,
+                "findings": 0,
+                "invalid_reason": "scripted invalid",
+            }
+            for replica in (1, 2)
+        ],
     }
     assert len(runtime.calls) == 6  # two good + two initial bad + two retry bad
 
@@ -332,3 +355,102 @@ async def test_diff_budget_filters_prompt_but_keeps_full_changed_paths(tmp_path:
     assert result.budget is not None
     assert result.budget.kept_files == ["src/a.py"]
     assert result.budget.excluded_reason == {generated_path: "generated-path"}
+
+
+def multi_chunk_target() -> ResolvedTarget:
+    paths = [f"src/chunk-{index}.py" for index in range(3)]
+    segments = [
+        (
+            f"diff --git a/{path} b/{path}\n"
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            f"+{'x' * 149_900}\n"
+        )
+        for path in paths
+    ]
+    return target().model_copy(update={"changed_paths": paths, "diff": "".join(segments)})
+
+
+async def test_chunk_prompts_fan_out_with_file_plan_and_artifact_axis(tmp_path: Path) -> None:
+    lanes_root = tmp_path / "lanes"
+    write_lane(lanes_root, "base-review", Tier.BASE)
+    runtime = FakeRuntime()
+
+    result = await discover(
+        registry=registry(("base-review", Tier.BASE)),
+        lanes_root=lanes_root,
+        target=multi_chunk_target(),
+        runtime=runtime,
+        out_root=tmp_path / "out",
+        replicas=1,
+    )
+
+    assert result.budget is not None
+    assert result.budget.chunk_count == 2
+    assert runtime.run_dirs == [
+        tmp_path / "out" / "base-review" / "c1" / "r1",
+        tmp_path / "out" / "base-review" / "c2" / "r1",
+    ]
+    assert len(runtime.prompts) == 2
+    first_prompt = runtime.prompts[0][1]
+    second_prompt = runtime.prompts[1][1]
+    for prompt, marker in ((first_prompt, "chunk 1/2"), (second_prompt, "chunk 2/2")):
+        assert marker in prompt
+        assert "src/chunk-0.py" in prompt
+        assert "src/chunk-1.py" in prompt
+        assert "src/chunk-2.py" in prompt
+    assert "[included] src/chunk-0.py" in first_prompt
+    assert "[included] src/chunk-1.py" in first_prompt
+    assert "[other] src/chunk-2.py" in first_prompt
+    assert "diff --git a/src/chunk-2.py" not in first_prompt
+    assert "[other] src/chunk-0.py" in second_prompt
+    assert "[included] src/chunk-2.py" in second_prompt
+    assert "diff --git a/src/chunk-0.py" not in second_prompt
+    coverage = result.coverage[0]
+    assert coverage.dispatched == 2
+    assert coverage.valid == 2
+    assert [(run.replica, run.chunk, run.valid) for run in coverage.runs] == [
+        (1, 1, True),
+        (1, 2, True),
+    ]
+
+
+async def test_stable_finding_id_does_not_depend_on_chunk_plan(tmp_path: Path) -> None:
+    lanes_root = tmp_path / "lanes"
+    write_lane(lanes_root, "base-review", Tier.BASE)
+    finding = RuntimeFinding(
+        rule_id="base-review/rule",
+        file="src/chunk-0.py",
+        line=1,
+        severity=Severity.WARNING,
+        body="same site",
+    )
+    one_chunk_target = multi_chunk_target().model_copy(
+        update={
+            "changed_paths": ["src/chunk-0.py"],
+            "diff": multi_chunk_target().diff.split("diff --git a/src/chunk-1.py", maxsplit=1)[0],
+        }
+    )
+
+    one = await discover(
+        registry=registry(("base-review", Tier.BASE)),
+        lanes_root=lanes_root,
+        target=one_chunk_target,
+        runtime=FakeRuntime(findings={"base-review": [finding]}),
+        out_root=tmp_path / "one",
+        replicas=1,
+    )
+    many = await discover(
+        registry=registry(("base-review", Tier.BASE)),
+        lanes_root=lanes_root,
+        target=multi_chunk_target(),
+        runtime=FakeRuntime(findings={"base-review": [finding]}),
+        out_root=tmp_path / "many",
+        replicas=1,
+    )
+
+    one_group = merge(one.findings, lane_tiers={"base-review": Tier.BASE}).groups[0]
+    many_group = merge(many.findings, lane_tiers={"base-review": Tier.BASE}).groups[0]
+    assert one_group.key == many_group.key

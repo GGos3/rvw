@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 
 import rvw.cli as cli_module
 from rvw.adjudicate import AdjudicationOutcome
-from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage
+from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage, RunCoverage
 from rvw.gate import GatePlan, PullRequestState, save_gate_plan
 from rvw.merge import merge
 from rvw.schema import Severity, Tier, Verdict
@@ -67,7 +67,22 @@ def prepared_artifacts(
         lane_results={},
         findings=findings,
         coverage=[
-            LaneCoverage(lane_id="lane-a", dispatched=3, valid=valid, findings=len(findings))
+            LaneCoverage(
+                lane_id="lane-a",
+                dispatched=3,
+                valid=valid,
+                findings=len(findings),
+                runs=[
+                    RunCoverage(
+                        replica=replica,
+                        chunk=1,
+                        valid=replica <= valid,
+                        findings=len(findings) if replica == 1 else 0,
+                        invalid_reason=None if replica <= valid else "scripted_invalid",
+                    )
+                    for replica in range(1, 4)
+                ],
+            )
         ],
         budget=None,
     )
@@ -106,7 +121,7 @@ def patch_target_dependencies(
         cli_module,
         "_gate_plan",
         lambda registry_root, resolved, replicas: GatePlan(
-            schema_version=1, lane_ids=["lane-a"], replicas=replicas
+            schema_version=1, lane_ids=["lane-a"], replicas=replicas, chunk_count=1
         ),
     )
 
@@ -187,7 +202,7 @@ def test_gate_checkout_failure_is_operational_error(
         cli_module,
         "_gate_plan",
         lambda registry_root, resolved, replicas: GatePlan(
-            schema_version=1, lane_ids=["lane-a"], replicas=replicas
+            schema_version=1, lane_ids=["lane-a"], replicas=replicas, chunk_count=1
         ),
     )
 
@@ -230,7 +245,7 @@ def test_gate_resume_uses_artifacts_without_review(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
     )
     finding_id = artifacts.merged.groups[0].key
     disposition_path = tmp_path / "dispositions.yaml"
@@ -273,7 +288,7 @@ def test_gate_stale_resume_fails_before_publication(
     artifacts = prepared_artifacts(out_root)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
     )
     monkeypatch.setattr(
         cli_module,

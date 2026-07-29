@@ -280,7 +280,7 @@ def _coverage_section(
             [
                 "",
                 f"diff 예산: {budget.kept_chars:,}자 유지 / {budget.excluded_chars:,}자 제외 "
-                f"({excluded})",
+                f"({excluded}) / {budget.chunk_count}청크",
             ]
         )
     if outcome is not None and outcome.coerced_rejections > 0:

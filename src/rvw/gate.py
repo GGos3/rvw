@@ -42,6 +42,7 @@ class GatePlan(BaseModel):
     schema_version: Literal[1] = 1
     lane_ids: list[str] = Field(min_length=1)
     replicas: int = Field(ge=1)
+    chunk_count: int = Field(ge=1)
 
     @field_validator("lane_ids")
     @classmethod
@@ -134,9 +135,12 @@ def validate_coverage(
     coverage: Sequence[LaneCoverage],
     *,
     replicas: int,
+    chunk_count: int,
 ) -> list[LaneCoverage]:
     if replicas < 1:
         raise GateInvariantError("expected replicas must be positive")
+    if chunk_count < 1:
+        raise GateInvariantError("expected chunk_count must be positive")
     if not coverage:
         raise GateInvariantError("coverage must be nonempty")
 
@@ -159,15 +163,43 @@ def validate_coverage(
 
     by_lane = {item.lane_id: item for item in coverage}
     ordered: list[LaneCoverage] = []
+    expected_runs = {
+        (replica, chunk)
+        for chunk in range(1, chunk_count + 1)
+        for replica in range(1, replicas + 1)
+    }
     for lane_id in planned_lane_ids:
         item = by_lane[lane_id]
-        if item.dispatched <= 0 or item.dispatched != replicas:
+        if item.dispatched <= 0:
             raise GateInvariantError(
-                f"lane {lane_id} dispatched {item.dispatched}; expected {replicas} positive runs"
+                f"lane {lane_id} dispatched {item.dispatched}; expected positive runs"
             )
-        if item.valid != item.dispatched:
+        actual_runs = {(run.replica, run.chunk) for run in item.runs}
+        missing_runs = sorted(expected_runs - actual_runs, key=lambda value: (value[1], value[0]))
+        unexpected_runs = sorted(
+            actual_runs - expected_runs, key=lambda value: (value[1], value[0])
+        )
+        if missing_runs:
+            detail = ", ".join(
+                f"replica {replica} chunk {chunk}" for replica, chunk in missing_runs
+            )
+            raise GateInvariantError(f"lane {lane_id} missing planned coverage runs: {detail}")
+        if unexpected_runs:
+            detail = ", ".join(
+                f"replica {replica} chunk {chunk}" for replica, chunk in unexpected_runs
+            )
+            raise GateInvariantError(f"lane {lane_id} has unexpected coverage runs: {detail}")
+        expected_count = replicas * chunk_count
+        if item.dispatched != expected_count:
             raise GateInvariantError(
-                f"lane {lane_id} valid {item.valid} does not equal dispatched {item.dispatched}"
+                f"lane {lane_id} dispatched {item.dispatched}; expected {expected_count} runs"
+            )
+        invalid_runs = [run for run in item.runs if not run.valid]
+        if invalid_runs:
+            run = invalid_runs[0]
+            raise GateInvariantError(
+                f"lane {lane_id} replica {run.replica} chunk {run.chunk} invalid: "
+                f"{run.invalid_reason}"
             )
         ordered.append(item)
     return ordered

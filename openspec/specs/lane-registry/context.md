@@ -4,6 +4,8 @@
 
 This capability owns the stable vocabulary and the name-indirection boundary between rvw code and the external runtime registry. Normative behavior is in [spec.md](spec.md); the registry itself remains outside this repository at `~/.hermes/review/`.
 
+A planned Run expands across lane, replica, and diff chunk. `rvw plan` derives chunks from the same exclusion and whole-file planner as execution, so its total is `lanes x replicas x chunks`; a one-chunk target retains the historical lane x replica count.
+
 ## Key decisions and measured basis
 
 - ADR-001 separates Rule, Lane, Layer, Runtime, and Run so review content, activation, execution mechanics, and publication policy do not collapse into one kind of document.

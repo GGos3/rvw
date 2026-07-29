@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import pytest
-
-from rvw.diffbudget import DiffBudgetExceeded, apply_diff_budget
+from rvw.diffbudget import apply_diff_budget
 
 
 def diff_segment(path: str, body: str) -> str:
@@ -13,7 +11,8 @@ def test_generated_path_is_excluded_and_announced() -> None:
     generated = diff_segment("runtime-snapshots/contract-graph.json", "generated")
     source = diff_segment("src/app.py", "kept")
 
-    filtered, report = apply_diff_budget(generated + source)
+    chunks, report = apply_diff_budget(generated + source)
+    filtered = chunks[0].text
 
     assert filtered.startswith(
         "# rvw: 1 files excluded from review diff (generated/oversize): "
@@ -32,7 +31,8 @@ def test_generated_path_is_excluded_and_announced() -> None:
 def test_generated_globs_match_nested_paths() -> None:
     generated = diff_segment("packages/api/runtime-snapshots/graph.json", "generated")
 
-    filtered, report = apply_diff_budget(generated)
+    chunks, report = apply_diff_budget(generated)
+    filtered = chunks[0].text
 
     assert "diff --git" not in filtered
     assert report.excluded_reason == {"packages/api/runtime-snapshots/graph.json": "generated-path"}
@@ -41,7 +41,8 @@ def test_generated_globs_match_nested_paths() -> None:
 def test_oversize_file_is_excluded() -> None:
     oversized = diff_segment("src/large.py", "x" * 80)
 
-    filtered, report = apply_diff_budget(oversized, max_file_chars=len(oversized) - 1)
+    chunks, report = apply_diff_budget(oversized, max_file_chars=len(oversized) - 1)
+    filtered = chunks[0].text
 
     assert filtered.startswith("# rvw: 1 files excluded")
     assert report.kept_files == []
@@ -50,35 +51,55 @@ def test_oversize_file_is_excluded() -> None:
     assert report.excluded_chars == len(oversized)
 
 
-def test_remaining_total_over_budget_raises_with_largest_offenders() -> None:
-    small = diff_segment("src/small.py", "x")
-    large = diff_segment("src/large.py", "x" * 20)
-
-    with pytest.raises(DiffBudgetExceeded) as raised:
-        apply_diff_budget(
-            small + large,
-            max_file_chars=10_000,
-            max_total_chars=len(small + large) - 1,
-        )
-
-    assert raised.value.offenders == [
-        ("src/large.py", len(large)),
-        ("src/small.py", len(small)),
+def test_tabelog_sized_diff_is_chunked_in_file_order_with_exact_placement() -> None:
+    segments = [
+        diff_segment(f"providers/tabelog/file-{index}.ts", "x" * 146_900) for index in range(5)
     ]
-    assert "src/large.py" in str(raised.value)
-    assert str(len(large)) in str(raised.value)
+    diff = "".join(segments)
+    assert 734_000 < len(diff) < 736_000
+
+    chunks, report = apply_diff_budget(diff)
+
+    assert len(chunks) >= 2
+    assert [file for chunk in chunks for file in chunk.files] == [
+        f"providers/tabelog/file-{index}.ts" for index in range(5)
+    ]
+    assert all(chunk.chars <= 400_000 for chunk in chunks)
+    assert "".join(chunk.text for chunk in chunks) == diff
+    assert sum(chunk.chars for chunk in chunks) == len(diff)
+    assert report.chunk_count == len(chunks)
+    assert [placement.model_dump() for placement in report.chunks] == [
+        {"index": chunk.index, "files": chunk.files, "chars": chunk.chars} for chunk in chunks
+    ]
 
 
 def test_no_exclusions_preserves_diff_exactly() -> None:
     diff = diff_segment("src/app.py", "kept")
 
-    filtered, report = apply_diff_budget(diff)
+    chunks, report = apply_diff_budget(diff)
 
-    assert filtered == diff
+    assert len(chunks) == 1
+    assert chunks[0].text == diff
+    assert chunks[0].files == ["src/app.py"]
+    assert chunks[0].chars == len(diff)
     assert report.model_dump() == {
         "kept_files": ["src/app.py"],
         "excluded_files": [],
         "excluded_reason": {},
         "kept_chars": len(diff),
         "excluded_chars": 0,
+        "chunk_count": 1,
+        "chunks": [{"index": 1, "files": ["src/app.py"], "chars": len(diff)}],
     }
+
+
+def test_diff_just_below_total_limit_stays_one_byte_identical_chunk() -> None:
+    diff = diff_segment("src/a.py", "x" * 199_000) + diff_segment("src/b.py", "x" * 199_000)
+    assert 398_000 < len(diff) <= 400_000
+
+    chunks, report = apply_diff_budget(diff)
+
+    assert len(chunks) == 1
+    assert chunks[0].text == diff
+    assert chunks[0].chars == len(diff)
+    assert report.chunk_count == 1

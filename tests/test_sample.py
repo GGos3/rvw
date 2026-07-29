@@ -38,6 +38,22 @@ def output(*findings: tuple[str, str, int]) -> RuntimeLaneOutput:
     )
 
 
+def fixture_diff(*, large: bool = False) -> str:
+    count = 3 if large else 1
+    body = "x" * 149_900 if large else "kept"
+    return "".join(
+        (
+            f"diff --git a/file-{index}.py b/file-{index}.py\n"
+            f"--- a/file-{index}.py\n"
+            f"+++ b/file-{index}.py\n"
+            "@@ -1 +1 @@\n"
+            "-old\n"
+            f"+{body}\n"
+        )
+        for index in range(count)
+    )
+
+
 class FakeRuntime:
     name = "fake"
 
@@ -48,6 +64,7 @@ class FakeRuntime:
     ) -> None:
         self.outputs = {"enum": list(enum_outputs), "free": list(free_outputs)}
         self.calls: list[tuple[str, Path, str]] = []
+        self.call_counts = {"enum": 0, "free": 0}
 
     async def execute_raw(
         self,
@@ -60,10 +77,16 @@ class FakeRuntime:
         validate: Callable[[object], BaseModel],
     ) -> RunResult[BaseModel]:
         del schema, deadline_seconds, workdir
-        variant = run_dir.parent.name
+        variant = (
+            run_dir.parent.parent.name
+            if run_dir.parent.name.startswith("c")
+            else run_dir.parent.name
+        )
         replica = int(run_dir.name.removeprefix("r"))
         self.calls.append((variant, run_dir, prompt))
-        scripted = self.outputs[variant][replica - 1]
+        call_index = self.call_counts[variant]
+        self.call_counts[variant] = call_index + 1
+        scripted = self.outputs[variant][call_index]
         if scripted is None:
             return RunResult(
                 lane_id="test-lane",
@@ -117,7 +140,7 @@ async def test_identical_sites_pass(replicas: int, tmp_path: Path) -> None:
     runtime = FakeRuntime(enum, free)
     report = await sample_lane(
         lane_fixture(),
-        fixture_diff="diff --git a/a.py b/a.py\n",
+        fixture_diff=fixture_diff(),
         runtime=runtime,
         out_root=tmp_path,
         replicas=replicas,
@@ -129,6 +152,11 @@ async def test_identical_sites_pass(replicas: int, tmp_path: Path) -> None:
     assert report.site_variance == []
     assert len(runtime.calls) == replicas * 2
     assert len({prompt for _, _, prompt in runtime.calls}) == 1
+    assert [run_dir for _variant, run_dir, _prompt in runtime.calls] == [
+        tmp_path / variant / f"r{replica}"
+        for variant in ("enum", "free")
+        for replica in range(1, replicas + 1)
+    ]
 
 
 async def test_free_extra_site_requires_review(tmp_path: Path) -> None:
@@ -138,7 +166,7 @@ async def test_free_extra_site_requires_review(tmp_path: Path) -> None:
     )
     report = await sample_lane(
         lane_fixture(),
-        fixture_diff="fixture",
+        fixture_diff=fixture_diff(),
         runtime=runtime,
         out_root=tmp_path,
         replicas=1,
@@ -157,7 +185,7 @@ async def test_novel_rule_at_shared_site_requires_review(tmp_path: Path) -> None
 
     report = await sample_lane(
         lane_fixture(),
-        fixture_diff="fixture",
+        fixture_diff=fixture_diff(),
         runtime=runtime,
         out_root=tmp_path,
         replicas=1,
@@ -177,7 +205,7 @@ async def test_in_enum_site_difference_is_non_failing_variance(tmp_path: Path) -
 
     report = await sample_lane(
         lane_fixture(),
-        fixture_diff="fixture",
+        fixture_diff=fixture_diff(),
         runtime=runtime,
         out_root=tmp_path,
         replicas=1,
@@ -199,7 +227,7 @@ async def test_generated_other_rule_is_not_novel(tmp_path: Path) -> None:
 
     report = await sample_lane(
         lane_fixture(),
-        fixture_diff="fixture",
+        fixture_diff=fixture_diff(),
         runtime=runtime,
         out_root=tmp_path,
         replicas=1,
@@ -217,7 +245,7 @@ async def test_invalid_replicas_are_ignored_in_union(tmp_path: Path) -> None:
     )
     report = await sample_lane(
         lane_fixture(),
-        fixture_diff="fixture",
+        fixture_diff=fixture_diff(),
         runtime=runtime,
         out_root=tmp_path,
         replicas=3,
@@ -225,3 +253,37 @@ async def test_invalid_replicas_are_ignored_in_union(tmp_path: Path) -> None:
     assert report.verdict == "PASS"
     assert report.enum_findings == [("test/one", 4)]
     assert report.free_findings == [("test/one", 4)]
+
+
+async def test_large_fixture_runs_every_variant_replica_chunk(tmp_path: Path) -> None:
+    enum = [
+        output(("test/one", "file-0.py", 1)),
+        output(("test/two", "file-2.py", 1)),
+    ]
+    free = [
+        output(("test/one", "file-0.py", 1)),
+        output(("test/two", "file-2.py", 1)),
+    ]
+    runtime = FakeRuntime(enum, free)
+
+    report = await sample_lane(
+        lane_fixture(),
+        fixture_diff=fixture_diff(large=True),
+        runtime=runtime,
+        out_root=tmp_path,
+        replicas=1,
+    )
+
+    assert report.chunk_count == 2
+    assert [run_dir for _variant, run_dir, _prompt in runtime.calls] == [
+        tmp_path / "enum" / "c1" / "r1",
+        tmp_path / "enum" / "c2" / "r1",
+        tmp_path / "free" / "c1" / "r1",
+        tmp_path / "free" / "c2" / "r1",
+    ]
+    assert [
+        "chunk 1/2" in runtime.calls[0][2],
+        "chunk 2/2" in runtime.calls[1][2],
+        "chunk 1/2" in runtime.calls[2][2],
+        "chunk 2/2" in runtime.calls[3][2],
+    ] == [True, True, True, True]

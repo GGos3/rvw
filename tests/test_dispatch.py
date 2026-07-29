@@ -81,8 +81,14 @@ class FakeRuntime(Runtime):
         return self._lane_call_counts.get(lane_id, 0)
 
 
-def planned(lane: Lane, replica: int = 1) -> PlannedRun:
-    return PlannedRun(lane=lane, prompt="prompt", replica=replica)
+def planned(lane: Lane, replica: int = 1, *, chunk: int = 1, chunk_count: int = 1) -> PlannedRun:
+    return PlannedRun(
+        lane=lane,
+        prompt="prompt",
+        replica=replica,
+        chunk=chunk,
+        chunk_count=chunk_count,
+    )
 
 
 async def test_heavy_runs_are_admitted_before_normal_and_light(tmp_path: Path) -> None:
@@ -200,6 +206,46 @@ async def test_run_directory_slugs_lane_id(tmp_path: Path) -> None:
     await dispatch([planned(lane, 3)], runtime, out_root=tmp_path)
 
     assert runtime.run_dirs == [tmp_path / "scope--bori--agent" / "r3"]
+
+
+async def test_multi_chunk_paths_and_result_keys_are_distinct(tmp_path: Path) -> None:
+    lane = make_lane("scope/bori/agent")
+    runtime = FakeRuntime()
+
+    results = await dispatch(
+        [
+            planned(lane, 1, chunk=1, chunk_count=2),
+            planned(lane, 1, chunk=2, chunk_count=2),
+        ],
+        runtime,
+        out_root=tmp_path,
+    )
+
+    assert runtime.run_dirs == [
+        tmp_path / "scope--bori--agent" / "c1" / "r1",
+        tmp_path / "scope--bori--agent" / "c2" / "r1",
+    ]
+    assert [(result.replica, result.chunk) for result in results] == [(1, 1), (1, 2)]
+
+
+async def test_all_invalid_retry_is_scoped_to_lane_chunk(tmp_path: Path) -> None:
+    lane = make_lane("chunk-retry")
+    runtime = FakeRuntime(statuses={lane.id: [RunStatus.INVALID, RunStatus.VALID, RunStatus.VALID]})
+
+    results = await dispatch(
+        [
+            planned(lane, 1, chunk=1, chunk_count=2),
+            planned(lane, 1, chunk=2, chunk_count=2),
+        ],
+        runtime,
+        out_root=tmp_path,
+    )
+
+    assert runtime.calls_for(lane.id) == 3
+    assert [(result.chunk, result.status) for result in results] == [
+        (1, RunStatus.VALID),
+        (2, RunStatus.VALID),
+    ]
 
 
 def assert_runtime_protocol(runtime: Runtime, callback: Callable[[RunResult], None]) -> None:

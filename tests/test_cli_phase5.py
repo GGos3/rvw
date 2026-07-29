@@ -233,6 +233,7 @@ def test_sample_exit_codes_and_pass_hint(
             ),
             verdict=cast(Literal["PASS", "REVIEW"], verdict),
             replicas=3,
+            chunk_count=1,
         )
 
     monkeypatch.setattr(cli_module, "sample_lane", fake_sample)
@@ -278,6 +279,7 @@ def test_sample_json_separates_novel_rules_and_site_variance(
             ],
             verdict="PASS",
             replicas=3,
+            chunk_count=1,
         )
 
     monkeypatch.setattr(cli_module, "sample_lane", fake_sample)
@@ -316,7 +318,24 @@ def test_doctor_cli_empty_and_fixture_store(tmp_path: Path) -> None:
         json.dumps(
             {
                 "findings": [],
-                "coverage": [{"lane_id": "lane", "dispatched": 3, "valid": 2, "findings": 0}],
+                "coverage": [
+                    {
+                        "lane_id": "lane",
+                        "dispatched": 3,
+                        "valid": 2,
+                        "findings": 0,
+                        "runs": [
+                            {
+                                "replica": replica,
+                                "chunk": 1,
+                                "valid": replica < 3,
+                                "findings": 0,
+                                "invalid_reason": (None if replica < 3 else "scripted_invalid"),
+                            }
+                            for replica in range(1, 4)
+                        ],
+                    }
+                ],
                 "budget": None,
             }
         ),

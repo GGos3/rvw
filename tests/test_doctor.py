@@ -61,6 +61,25 @@ def outcome(
     }
 
 
+def coverage(lane_id: str, *, dispatched: int, valid: int, findings: int) -> dict[str, object]:
+    return {
+        "lane_id": lane_id,
+        "dispatched": dispatched,
+        "valid": valid,
+        "findings": findings,
+        "runs": [
+            {
+                "replica": replica,
+                "chunk": 1,
+                "valid": replica <= valid,
+                "findings": findings if replica == 1 else 0,
+                "invalid_reason": None if replica <= valid else "scripted_invalid",
+            }
+            for replica in range(1, dispatched + 1)
+        ],
+    }
+
+
 def test_empty_store(tmp_path: Path) -> None:
     report = diagnose(RunStore(tmp_path))
     assert report.runs_scanned == 0
@@ -73,7 +92,7 @@ def test_counts_lane_health_and_adjudication(tmp_path: Path) -> None:
         tmp_path,
         "one",
         findings=[finding("lane-a", "lane/rule"), finding("lane-a", "lane/other")],
-        coverage=[{"lane_id": "lane-a", "dispatched": 3, "valid": 2, "findings": 2}],
+        coverage=[coverage("lane-a", dispatched=3, valid=2, findings=2)],
         outcome=outcome(
             {"confirmed": "CONFIRMED", "rejected": "REJECTED", "uncertain": "UNCERTAIN"},
             unresolved=["uncertain"],
@@ -86,8 +105,8 @@ def test_counts_lane_health_and_adjudication(tmp_path: Path) -> None:
         "two",
         findings=[finding("lane-b", "b/other")],
         coverage=[
-            {"lane_id": "lane-a", "dispatched": 3, "valid": 3, "findings": 0},
-            {"lane_id": "lane-b", "dispatched": 2, "valid": 1, "findings": 1},
+            coverage("lane-a", dispatched=3, valid=3, findings=0),
+            coverage("lane-b", dispatched=2, valid=1, findings=1),
         ],
         outcome=outcome({"confirmed-2": "CONFIRMED"}),
         mtime=2,
@@ -119,14 +138,14 @@ def test_partial_runs_and_last_n_by_directory_mtime(tmp_path: Path) -> None:
         tmp_path,
         "old",
         findings=[finding("old", "old/other")],
-        coverage=[{"lane_id": "old", "dispatched": 1, "valid": 0, "findings": 1}],
+        coverage=[coverage("old", dispatched=1, valid=0, findings=0)],
         mtime=1,
     )
     write_run(
         tmp_path,
         "new",
         findings=[],
-        coverage=[{"lane_id": "new", "dispatched": 3, "valid": 3, "findings": 0}],
+        coverage=[coverage("new", dispatched=3, valid=3, findings=0)],
         mtime=2,
     )
     incomplete = tmp_path / "newest-without-discover"

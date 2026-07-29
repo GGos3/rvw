@@ -28,10 +28,13 @@ class RunResult[OutputT: BaseModel]:
     invalid_reason: str | None
     wall_seconds: float
     artifact_dir: Path
+    chunk: int = 1
 
     def __post_init__(self) -> None:
         if self.replica < 1:
             raise ValueError("replica must be at least 1")
+        if self.chunk < 1:
+            raise ValueError("chunk must be at least 1")
         if self.wall_seconds < 0:
             raise ValueError("wall_seconds must not be negative")
         if self.status is RunStatus.VALID:

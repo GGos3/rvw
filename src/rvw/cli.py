@@ -19,6 +19,7 @@ from rich.table import Table
 
 from rvw import __version__
 from rvw.adjudicate import AdjudicationOutcome, adjudicate
+from rvw.diffbudget import apply_diff_budget
 from rvw.discover import DiscoverResult, discover, resolve_lane_path
 from rvw.dispatch import PlannedRun, lpt_sort_key
 from rvw.doctor import DoctorReport, diagnose
@@ -217,9 +218,11 @@ def _gate_plan(registry_root: Path, target: ResolvedTarget, replicas: int) -> Ga
     lane_ids = [lane.id for lane in _load_active_lanes(registry, lanes_root, target)]
     if not lane_ids:
         raise GateInvariantError("activated gate plan must contain at least one lane")
+    chunks, _budget = apply_diff_budget(target.diff)
     return GatePlan(
         lane_ids=lane_ids,
         replicas=replicas,
+        chunk_count=len(chunks),
     )
 
 
@@ -239,9 +242,17 @@ def _plan_payload(
 ) -> dict[str, Any]:
     active_layers = registry.activate(target.repo, target.changed_paths)
     lanes = _load_active_lanes(registry, lanes_root, target)
+    chunks, _budget = apply_diff_budget(target.diff)
     runs = [
-        PlannedRun(lane=lane, prompt="", replica=replica)
+        PlannedRun(
+            lane=lane,
+            prompt="",
+            replica=replica,
+            chunk=chunk.index,
+            chunk_count=len(chunks),
+        )
         for lane in lanes
+        for chunk in chunks
         for replica in range(1, _PLAN_REPLICAS + 1)
     ]
     ordered_runs = sorted(runs, key=lambda run: lpt_sort_key(run.lane.cost))
@@ -273,6 +284,7 @@ def _plan_payload(
             for lane in lanes
         ],
         "dispatch_order": [run.lane.id for run in ordered_runs],
+        "chunk_count": len(chunks),
         "total_runs": len(runs),
         "brief_source": _brief_source(target, dynamic_brief),
     }
@@ -310,6 +322,7 @@ def _print_plan(payload: dict[str, Any]) -> None:
             str(lane_value["replicas"]),
         )
     _console.print(table)
+    _console.print(f"Chunks: {payload['chunk_count']}")
     _console.print(f"Total runs: {payload['total_runs']}")
 
 
@@ -728,6 +741,7 @@ async def _gate_pipeline(
             plan.lane_ids,
             artifacts.discovered.coverage,
             replicas=plan.replicas,
+            chunk_count=plan.chunk_count,
         )
     except GateInvariantError as exc:
         _gate_invariant_failure(artifacts, exc)

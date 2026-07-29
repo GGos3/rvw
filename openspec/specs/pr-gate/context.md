@@ -7,7 +7,7 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 ## Key decisions and measured basis
 
 - Six apifuse dogfood rounds found unbound shell variables, captured-but-unchecked SHAs, count-only disposition checks, missing coverage checks, double review ambiguity, and manual 40-character SHA relay.
-- Target mode performs one review and writes `gate-plan.json`. When findings need a human decision, `gate-dispositions.yaml` contains the deterministic group keys and resume mode consumes the same run without invoking models again.
+- Target mode performs one review and writes `gate-plan.json`, including the planner-derived chunk count. Coverage validation compares the exact lane x replica x chunk Cartesian product rather than relying on aggregate counts. When findings need a human decision, `gate-dispositions.yaml` contains the deterministic group keys and resume mode consumes the same run without invoking models again.
 - The repository-admin permission returned by GitHub is the verifiable owner authority for blocker acceptance. rvw records that actor and the human reason but does not decide or publish an approval.
 - `accepted` and `must_fix` are deliberately small disposition states. The latter keeps the gate blocked; the former records explicit risk acceptance subject to blocker authority.
 - Gate publication reuses the ordinary publish implementation, so COMMENT hardcoding, dry-run default, inline selection, and the bounded bulk 422 fallback have one code path.
@@ -18,6 +18,7 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 - The checkout clone fetches GitHub's `refs/pull/<number>/head` before detaching at the captured SHA so fork pull requests do not depend on the base branch advertising the commit.
 - Finding IDs include hunk identity and are valid only while both persisted anchors remain current.
 - Resume requires the ordinary run stages and `gate-plan.json` written by target mode.
+- A coverage failure identifies the missing, unexpected, or invalid replica-chunk identity from persisted artifacts.
 
 ## Failure modes
 

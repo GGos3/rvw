@@ -28,6 +28,7 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 - Missing policy files fail before the pipeline runs.
 - `--allow-approve` can mislead callers if they ignore the warning; it has no enabling effect.
 - Sampling is model-driven and can vary between runs despite equal replica counts.
+- Sampling uses the production diff planner and scales as two variants x replicas x chunks, while comparison still unions valid findings by variant.
 - Existing consumers still see only `PASS` or `REVIEW`; they must inspect `site_variance` when they need replica-distribution detail.
 - Doctor's rates can be distorted by a small recent-run sample and do not validate registry predicates.
 - Premature removal of external review guidance can leave a repo without a proven rvw lane replacement.

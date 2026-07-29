@@ -1,4 +1,4 @@
-"""Generated-path filtering and hard size guards for review diffs."""
+"""Generated-path filtering and ordered file-chunk planning for review diffs."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import shlex
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 DEFAULT_GENERATED_GLOBS = [
     "**/runtime-snapshots/**",
@@ -29,36 +29,46 @@ _OLD_FILE_HEADER = re.compile(r"^--- (?P<path>.+)$", re.MULTILINE)
 _NEW_FILE_HEADER = re.compile(r"^\+\+\+ (?P<path>.+)$", re.MULTILINE)
 
 
+class DiffChunkPlacement(BaseModel):
+    """Persisted file placement and character accounting for one diff chunk."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    index: int = Field(ge=1)
+    files: list[str]
+    chars: int = Field(ge=0)
+
+
+class DiffChunk(DiffChunkPlacement):
+    """One prompt-sized group of complete, ordered per-file diff segments."""
+
+    text: str
+
+
 class DiffBudgetReport(BaseModel):
-    """Character accounting and file-level exclusions for one review diff."""
+    """Character accounting, exclusions, and chunk placement for one review diff."""
 
     model_config = ConfigDict(extra="forbid")
 
     kept_files: list[str]
     excluded_files: list[str]
     excluded_reason: dict[str, str]
-    kept_chars: int
-    excluded_chars: int
+    kept_chars: int = Field(ge=0)
+    excluded_chars: int = Field(ge=0)
+    chunk_count: int = Field(ge=1)
+    chunks: list[DiffChunkPlacement]
 
-
-class DiffBudgetExceeded(RuntimeError):
-    """The non-excluded review diff still exceeds its aggregate hard limit."""
-
-    def __init__(
-        self,
-        *,
-        total_chars: int,
-        max_total_chars: int,
-        offenders: list[tuple[str, int]],
-    ) -> None:
-        self.total_chars = total_chars
-        self.max_total_chars = max_total_chars
-        self.offenders = offenders
-        detail = ", ".join(f"{path} ({size} chars)" for path, size in offenders)
-        super().__init__(
-            f"review diff is {total_chars} chars after exclusions, exceeding the "
-            f"{max_total_chars}-char total budget; top offenders: {detail}"
-        )
+    @model_validator(mode="after")
+    def _placement_must_match_totals(self) -> DiffBudgetReport:
+        if self.chunk_count != len(self.chunks):
+            raise ValueError("chunk_count must equal the number of chunk placements")
+        if [chunk.index for chunk in self.chunks] != list(range(1, self.chunk_count + 1)):
+            raise ValueError("chunk placement indexes must be contiguous from 1")
+        if [file for chunk in self.chunks for file in chunk.files] != self.kept_files:
+            raise ValueError("chunk placements must contain every kept file in order")
+        if sum(chunk.chars for chunk in self.chunks) != self.kept_chars:
+            raise ValueError("chunk placement characters must equal kept_chars")
+        return self
 
 
 @dataclass(frozen=True)
@@ -142,11 +152,13 @@ def apply_diff_budget(
     generated_globs: Sequence[str] = DEFAULT_GENERATED_GLOBS,
     max_file_chars: int = 200_000,
     max_total_chars: int = 400_000,
-) -> tuple[str, DiffBudgetReport]:
-    """Filter generated/oversize files, then enforce the aggregate diff limit."""
+) -> tuple[list[DiffChunk], DiffBudgetReport]:
+    """Filter excluded files, then plan ordered prompt-sized file chunks."""
 
     if max_file_chars < 0 or max_total_chars < 0:
         raise ValueError("diff budget limits must be non-negative")
+    if max_file_chars > max_total_chars:
+        raise ValueError("max_file_chars must not exceed max_total_chars")
 
     segments = split_diff_files(diff)
     kept: list[DiffFileSegment] = []
@@ -162,40 +174,58 @@ def apply_diff_budget(
         else:
             kept.append(segment)
 
-    kept_chars = sum(len(segment.text) for segment in kept)
-    if kept_chars > max_total_chars:
-        offenders = sorted(
-            ((segment.file, len(segment.text)) for segment in kept),
-            key=lambda item: (-item[1], item[0]),
-        )
-        raise DiffBudgetExceeded(
-            total_chars=kept_chars,
-            max_total_chars=max_total_chars,
-            offenders=offenders,
-        )
+    grouped: list[list[DiffFileSegment]] = []
+    current: list[DiffFileSegment] = []
+    current_chars = 0
+    for segment in kept:
+        segment_chars = len(segment.text)
+        if current and current_chars + segment_chars > max_total_chars:
+            grouped.append(current)
+            current = []
+            current_chars = 0
+        current.append(segment)
+        current_chars += segment_chars
+    if current or not grouped:
+        grouped.append(current)
 
-    report = DiffBudgetReport(
-        kept_files=[segment.file for segment in kept],
-        excluded_files=[segment.file for segment in excluded],
-        excluded_reason=reasons,
-        kept_chars=kept_chars,
-        excluded_chars=sum(len(segment.text) for segment in excluded),
-    )
-    filtered = "".join(segment.text for segment in kept)
+    header = ""
     if excluded:
         paths = ", ".join(segment.file for segment in excluded)
         header = (
             f"# rvw: {len(excluded)} files excluded from review diff "
             f"(generated/oversize): {paths}\n"
         )
-        filtered = f"{header}{filtered}"
-    return filtered, report
+
+    chunks = [
+        DiffChunk(
+            index=index,
+            files=[segment.file for segment in group],
+            chars=sum(len(segment.text) for segment in group),
+            text=f"{header}{''.join(segment.text for segment in group)}",
+        )
+        for index, group in enumerate(grouped, start=1)
+    ]
+
+    report = DiffBudgetReport(
+        kept_files=[segment.file for segment in kept],
+        excluded_files=[segment.file for segment in excluded],
+        excluded_reason=reasons,
+        kept_chars=sum(chunk.chars for chunk in chunks),
+        excluded_chars=sum(len(segment.text) for segment in excluded),
+        chunk_count=len(chunks),
+        chunks=[
+            DiffChunkPlacement(index=chunk.index, files=chunk.files, chars=chunk.chars)
+            for chunk in chunks
+        ],
+    )
+    return chunks, report
 
 
 __all__ = [
     "DEFAULT_GENERATED_GLOBS",
-    "DiffBudgetExceeded",
     "DiffBudgetReport",
+    "DiffChunk",
+    "DiffChunkPlacement",
     "DiffFileSegment",
     "apply_diff_budget",
     "split_diff_files",

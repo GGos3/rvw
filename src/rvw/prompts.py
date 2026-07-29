@@ -18,6 +18,7 @@ def build_lane_prompt(
     brief: str | None,
     brief_source: str | None,
     covered_rules: dict[str, list[str]],
+    chunk_context: str | None = None,
 ) -> str:
     """Build one lane prompt without performing I/O."""
 
@@ -45,6 +46,9 @@ def build_lane_prompt(
             brief_lines.append("BRIEF UNAVAILABLE — mark findings inconclusive")
         sections.append("\n\n".join(brief_lines))
 
+    if chunk_context is not None:
+        sections.append(chunk_context)
+
     sections.append(f"## Unified diff under review\n\n```diff\n{diff}```")
     declared_rules = ", ".join(f"`{rule}`" for rule in lane.rules)
     sections.append(
@@ -57,4 +61,19 @@ def build_lane_prompt(
     return "\n\n".join(sections)
 
 
-__all__: list[str] = ["build_lane_prompt"]
+def build_chunk_context(
+    *,
+    chunk: int,
+    chunk_count: int,
+    chunk_files: list[str],
+    kept_files: list[str],
+) -> str:
+    """Render cross-chunk path context without duplicating other chunk diffs."""
+
+    included = set(chunk_files)
+    lines = ["## Diff chunk context", f"chunk {chunk}/{chunk_count}", "All kept files:"]
+    lines.extend(f"- [{'included' if path in included else 'other'}] {path}" for path in kept_files)
+    return "\n".join(lines)
+
+
+__all__: list[str] = ["build_chunk_context", "build_lane_prompt"]

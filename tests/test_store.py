@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from rvw.adjudicate import AdjudicationOutcome
-from rvw.diffbudget import DiffBudgetReport
-from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage
+from rvw.diffbudget import DiffBudgetReport, DiffChunkPlacement
+from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage, RunCoverage
 from rvw.merge import merge
 from rvw.schema import Tier, Verdict
 from rvw.store import RunNotFound, RunStore, StageMissing
@@ -53,13 +53,32 @@ def test_round_trips_every_stage(tmp_path: Path) -> None:
     target = target_fixture()
     run = store.create(target)
     findings = findings_fixture()
-    coverage = [LaneCoverage(lane_id="slop-hygiene", dispatched=3, valid=2, findings=4)]
+    coverage = [
+        LaneCoverage(
+            lane_id="slop-hygiene",
+            dispatched=3,
+            valid=2,
+            findings=4,
+            runs=[
+                RunCoverage(
+                    replica=replica,
+                    chunk=1,
+                    valid=replica < 3,
+                    findings=4 if replica == 1 else 0,
+                    invalid_reason=None if replica < 3 else "scripted_invalid",
+                )
+                for replica in range(1, 4)
+            ],
+        )
+    ]
     budget = DiffBudgetReport(
         kept_files=["a.ts"],
         excluded_files=["generated.ts"],
         excluded_reason={"generated.ts": "generated-path"},
         kept_chars=1234,
         excluded_chars=567,
+        chunk_count=1,
+        chunks=[DiffChunkPlacement(index=1, files=["a.ts"], chars=1234)],
     )
     discovered = DiscoverResult(
         lane_results={}, findings=findings, coverage=coverage, budget=budget

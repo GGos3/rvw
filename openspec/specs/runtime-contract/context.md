@@ -7,6 +7,7 @@ This capability defines the machine boundary between rvw and a model runtime. It
 ## Key decisions and measured basis
 
 - ADR-004 replaced prose parsing with strict JSON and stable hunk enrichment. A prompt that explicitly requested an outside rule still obeyed the API-level enum schema, demonstrating that structured-output enforcement dominates prompt wording.
+- Chunked discovery keeps `r<replica>` as the leaf directory required by the adapter. Multi-chunk runs add an inspectable `c<chunk>` parent, while one-chunk discovery and sampling retain their previous artifact paths.
 - The enum-versus-free fixture produced five findings in each condition with near-identical text. Both missed the same deep defects, so rule scope—not the ID enum—was the suppressing factor; ADR-005 added sweep coverage rather than weakening IDs.
 - OpenAI strict output rejects object schemas whose `required` array omits defaulted properties. The implementation rewrites both root and item schemas so every property is required.
 - The four-part validity contract prevents a zero exit or parseable partial artifact from being silently treated as PASS. On the PR #1119 smoke, all 39 discovery runs were valid; the complete discovery/adjudication walls were about 410s and 197s.

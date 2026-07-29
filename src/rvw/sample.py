@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from rvw.diffbudget import apply_diff_budget
 from rvw.lane import Lane
-from rvw.prompts import build_lane_prompt
+from rvw.prompts import build_chunk_context, build_lane_prompt
 from rvw.runtimes import RunResult, RunStatus, Runtime
 from rvw.runtimes.codex import validate_output
 from rvw.schema import RuntimeLaneOutput
@@ -47,6 +48,7 @@ class SampleReport:
     site_variance: list[SampleSiteVariance]
     verdict: Literal["PASS", "REVIEW"]
     replicas: int
+    chunk_count: int
 
 
 def _sites(
@@ -126,19 +128,31 @@ async def sample_lane(
     if deadline_seconds < 1:
         raise ValueError("deadline_seconds must be at least 1")
 
-    prompt = build_lane_prompt(
-        lane,
-        diff=fixture_diff,
-        brief=None,
-        brief_source=None,
-        covered_rules={},
-    )
+    chunks, budget = apply_diff_budget(fixture_diff)
+    prompts = {
+        chunk.index: build_lane_prompt(
+            lane,
+            diff=chunk.text,
+            brief=None,
+            brief_source=None,
+            covered_rules={},
+            chunk_context=build_chunk_context(
+                chunk=chunk.index,
+                chunk_count=len(chunks),
+                chunk_files=chunk.files,
+                kept_files=budget.kept_files,
+            ),
+        )
+        for chunk in chunks
+    }
     semaphore = asyncio.Semaphore(16)
 
     def validate_enum(raw: object) -> RuntimeLaneOutput:
         return validate_output(lane, raw)
 
-    async def execute_one(variant: Literal["enum", "free"], replica: int) -> RunResult[Any]:
+    async def execute_one(
+        variant: Literal["enum", "free"], replica: int, chunk: int
+    ) -> RunResult[Any]:
         async with semaphore:
             if variant == "enum":
                 schema = lane.output_schema()
@@ -146,22 +160,30 @@ async def sample_lane(
             else:
                 schema = free_variant_schema(lane)
                 validator = validate_output_free
-            return await runtime.execute_raw(
-                schema=schema,
-                prompt=prompt,
-                run_dir=out_root / variant / f"r{replica}",
-                deadline_seconds=deadline_seconds,
-                validate=validator,
+            variant_dir = out_root / variant
+            if len(chunks) > 1:
+                variant_dir /= f"c{chunk}"
+            return replace(
+                await runtime.execute_raw(
+                    schema=schema,
+                    prompt=prompts[chunk],
+                    run_dir=variant_dir / f"r{replica}",
+                    deadline_seconds=deadline_seconds,
+                    validate=validator,
+                ),
+                chunk=chunk,
             )
 
     tasks = [
-        asyncio.create_task(execute_one(variant, replica))
+        asyncio.create_task(execute_one(variant, replica, chunk.index))
         for variant in ("enum", "free")
+        for chunk in chunks
         for replica in range(1, replicas + 1)
     ]
     all_results = await asyncio.gather(*tasks)
-    enum_results = all_results[:replicas]
-    free_results = all_results[replicas:]
+    runs_per_variant = replicas * len(chunks)
+    enum_results = all_results[:runs_per_variant]
+    free_results = all_results[runs_per_variant:]
     enum_sites = _sites(enum_results)
     free_sites = _sites(free_results)
     enum_only_sites = set(enum_sites) - set(free_sites)
@@ -183,6 +205,7 @@ async def sample_lane(
         ),
         verdict="REVIEW" if novel_rule_ids else "PASS",
         replicas=replicas,
+        chunk_count=len(chunks),
     )
 
 

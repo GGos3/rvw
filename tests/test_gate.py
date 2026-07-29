@@ -8,7 +8,7 @@ import yaml
 from pydantic import ValidationError
 
 from rvw.adjudicate import AdjudicationOutcome
-from rvw.discover import EnrichedFinding, LaneCoverage
+from rvw.discover import EnrichedFinding, LaneCoverage, RunCoverage
 from rvw.gate import (
     DispositionDecision,
     DispositionDocument,
@@ -105,11 +105,40 @@ def merged_outcome() -> tuple[MergeResult, AdjudicationOutcome]:
     return merged, outcome
 
 
+def lane_coverage(
+    lane_id: str,
+    *,
+    replicas: int = 3,
+    chunks: int = 1,
+    invalid: set[tuple[int, int]] | None = None,
+    findings: int = 0,
+) -> LaneCoverage:
+    invalid = invalid or set()
+    runs = [
+        RunCoverage(
+            replica=replica,
+            chunk=chunk,
+            valid=(replica, chunk) not in invalid,
+            findings=findings if (replica, chunk) == (1, 1) else 0,
+            invalid_reason=("scripted_invalid" if (replica, chunk) in invalid else None),
+        )
+        for chunk in range(1, chunks + 1)
+        for replica in range(1, replicas + 1)
+    ]
+    return LaneCoverage(
+        lane_id=lane_id,
+        dispatched=len(runs),
+        valid=sum(run.valid for run in runs),
+        findings=findings,
+        runs=runs,
+    )
+
+
 def complete_coverage() -> list[LaneCoverage]:
     return [
-        LaneCoverage(lane_id="lane-a", dispatched=3, valid=3, findings=1),
-        LaneCoverage(lane_id="lane-b", dispatched=3, valid=3, findings=1),
-        LaneCoverage(lane_id="lane-c", dispatched=3, valid=3, findings=1),
+        lane_coverage("lane-a", findings=1),
+        lane_coverage("lane-b", findings=1),
+        lane_coverage("lane-c", findings=1),
     ]
 
 
@@ -151,12 +180,12 @@ def test_report_exposes_group_key_as_public_finding_id() -> None:
     "coverage,match",
     [
         ([], "nonempty"),
-        ([LaneCoverage(lane_id="lane-a", dispatched=0, valid=0, findings=0)], "dispatched"),
-        ([LaneCoverage(lane_id="lane-a", dispatched=3, valid=2, findings=0)], "valid"),
+        ([lane_coverage("lane-a", replicas=0)], "dispatched"),
+        ([lane_coverage("lane-a", invalid={(1, 1)})], "invalid"),
         (
             [
-                LaneCoverage(lane_id="lane-a", dispatched=3, valid=3, findings=0),
-                LaneCoverage(lane_id="lane-a", dispatched=3, valid=3, findings=0),
+                lane_coverage("lane-a"),
+                lane_coverage("lane-a"),
             ],
             "duplicate",
         ),
@@ -166,17 +195,63 @@ def test_coverage_rejects_vacuous_invalid_and_duplicate_rows(
     coverage: list[LaneCoverage], match: str
 ) -> None:
     with pytest.raises(GateInvariantError, match=match):
-        validate_coverage(["lane-a"], coverage, replicas=3)
+        validate_coverage(["lane-a"], coverage, replicas=3, chunk_count=1)
 
 
 def test_coverage_requires_exact_planned_lane_set() -> None:
-    coverage = [LaneCoverage(lane_id="lane-a", dispatched=3, valid=3, findings=0)]
+    coverage = [lane_coverage("lane-a")]
 
     with pytest.raises(GateInvariantError, match=r"missing.*lane-b"):
-        validate_coverage(["lane-a", "lane-b"], coverage, replicas=3)
+        validate_coverage(["lane-a", "lane-b"], coverage, replicas=3, chunk_count=1)
 
     with pytest.raises(GateInvariantError, match=r"unexpected.*lane-a"):
-        validate_coverage([], coverage, replicas=3)
+        validate_coverage([], coverage, replicas=3, chunk_count=1)
+
+
+def test_coverage_fails_closed_when_one_chunk_is_invalid_or_missing() -> None:
+    invalid = [lane_coverage("lane-a", replicas=2, chunks=2, invalid={(2, 2)})]
+    with pytest.raises(GateInvariantError, match=r"lane-a.*replica 2.*chunk 2.*invalid"):
+        validate_coverage(["lane-a"], invalid, replicas=2, chunk_count=2)
+
+    complete = lane_coverage("lane-a", replicas=2, chunks=2)
+    missing_runs = complete.runs[:-1]
+    missing = [
+        LaneCoverage(
+            lane_id="lane-a",
+            dispatched=len(missing_runs),
+            valid=len(missing_runs),
+            findings=0,
+            runs=missing_runs,
+        )
+    ]
+    with pytest.raises(GateInvariantError, match=r"missing.*replica 2.*chunk 2"):
+        validate_coverage(["lane-a"], missing, replicas=2, chunk_count=2)
+
+
+def test_coverage_models_reject_duplicate_runs_and_invalid_run_findings() -> None:
+    run = RunCoverage(
+        replica=1,
+        chunk=1,
+        valid=True,
+        findings=0,
+        invalid_reason=None,
+    )
+    with pytest.raises(ValidationError, match="unique"):
+        LaneCoverage(
+            lane_id="lane-a",
+            dispatched=2,
+            valid=2,
+            findings=0,
+            runs=[run, run],
+        )
+    with pytest.raises(ValidationError, match="cannot have findings"):
+        RunCoverage(
+            replica=1,
+            chunk=1,
+            valid=False,
+            findings=1,
+            invalid_reason="scripted_invalid",
+        )
 
 
 def test_dispositions_reject_duplicate_omitted_unknown_and_rejected_ids() -> None:
@@ -404,7 +479,12 @@ def test_gate_anchor_is_strict() -> None:
 
 
 def test_gate_plan_round_trip_is_strict(tmp_path: Path) -> None:
-    plan = GatePlan(schema_version=1, lane_ids=["lane-a", "lane-b"], replicas=3)
+    plan = GatePlan(
+        schema_version=1,
+        lane_ids=["lane-a", "lane-b"],
+        replicas=3,
+        chunk_count=2,
+    )
     path = save_gate_plan(tmp_path, plan)
 
     assert load_gate_plan(tmp_path) == plan

@@ -6,13 +6,13 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rvw.diffbudget import DiffBudgetReport, apply_diff_budget
 from rvw.dispatch import PlannedRun, dispatch
 from rvw.hunks import hunk_for_line, is_anchorable, parse_hunks
 from rvw.lane import load_lane
-from rvw.prompts import build_lane_prompt
+from rvw.prompts import build_chunk_context, build_lane_prompt
 from rvw.registry import Registry
 from rvw.runtimes import RunResult, RunStatus, Runtime
 from rvw.schema import Finding, Tier
@@ -28,15 +28,51 @@ class EnrichedFinding(Finding):
     replica: int = Field(ge=1)
 
 
+class RunCoverage(BaseModel):
+    """Validity and yield for one planned replica-chunk execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    replica: int = Field(ge=1)
+    chunk: int = Field(ge=1)
+    valid: bool
+    findings: int = Field(ge=0)
+    invalid_reason: str | None
+
+    @model_validator(mode="after")
+    def _validity_must_match_reason(self) -> RunCoverage:
+        if self.valid and self.invalid_reason is not None:
+            raise ValueError("valid coverage runs cannot have an invalid_reason")
+        if not self.valid and (self.invalid_reason is None or not self.invalid_reason.strip()):
+            raise ValueError("invalid coverage runs require an invalid_reason")
+        if not self.valid and self.findings:
+            raise ValueError("invalid coverage runs cannot have findings")
+        return self
+
+
 class LaneCoverage(BaseModel):
-    """DISCOVER coverage and yield for one activated lane."""
+    """DISCOVER aggregate and exact run coverage for one activated lane."""
 
     model_config = ConfigDict(extra="forbid")
 
     lane_id: str
-    dispatched: int
-    valid: int
-    findings: int
+    dispatched: int = Field(ge=0)
+    valid: int = Field(ge=0)
+    findings: int = Field(ge=0)
+    runs: list[RunCoverage]
+
+    @model_validator(mode="after")
+    def _aggregates_must_match_runs(self) -> LaneCoverage:
+        identities = [(run.replica, run.chunk) for run in self.runs]
+        if len(identities) != len(set(identities)):
+            raise ValueError("coverage run identities must be unique")
+        if self.dispatched != len(self.runs):
+            raise ValueError("dispatched must equal the number of coverage runs")
+        if self.valid != sum(run.valid for run in self.runs):
+            raise ValueError("valid must equal the number of valid coverage runs")
+        if self.findings != sum(run.findings for run in self.runs):
+            raise ValueError("findings must equal the coverage run finding total")
+        return self
 
 
 @dataclass(frozen=True)
@@ -113,21 +149,30 @@ async def discover(
     owners = _active_lane_owners(registry, target, lane_filter)
     lanes = [load_lane(resolve_lane_path(lanes_root, lane_id, tier)) for lane_id, tier in owners]
     effective_brief, effective_brief_source = _effective_brief(target, brief, brief_source)
-    review_diff, budget = apply_diff_budget(target.diff)
+    chunks, budget = apply_diff_budget(target.diff)
     covered_rules = {lane.id: lane.rules for lane in lanes}
-    prompts = {
-        lane.id: build_lane_prompt(
-            lane,
-            diff=review_diff,
-            brief=effective_brief,
-            brief_source=effective_brief_source,
-            covered_rules=covered_rules,
+    planned_runs = [
+        PlannedRun(
+            lane=lane,
+            prompt=build_lane_prompt(
+                lane,
+                diff=chunk.text,
+                brief=effective_brief,
+                brief_source=effective_brief_source,
+                covered_rules=covered_rules,
+                chunk_context=build_chunk_context(
+                    chunk=chunk.index,
+                    chunk_count=len(chunks),
+                    chunk_files=chunk.files,
+                    kept_files=budget.kept_files,
+                ),
+            ),
+            replica=replica,
+            chunk=chunk.index,
+            chunk_count=len(chunks),
         )
         for lane in lanes
-    }
-    planned_runs = [
-        PlannedRun(lane=lane, prompt=prompts[lane.id], replica=replica)
-        for lane in lanes
+        for chunk in chunks
         for replica in range(1, replicas + 1)
     ]
     raw_results = await dispatch(
@@ -144,6 +189,7 @@ async def discover(
 
     hunks = parse_hunks(target.diff)
     enriched: list[EnrichedFinding] = []
+    finding_counts: dict[tuple[str, int, int], int] = {}
     for result in raw_results:
         if result.status is not RunStatus.VALID or result.output is None:
             continue
@@ -161,18 +207,30 @@ async def discover(
                     }
                 )
             )
+            key = (result.lane_id, result.replica, result.chunk)
+            finding_counts[key] = finding_counts.get(key, 0) + 1
 
     coverage: list[LaneCoverage] = []
     for lane in lanes:
         results = lane_results[lane.id]
         valid = sum(result.status is RunStatus.VALID for result in results)
-        findings = sum(finding.lane_id == lane.id for finding in enriched)
+        runs = [
+            RunCoverage(
+                replica=result.replica,
+                chunk=result.chunk,
+                valid=result.status is RunStatus.VALID,
+                findings=finding_counts.get((result.lane_id, result.replica, result.chunk), 0),
+                invalid_reason=result.invalid_reason,
+            )
+            for result in results
+        ]
         coverage.append(
             LaneCoverage(
                 lane_id=lane.id,
-                dispatched=replicas,
+                dispatched=len(runs),
                 valid=valid,
-                findings=findings,
+                findings=sum(run.findings for run in runs),
+                runs=runs,
             )
         )
 
@@ -188,6 +246,7 @@ __all__: list[str] = [
     "DiscoverResult",
     "EnrichedFinding",
     "LaneCoverage",
+    "RunCoverage",
     "discover",
     "resolve_lane_path",
 ]

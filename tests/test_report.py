@@ -4,8 +4,8 @@ import json
 from pathlib import Path
 
 from rvw.adjudicate import AdjudicationOutcome
-from rvw.diffbudget import DiffBudgetReport
-from rvw.discover import EnrichedFinding, LaneCoverage
+from rvw.diffbudget import DiffBudgetReport, DiffChunkPlacement
+from rvw.discover import EnrichedFinding, LaneCoverage, RunCoverage
 from rvw.merge import MergeResult, merge
 from rvw.report import render_report
 from rvw.schema import Severity, Tier, Verdict
@@ -50,14 +50,34 @@ def target_fixture() -> ResolvedTarget:
     )
 
 
+def coverage_fixture(lane_id: str, *, valid: int, findings: int) -> LaneCoverage:
+    runs = [
+        RunCoverage(
+            replica=replica,
+            chunk=1,
+            valid=replica <= valid,
+            findings=findings if replica == 1 else 0,
+            invalid_reason=None if replica <= valid else "scripted_invalid",
+        )
+        for replica in range(1, 4)
+    ]
+    return LaneCoverage(
+        lane_id=lane_id,
+        dispatched=3,
+        valid=valid,
+        findings=findings,
+        runs=runs,
+    )
+
+
 def render_real(*, synthesis: str | None = None) -> str:
     return render_report(
         target=target_fixture(),
         merged=merged_from_fixture(),
         outcome=outcome_from_fixture(),
         coverage=[
-            LaneCoverage(lane_id="slop-hygiene", dispatched=3, valid=3, findings=7),
-            LaneCoverage(lane_id="unscoped-sweep", dispatched=3, valid=2, findings=4),
+            coverage_fixture("slop-hygiene", valid=3, findings=7),
+            coverage_fixture("unscoped-sweep", valid=2, findings=4),
         ],
         budget=DiffBudgetReport(
             kept_files=["a.ts"],
@@ -68,6 +88,8 @@ def render_real(*, synthesis: str | None = None) -> str:
             },
             kept_chars=12345,
             excluded_chars=6789,
+            chunk_count=1,
+            chunks=[DiffChunkPlacement(index=1, files=["a.ts"], chars=12345)],
         ),
         synthesis=synthesis,
     )
@@ -92,6 +114,7 @@ def test_real_report_order_folds_regions_coverage_and_empty_sections() -> None:
     assert "(인접: providers/naver-map/index.ts L1721\N{EN DASH}1733)" in report
     assert "| 합계 | 6 | 5 | 11 |" in report
     assert "diff 예산: 12,345자 유지 / 6,789자 제외 (generated.ts, bun.lockb)" in report
+    assert "1청크" in report
     assert "## 기각 (REJECTED)" not in report
     assert "## 검증 미확정" not in report
 
