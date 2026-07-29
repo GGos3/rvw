@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
-from rvw.diffbudget import apply_diff_budget
+from rvw.diffbudget import apply_diff_budget, require_reviewable_diff
 from rvw.lane import Lane
 from rvw.prompts import build_chunk_context, build_lane_prompt
 from rvw.runtimes import RunResult, RunStatus, Runtime
@@ -129,6 +129,7 @@ async def sample_lane(
         raise ValueError("deadline_seconds must be at least 1")
 
     chunks, budget = apply_diff_budget(fixture_diff)
+    require_reviewable_diff(budget, source="fixture")
     prompts = {
         chunk.index: build_lane_prompt(
             lane,

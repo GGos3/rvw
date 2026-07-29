@@ -11,7 +11,7 @@ from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Never, cast
 
 import typer
 from rich.console import Console
@@ -19,7 +19,7 @@ from rich.table import Table
 
 from rvw import __version__
 from rvw.adjudicate import AdjudicationOutcome, adjudicate
-from rvw.diffbudget import apply_diff_budget
+from rvw.diffbudget import EmptyReviewDiffError, apply_diff_budget
 from rvw.discover import DiscoverResult, discover, resolve_lane_path
 from rvw.dispatch import PlannedRun, lpt_sort_key
 from rvw.doctor import DoctorReport, diagnose
@@ -108,6 +108,14 @@ class _PipelineArtifacts:
 def _write_json(payload: Any) -> None:
     json.dump(payload, sys.stdout)
     sys.stdout.write("\n")
+
+
+def _empty_review_failure(exc: EmptyReviewDiffError, *, json_output: bool) -> Never:
+    if json_output:
+        _write_json(exc.payload())
+    else:
+        _error_console.print(str(exc), markup=False)
+    raise typer.Exit(EXIT_USER_ERROR) from exc
 
 
 def _schema_payload() -> dict[str, Any]:
@@ -407,19 +415,22 @@ def review(
     publish: Annotated[bool, Option("--publish")] = False,
     dynamic_brief: Annotated[Path | None, Option("--dynamic-brief")] = None,
 ) -> None:
-    asyncio.run(
-        _review_pipeline(
-            target_spec=target,
-            repo_dir=repo_dir,
-            registry_root=registry_root,
-            replicas=replicas,
-            out_root=out_root,
-            json_output=json_output,
-            pause=pause,
-            publish=publish,
-            dynamic_brief=dynamic_brief,
+    try:
+        asyncio.run(
+            _review_pipeline(
+                target_spec=target,
+                repo_dir=repo_dir,
+                registry_root=registry_root,
+                replicas=replicas,
+                out_root=out_root,
+                json_output=json_output,
+                pause=pause,
+                publish=publish,
+                dynamic_brief=dynamic_brief,
+            )
         )
-    )
+    except EmptyReviewDiffError as exc:
+        _empty_review_failure(exc, json_output=json_output)
 
 
 def _optional_outcome(run: RunHandle) -> AdjudicationOutcome | None:
@@ -714,6 +725,8 @@ async def _gate_pipeline(
             save_gate_plan(artifacts.run.dir, plan)
         except typer.Exit:
             raise
+        except EmptyReviewDiffError as exc:
+            _empty_review_failure(exc, json_output=json_output)
         except GateInvariantError as exc:
             _error_console.print(str(exc), markup=False)
             raise typer.Exit(EXIT_NOT_FOUND) from exc
@@ -859,15 +872,18 @@ def auto(
             "approve publishing is not implemented (ADR-009 Phase-5 opt-in placeholder)",
             markup=False,
         )
-    asyncio.run(
-        _auto_pipeline(
-            target_spec=target,
-            repo_dir=repo_dir,
-            policy_path=policy_path,
-            publish=publish,
-            json_output=json_output,
+    try:
+        asyncio.run(
+            _auto_pipeline(
+                target_spec=target,
+                repo_dir=repo_dir,
+                policy_path=policy_path,
+                publish=publish,
+                json_output=json_output,
+            )
         )
-    )
+    except EmptyReviewDiffError as exc:
+        _empty_review_failure(exc, json_output=json_output)
 
 
 async def _auto_pipeline(
@@ -1128,6 +1144,13 @@ def doctor(
 
 def _fixture_diff(fixture: Path) -> str:
     try:
+        content = fixture.read_bytes().decode("utf-8")
+    except (OSError, UnicodeError):
+        content = None
+    if content is not None and content.startswith(("diff --git ", "--- ")):
+        return content
+
+    try:
         completed = subprocess.run(
             ["git", "diff", "--no-index", "--", "/dev/null", str(fixture)],
             check=False,
@@ -1214,15 +1237,18 @@ def sample(
     except ValueError as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_USER_ERROR) from exc
-    report = asyncio.run(
-        sample_lane(
-            lane,
-            fixture_diff=fixture_diff,
-            runtime=CodexRuntime(),
-            out_root=out_root,
-            replicas=replicas,
+    try:
+        report = asyncio.run(
+            sample_lane(
+                lane,
+                fixture_diff=fixture_diff,
+                runtime=CodexRuntime(),
+                out_root=out_root,
+                replicas=replicas,
+            )
         )
-    )
+    except EmptyReviewDiffError as exc:
+        _empty_review_failure(exc, json_output=json_output)
     if json_output:
         _write_json(asdict(report))
     else:

@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 import rvw.cli as cli_module
 import rvw.publish as publish_module
 from rvw.adjudicate import AdjudicationOutcome
+from rvw.diffbudget import apply_diff_budget
 from rvw.discover import DiscoverResult, EnrichedFinding
 from rvw.merge import merge
 from rvw.sample import SampleReport, SampleSiteVariance
@@ -200,6 +201,86 @@ Find issues.
     fixture = tmp_path / "fixture.py"
     fixture.write_text("problem = True\n", encoding="utf-8")
     return root
+
+
+def sample_diff_segment(path: str, body: str) -> str:
+    return f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+{body}\n"
+
+
+def test_fixture_diff_passes_through_large_unified_diff_with_original_budget(
+    tmp_path: Path,
+) -> None:
+    original = "".join(
+        sample_diff_segment(f"providers/tabelog/file-{index}.ts", "x" * 146_900)
+        for index in range(5)
+    )
+    assert 734_000 < len(original) < 736_000
+    fixture = tmp_path / "fixture.diff"
+    fixture.write_text(original, encoding="utf-8")
+
+    fixture_diff = cli_module._fixture_diff(fixture)
+    chunks, budget = apply_diff_budget(fixture_diff)
+
+    assert fixture_diff == original
+    assert budget.kept_chars == len(original)
+    assert budget.excluded_reason == {}
+    assert budget.chunk_count >= 2
+    assert "".join(chunk.text for chunk in chunks) == original
+
+
+def test_fixture_diff_passes_through_traditional_unified_diff(tmp_path: Path) -> None:
+    original = "--- a/source.py\n+++ b/source.py\n@@ -1 +1 @@\n-old\n+new\n"
+    fixture = tmp_path / "traditional.diff"
+    fixture.write_text(original, encoding="utf-8")
+
+    assert cli_module._fixture_diff(fixture) == original
+
+
+def test_fixture_diff_keeps_ordinary_source_file_conversion(tmp_path: Path) -> None:
+    fixture = tmp_path / "fixture.py"
+    fixture.write_text("problem = True\n", encoding="utf-8")
+
+    fixture_diff = cli_module._fixture_diff(fixture)
+
+    assert fixture_diff.startswith("diff --git ")
+    assert "--- /dev/null\n" in fixture_diff
+    assert "+problem = True\n" in fixture_diff
+
+
+def test_sample_empty_review_json_is_user_error(
+    tmp_path: Path,
+    sample_registry: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = tmp_path / "oversized.diff"
+    fixture.write_text(sample_diff_segment("src/large.py", "x" * 767_000), encoding="utf-8")
+
+    class NoRuntime:
+        async def execute_raw(self, **kwargs: object) -> object:
+            raise AssertionError(f"runtime must not execute: {kwargs}")
+
+    monkeypatch.setattr(cli_module, "CodexRuntime", NoRuntime)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "sample",
+            "--lane",
+            "test-lane",
+            "--fixture",
+            str(fixture),
+            "--registry",
+            str(sample_registry),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 2, result.stdout
+    assert json.loads(result.stdout) == {
+        "error": "empty-review-diff",
+        "message": "fixture produced an empty review diff; excluded: [src/large.py (oversize-file)]",
+        "excluded_reason": {"src/large.py": "oversize-file"},
+    }
 
 
 @pytest.mark.parametrize(("verdict", "exit_code"), [("PASS", 0), ("REVIEW", 1)])

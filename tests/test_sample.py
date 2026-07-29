@@ -7,6 +7,7 @@ from typing import Any, cast
 import pytest
 from pydantic import BaseModel
 
+from rvw.diffbudget import EmptyReviewDiffError
 from rvw.lane import Lane
 from rvw.runtimes import RunResult, RunStatus
 from rvw.sample import SampleSiteVariance, free_variant_schema, sample_lane, validate_output_free
@@ -287,3 +288,31 @@ async def test_large_fixture_runs_every_variant_replica_chunk(tmp_path: Path) ->
         "chunk 1/2" in runtime.calls[2][2],
         "chunk 2/2" in runtime.calls[3][2],
     ] == [True, True, True, True]
+
+
+async def test_oversized_single_segment_fails_before_sampling_runtime(tmp_path: Path) -> None:
+    oversized = (
+        "diff --git a/src/large.py b/src/large.py\n"
+        "--- a/src/large.py\n"
+        "+++ b/src/large.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        f"+{'x' * 767_000}\n"
+    )
+    runtime = FakeRuntime([output()], [output()])
+
+    with pytest.raises(
+        EmptyReviewDiffError,
+        match=r"^fixture produced an empty review diff; excluded: ",
+    ) as caught:
+        await sample_lane(
+            lane_fixture(),
+            fixture_diff=oversized,
+            runtime=runtime,
+            out_root=tmp_path,
+            replicas=1,
+        )
+
+    assert caught.value.error_code == "empty-review-diff"
+    assert caught.value.excluded_reason == {"src/large.py": "oversize-file"}
+    assert runtime.calls == []

@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import rvw.discover as discover_module
+from rvw.diffbudget import EmptyReviewDiffError
 from rvw.discover import discover, resolve_lane_path
 from rvw.dispatch import PlannedRun
 from rvw.lane import Lane
@@ -355,6 +356,44 @@ async def test_diff_budget_filters_prompt_but_keeps_full_changed_paths(tmp_path:
     assert result.budget is not None
     assert result.budget.kept_files == ["src/a.py"]
     assert result.budget.excluded_reason == {generated_path: "generated-path"}
+
+
+async def test_all_excluded_diff_fails_before_discovery_dispatch(tmp_path: Path) -> None:
+    lanes_root = tmp_path / "lanes"
+    write_lane(lanes_root, "base-review", Tier.BASE)
+    generated_path = "runtime-snapshots/contract-graph.json"
+    generated_target = target().model_copy(
+        update={
+            "changed_paths": [generated_path],
+            "diff": (
+                f"diff --git a/{generated_path} b/{generated_path}\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                f"+++ b/{generated_path}\n"
+                "@@ -0,0 +1 @@\n"
+                "+generated\n"
+            ),
+        }
+    )
+    runtime = FakeRuntime()
+
+    with pytest.raises(
+        EmptyReviewDiffError,
+        match=r"^target produced an empty review diff; excluded: ",
+    ) as caught:
+        await discover(
+            registry=registry(("base-review", Tier.BASE)),
+            lanes_root=lanes_root,
+            target=generated_target,
+            runtime=runtime,
+            out_root=tmp_path / "out",
+            replicas=1,
+        )
+
+    assert caught.value.error_code == "empty-review-diff"
+    assert caught.value.excluded_reason == {generated_path: "generated-path"}
+    assert runtime.calls == []
+    assert runtime.prompts == []
 
 
 def multi_chunk_target() -> ResolvedTarget:

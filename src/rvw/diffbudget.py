@@ -71,6 +71,29 @@ class DiffBudgetReport(BaseModel):
         return self
 
 
+class EmptyReviewDiffError(ValueError):
+    """A diff budget retained no content that can be reviewed."""
+
+    error_code = "empty-review-diff"
+
+    def __init__(self, source: str, report: DiffBudgetReport) -> None:
+        self.source = source
+        self.excluded_reason = dict(report.excluded_reason)
+        excluded = ", ".join(
+            f"{path} ({report.excluded_reason[path]})" for path in report.excluded_files
+        )
+        super().__init__(f"{source} produced an empty review diff; excluded: [{excluded}]")
+
+    def payload(self) -> dict[str, object]:
+        """Return the stable machine-readable representation."""
+
+        return {
+            "error": self.error_code,
+            "message": str(self),
+            "excluded_reason": self.excluded_reason,
+        }
+
+
 @dataclass(frozen=True)
 class DiffFileSegment:
     """One complete per-file unified-diff segment."""
@@ -221,12 +244,21 @@ def apply_diff_budget(
     return chunks, report
 
 
+def require_reviewable_diff(report: DiffBudgetReport, *, source: str) -> None:
+    """Fail when exclusions leave no characters for a runtime to review."""
+
+    if report.kept_chars == 0:
+        raise EmptyReviewDiffError(source, report)
+
+
 __all__ = [
     "DEFAULT_GENERATED_GLOBS",
     "DiffBudgetReport",
     "DiffChunk",
     "DiffChunkPlacement",
     "DiffFileSegment",
+    "EmptyReviewDiffError",
     "apply_diff_budget",
+    "require_reviewable_diff",
     "split_diff_files",
 ]

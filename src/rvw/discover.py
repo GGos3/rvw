@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from rvw.diffbudget import DiffBudgetReport, apply_diff_budget
+from rvw.diffbudget import DiffBudgetReport, apply_diff_budget, require_reviewable_diff
 from rvw.dispatch import PlannedRun, dispatch
 from rvw.hunks import hunk_for_line, is_anchorable, parse_hunks
 from rvw.lane import load_lane
@@ -150,6 +150,7 @@ async def discover(
     lanes = [load_lane(resolve_lane_path(lanes_root, lane_id, tier)) for lane_id, tier in owners]
     effective_brief, effective_brief_source = _effective_brief(target, brief, brief_source)
     chunks, budget = apply_diff_budget(target.diff)
+    require_reviewable_diff(budget, source="target")
     covered_rules = {lane.id: lane.rules for lane in lanes}
     planned_runs = [
         PlannedRun(
