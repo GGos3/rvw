@@ -47,6 +47,19 @@ def test_release_please_uses_required_pat_and_no_call_chain() -> None:
     assert "uses: ./.github/workflows/release.yml" not in workflow
 
 
+def test_release_please_syncs_uv_lock_on_the_release_branch() -> None:
+    workflow = (ROOT / ".github/workflows/release-please.yml").read_text(encoding="utf-8")
+
+    # The release-please toml extra-file updater does not rewrite uv.lock
+    # (observed 2026-07-28 on v4 and v5), so the workflow must regenerate it
+    # on the release branch itself, and push with the PAT so the release PR's
+    # CI retriggers.
+    assert "ref: release-please--branches--main" in workflow
+    assert "uv lock" in workflow
+    assert "git push origin HEAD:release-please--branches--main" in workflow
+    assert workflow.count("token: ${{ secrets.RELEASE_PLEASE_TOKEN }}") == 2
+
+
 def test_release_assets_handle_preexisting_release() -> None:
     workflow = (ROOT / ".github/workflows/release.yml").read_text(encoding="utf-8")
 

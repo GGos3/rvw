@@ -29,3 +29,35 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: .github/release-please-config.json
           manifest-file: .github/release-please-manifest.json
+
+      # release-please's toml extra-file updater does not actually rewrite
+      # uv.lock (observed on both v4 and v5, 2026-07-28; codex-lb worked
+      # around it with manual 'chore(release): sync uv lock' commits every
+      # release). Regenerate the lock on the release branch here instead.
+      # The push must use the PAT: a default-repository-token push would not
+      # retrigger the release PR's CI, leaving the PR with stale checks.
+      - name: Check out release branch
+        if: steps.release.outputs.prs_created == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: release-please--branches--main
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
+      - name: Sync uv.lock on the release branch
+        if: steps.release.outputs.prs_created == 'true'
+        uses: astral-sh/setup-uv@v9.0.0
+      - name: Commit synced lockfile
+        if: steps.release.outputs.prs_created == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv lock
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already in sync"
+            exit 0
+          fi
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add uv.lock
+          git commit -m "chore(release): sync uv lock for ${VERSION}"
+          git push origin HEAD:release-please--branches--main
