@@ -9,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, Never, cast

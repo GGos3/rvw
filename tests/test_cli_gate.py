@@ -406,7 +406,7 @@ def test_gate_inherit_source_errors_before_template_writing(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     if source_setup == "missing_verdict":
         inherited_source(out_root, current, write_verdict=False)
@@ -440,7 +440,7 @@ def test_gate_inherit_rejects_symlinked_verdict_artifact(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     source = inherited_source(out_root, current)
     foreign = tmp_path / "foreign-verdict.json"
@@ -480,7 +480,7 @@ def test_gate_inheritance_source_requires_completed_kind(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     source = inherited_source(out_root, current)
     source_verdict = source.load_gate_verdict().model_copy(update={"kind": source_kind})
@@ -559,7 +559,7 @@ def test_inheritance_source_validation_diagnostic_is_bounded_and_redacted(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     source = inherited_source(out_root, current)
     verdict_path = source.dir / "gate-verdict.json"
@@ -834,7 +834,7 @@ def test_gate_resume_without_dispositions_preserves_completed_verdict(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     group = artifacts.merged.groups[0]
     save_gate_verdict(
@@ -888,7 +888,7 @@ def test_gate_resume_rejects_truncated_verdict_as_corrupt_without_rewriting(
     artifacts = prepared_artifacts(out_root)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     verdict_path = artifacts.run.dir / "gate-verdict.json"
     corrupt_bytes = b'{"run_id":'
@@ -1260,7 +1260,7 @@ def test_gate_failure_verdict_is_retryable_after_dispositions_are_corrected(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
     invalid = tmp_path / "invalid.yaml"
@@ -1314,7 +1314,7 @@ def test_gate_orphan_outcome_key_persists_failure_verdict(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     assert artifacts.outcome is not None
     artifacts.outcome.verdicts["orphan-finding"] = Verdict.CONFIRMED
@@ -1342,7 +1342,7 @@ def test_gate_full_inheritance_does_not_overwrite_completed_block_verdict(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     source = inherited_source(out_root, current)
     group = current.merged.groups[0]
@@ -1402,7 +1402,7 @@ def test_gate_full_inheritance_replaces_pause_stub_and_proceeds(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     source = inherited_source(out_root, current)
     save_gate_verdict(
@@ -1448,7 +1448,7 @@ def test_gate_inheritance_matcher_invariant_persists_block_verdict(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     source = inherited_source(out_root, current)
     current.merged.groups[0] = current.merged.groups[0].model_copy(update={"bodies": []})
@@ -1487,7 +1487,7 @@ def test_gate_resume_without_dispositions_rewrites_existing_pause_stub(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     save_gate_verdict(
         artifacts.run.dir,
@@ -1533,7 +1533,7 @@ def test_gate_full_tier_one_inheritance_persists_document_and_auto_proceeds(
         calls = []
         save_gate_plan(
             current.run.dir,
-            GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+            GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
         )
         monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
         mode_args = ["--run", current.run.run_id]
@@ -1800,7 +1800,7 @@ def test_gate_rejects_unbound_inherited_from_claims(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     source = inherited_source(out_root, current) if source_case != "absent" else None
     if source_case == "unmatched":
@@ -1846,7 +1846,7 @@ def test_gate_allows_fresh_disposition_when_inheritance_source_is_selected(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
     )
     source = inherited_source(out_root, current)
     update_source_finding(source, finding_id="other-id", file="src/other.py")
