@@ -596,7 +596,7 @@ def test_inheritance_target_validation_diagnostic_is_bounded_and_redacted(
     source = inherited_source(out_root, current)
     target_path = source.dir / "target.json"
     raw = json.loads(target_path.read_text(encoding="utf-8"))
-    token = "github_pat_11AA22BB33CC44DD55EE66FF"
+    token = "github_pat_" + "11AA22BB33CC44DD55EE66FF"
     raw["pr_number"] = token
     target_path.write_text(json.dumps(raw), encoding="utf-8")
 
@@ -620,7 +620,7 @@ def test_inheritance_target_mismatch_redacts_observed_repo_controls_and_token(
     out_root = tmp_path / "runs"
     current = prepared_artifacts(out_root, actionable=True)
     source = inherited_source(out_root, current)
-    credential = "github_pat_11AA22BB33CC44DD55EE66FF"
+    credential = "github_pat_" + "11AA22BB33CC44DD55EE66FF"
     observed = "github_\x00pat_11AA22BB33CC44DD55EE66FF/repo"
     source.save_target(target().model_copy(update={"repo": observed}))
 
@@ -1153,7 +1153,7 @@ def test_gate_failed_publish_writes_redacted_publish_status(
     out_root = tmp_path / "runs"
     artifacts = prepared_artifacts(out_root)
     patch_target_dependencies(monkeypatch, artifacts)
-    token = "github_pat_11AA22BB33CC44DD55EE66FF"
+    token = "github_pat_" + "11AA22BB33CC44DD55EE66FF"
 
     def failed_publish(**kwargs: object) -> object:
         del kwargs
@@ -1694,7 +1694,7 @@ def test_gate_redacts_and_labels_carried_blocker_authorization_failure(
     source = inherited_source(out_root, current)
     patch_target_dependencies(monkeypatch, current)
     real_permission_lookup = cli_module.github_actor_permission
-    secret_token = "github_pat_11AA22BB33CC44DD55EE66FF"
+    secret_token = "github_pat_" + "11AA22BB33CC44DD55EE66FF"
     bearer_secret = "bearer-value-that-must-not-survive"
     fixture_label = f"fixture-{failed_step}-only"
 

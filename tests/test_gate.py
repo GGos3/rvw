@@ -1205,12 +1205,12 @@ def test_pull_request_requery_and_actor_permission_commands() -> None:
 
 def test_authorization_diagnostic_redacts_token_families_and_controls() -> None:
     secrets = [
-        "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-        "gho_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
-        "ghu_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
-        "ghs_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
-        "ghr_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
-        "github_pat_11AA22BB33CC44DD55EE66FF",
+        "ghp_" + "A" * 36,
+        "gho_" + "B" * 36,
+        "ghu_" + "C" * 36,
+        "ghs_" + "D" * 36,
+        "ghr_" + "E" * 36,
+        "github_pat_" + "11AA22BB33CC44DD55EE66FF",
         "f" * 80,
         "QWxhZGRpbjpvcGVuIHNlc2FtZQ" * 4,
     ]
