@@ -86,3 +86,16 @@
 
 - [x] 18.1 Synchronize the delta and main pr-gate spec/context for completed-verdict rejection, inheritance source validation, digest construction, and demotion-reason vocabulary.
 - [x] 18.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.
+
+## 19. Round-8 regression coverage
+
+- [x] 19.1 Add failing regressions for normalize-before-redact diagnostics, typed retryable verdict lifecycle and completed-verdict republishing, pinned directory-relative artifact reads, severity-bound tier one, outcome-key equality, bounded source-validation diagnostics, empty authorization output, and the closed blank-reason vocabulary.
+
+## 20. Round-8 hardening implementation
+
+- [x] 20.1 Implement the round-8 redaction, lifecycle, pinned-read, inheritance-integrity, authorization-output, and vocabulary corrections.
+
+## 21. Round-8 specification and verification
+
+- [x] 21.1 Synchronize the delta and main pr-gate spec/context for verdict kinds and republishing, severity-bound matching, exact outcome keys, normalize-before-redact diagnostics, and pinned directory reads.
+- [x] 21.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.

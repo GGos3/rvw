@@ -7,7 +7,7 @@ import json
 import os
 import re
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -72,20 +72,48 @@ class RunHandle:
 
     run_id: str
     dir: Path
+    _dir_fd: int | None = field(default=None, repr=False, compare=False)
+
+    def _pinned_dir_fd(self) -> int:
+        fd = self._dir_fd
+        if fd is not None:
+            return fd
+        try:
+            fd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise InvalidRunId(self.run_id, self.dir.parent) from exc
+            raise
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise InvalidRunId(self.run_id, self.dir.parent)
+        object.__setattr__(self, "_dir_fd", fd)
+        return fd
+
+    def close(self) -> None:
+        fd = self._dir_fd
+        if fd is not None:
+            os.close(fd)
+            object.__setattr__(self, "_dir_fd", None)
+
+    def __enter__(self) -> RunHandle:
+        self._pinned_dir_fd()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
 
     def _load_contained_json(self, name: str, stage: str) -> Any:
-        path = self.dir / name
         try:
-            resolved_parent = path.parent.resolve(strict=True)
-        except FileNotFoundError as exc:
-            raise StageMissing(stage, self.dir) from exc
-        resolved_dir = self.dir.resolve()
-        if not resolved_parent.is_relative_to(resolved_dir):
-            raise InvalidRunId(self.run_id, self.dir.parent)
-        try:
-            # O_NOFOLLOW protects the final component, which is the artifact swap vector;
-            # RunStore.open has already validated the run directory itself.
-            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=self._pinned_dir_fd(),
+            )
         except FileNotFoundError as exc:
             raise StageMissing(stage, self.dir) from exc
         except OSError as exc:
@@ -219,9 +247,18 @@ class RunStore:
         resolved_run = run_dir.resolve()
         if not resolved_run.is_relative_to(resolved_root) or resolved_run == resolved_root:
             raise InvalidRunId(run_id, self.root)
-        if not run_dir.is_dir():
-            raise RunNotFound(run_id, self.root)
-        return RunHandle(run_id=run_id, dir=run_dir)
+        try:
+            fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError as exc:
+            raise RunNotFound(run_id, self.root) from exc
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise InvalidRunId(run_id, self.root) from exc
+            raise
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise InvalidRunId(run_id, self.root)
+        return RunHandle(run_id=run_id, dir=run_dir, _dir_fd=fd)
 
 
 __all__ = ["InvalidRunId", "RunHandle", "RunNotFound", "RunStore", "StageMissing"]

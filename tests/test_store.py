@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -180,6 +181,60 @@ def test_contained_json_loader_reads_regular_file(tmp_path: Path) -> None:
     run = RunHandle(run_id="safe-run", dir=run_dir)
 
     assert run._load_contained_json("target.json", "target") == {"source": "original"}
+
+
+def test_contained_json_loader_uses_pinned_dir_fd_and_no_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "runs"
+    run_dir = root / "safe-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "target.json").write_text('{"source": "original"}\n', encoding="utf-8")
+    run = RunStore(root).open("safe-run")
+    real_open = os.open
+    artifact_opens: list[tuple[int, int | None]] = []
+
+    def recording_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == "target.json":
+            artifact_opens.append((flags, dir_fd))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    try:
+        assert run._load_contained_json("target.json", "target") == {"source": "original"}
+    finally:
+        run.close()
+
+    assert len(artifact_opens) == 1
+    flags, dir_fd = artifact_opens[0]
+    assert flags & os.O_NOFOLLOW
+    assert dir_fd is not None
+
+
+def test_opened_run_reads_from_pinned_directory_after_path_swap(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    run_dir = root / "safe-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "target.json").write_text('{"source": "original"}\n', encoding="utf-8")
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "target.json").write_text('{"source": "foreign"}\n', encoding="utf-8")
+
+    run = RunStore(root).open("safe-run")
+    pinned_path = root / "pinned-run"
+    run_dir.rename(pinned_path)
+    run_dir.symlink_to(foreign, target_is_directory=True)
+    try:
+        assert run._load_contained_json("target.json", "target") == {"source": "original"}
+    finally:
+        run.close()
 
 
 def test_contained_json_loader_rejects_non_regular_file(tmp_path: Path) -> None:

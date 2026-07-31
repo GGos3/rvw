@@ -563,6 +563,43 @@ def test_inheritance_source_rejects_blank_accepted_reason(tmp_path: Path) -> Non
         )
 
 
+def test_inheritance_source_validation_diagnostic_is_bounded_and_redacted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        current.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    source = inherited_source(out_root, current)
+    verdict_path = source.dir / "gate-verdict.json"
+    raw = json.loads(verdict_path.read_text(encoding="utf-8"))
+    raw["findings"][0]["severity"] = "ghp_\u202eSECRET123"
+    verdict_path.write_text(json.dumps(raw), encoding="utf-8")
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            current.run.run_id,
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "inherit_verdict_invalid" in result.stderr
+    assert "ghp_SECRET123" not in result.stderr
+    assert "[REDACTED]" in result.stderr
+    assert len(result.stderr) <= 600
+
+
 def test_inheritance_source_accepts_closed_counts_and_nonblank_reason(tmp_path: Path) -> None:
     out_root = tmp_path / "runs"
     current = prepared_artifacts(out_root, actionable=True)
@@ -726,6 +763,186 @@ def test_gate_resume_without_dispositions_preserves_completed_verdict(
     assert "--inherit" in result.stderr
     assert json_path.read_bytes() == original_json
     assert markdown_path.read_bytes() == original_markdown
+
+
+def test_gate_completed_dry_run_can_be_republished_with_execute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, artifacts)
+    first = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+    assert first.exit_code == 0
+    verdict_bytes = (artifacts.run.dir / "gate-verdict.json").read_bytes()
+    published: list[str] = []
+
+    def successful_publish(**kwargs: object) -> object:
+        assert kwargs["execute"] is True
+        published.append(str(kwargs["report_md"]))
+        return type("Result", (), {"review_url": "https://example.test/review/1"})()
+
+    monkeypatch.setattr(cli_module, "publish_review", successful_publish)
+    second = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root), "--execute"],
+    )
+
+    assert second.exit_code == 0, second.stderr
+    assert published == [(artifacts.run.dir / "gate-verdict.md").read_text(encoding="utf-8")]
+    assert (artifacts.run.dir / "gate-verdict.json").read_bytes() == verdict_bytes
+
+
+def test_gate_transient_publish_failure_retries_existing_completed_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, artifacts)
+    calls: list[str] = []
+
+    def flaky_publish(**kwargs: object) -> object:
+        calls.append(str(kwargs["report_md"]))
+        if len(calls) == 1:
+            raise cli_module.PublishError("transient publish failure")
+        return type("Result", (), {"review_url": "https://example.test/review/2"})()
+
+    monkeypatch.setattr(cli_module, "publish_review", flaky_publish)
+    first = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root), "--execute"],
+    )
+    assert first.exit_code == 3
+    verdict_bytes = (artifacts.run.dir / "gate-verdict.json").read_bytes()
+
+    second = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root), "--execute"],
+    )
+
+    assert second.exit_code == 0, second.stderr
+    assert len(calls) == 2
+    assert calls[0] == calls[1]
+    assert (artifacts.run.dir / "gate-verdict.json").read_bytes() == verdict_bytes
+
+
+def test_gate_completed_verdict_rejects_disposition_regeneration_with_execute(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, artifacts)
+    first = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+    assert first.exit_code == 0
+    dispositions = tmp_path / "dispositions.yaml"
+    dispositions.write_text("schema_version: 1\ndispositions: []\n", encoding="utf-8")
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            artifacts.run.run_id,
+            "--dispositions",
+            str(dispositions),
+            "--out",
+            str(out_root),
+            "--execute",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "verdict_already_completed" in result.stderr
+
+
+def test_gate_failure_verdict_is_retryable_after_dispositions_are_corrected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        artifacts.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+    invalid = tmp_path / "invalid.yaml"
+    invalid.write_text("schema_version: 1\ndispositions: []\n", encoding="utf-8")
+    first = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            artifacts.run.run_id,
+            "--dispositions",
+            str(invalid),
+            "--out",
+            str(out_root),
+        ],
+    )
+    assert first.exit_code == 1
+    assert artifacts.run.load_gate_verdict().kind == "failure"
+
+    finding_id = artifacts.merged.groups[0].key
+    corrected = tmp_path / "corrected.yaml"
+    corrected.write_text(
+        "schema_version: 1\ndispositions:\n"
+        f"  - finding_id: {finding_id}\n"
+        "    decision: accepted\n"
+        "    reason: corrected owner decision\n",
+        encoding="utf-8",
+    )
+    second = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            artifacts.run.run_id,
+            "--dispositions",
+            str(corrected),
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert second.exit_code == 0, second.stderr
+    assert artifacts.run.load_gate_verdict().kind == "completed"
+
+
+def test_gate_orphan_outcome_key_persists_failure_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        artifacts.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    assert artifacts.outcome is not None
+    artifacts.outcome.verdicts["orphan-finding"] = Verdict.CONFIRMED
+    artifacts.run.save_outcome(artifacts.outcome)
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 1
+    persisted = artifacts.run.load_gate_verdict()
+    assert persisted.kind == "failure"
+    assert persisted.verdict == "BLOCK"
+    assert persisted.findings == []
+    assert "orphan-finding" in persisted.failures[0]
 
 
 def test_gate_full_inheritance_does_not_overwrite_completed_block_verdict(

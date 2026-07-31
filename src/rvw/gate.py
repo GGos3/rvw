@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.discover import LaneCoverage
@@ -105,11 +105,11 @@ class InheritanceBlankReason(StrEnum):
     SOURCE_PAIR_AMBIGUOUS = "source_pair_ambiguous"
     CURRENT_PAIR_AMBIGUOUS = "current_pair_ambiguous"
     CONTENT_CHANGED = "content_changed"
-    CONTENT_DIGEST_UNKNOWN = "content_digest_unknown"
     SOURCE_DIGEST_MISSING = "source_digest_missing"
     CURRENT_DIGEST_MISSING = "current_digest_missing"
     DIAGNOSIS_CHANGED = "diagnosis_changed"
     FINDING_ID_CHANGED = "finding_id_changed"
+    SEVERITY_CHANGED = "severity_changed"
 
 
 class GateFinding(BaseModel):
@@ -178,8 +178,27 @@ class GateVerdict(BaseModel):
     findings: list[GateFinding]
     actor: str | None = None
     verdict: Literal["PASS", "BLOCK"]
+    kind: Literal["pause", "failure", "completed"] = "failure"
     failures: list[str] = Field(default_factory=list)
     inheritance_summary: InheritanceSummary | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _infer_legacy_kind(cls, value: object) -> object:
+        if not isinstance(value, Mapping) or "kind" in value:
+            return value
+        inferred = dict(value)
+        failures = inferred.get("failures")
+        findings = inferred.get("findings")
+        if isinstance(failures, list) and (
+            "actionable findings require explicit dispositions" in failures
+        ):
+            inferred["kind"] = "pause"
+        elif isinstance(findings, list) and findings:
+            inferred["kind"] = "completed"
+        else:
+            inferred["kind"] = "failure"
+        return inferred
 
 
 def load_dispositions(path: Path) -> DispositionDocument:
@@ -282,6 +301,20 @@ def validate_coverage(
 def _actionable(
     merged: MergeResult, outcome: AdjudicationOutcome
 ) -> list[tuple[CollapseGroup, Verdict]]:
+    merged_keys = {group.key for group in merged.groups}
+    outcome_keys = set(outcome.verdicts)
+    if outcome_keys != merged_keys:
+        missing = sorted(merged_keys - outcome_keys)
+        orphan = sorted(outcome_keys - merged_keys)
+        details = []
+        if missing:
+            details.append(f"missing={','.join(missing)}")
+        if orphan:
+            details.append(f"orphan={','.join(orphan)}")
+        raise GateInvariantError(
+            "adjudication outcome keys must exactly match merged finding keys: "
+            + "; ".join(details)
+        )
     actionable: list[tuple[CollapseGroup, Verdict]] = []
     for group in merged.groups:
         verdict = outcome.verdicts.get(group.key)
@@ -368,7 +401,9 @@ def match_inherited_dispositions(
             inherited_digest = exact.hunk_sha256
             current_digest = current_digests.get(group.key)
             inherited_body_digest = exact.body_sha256
-            if (
+            if exact.severity is not group.severity:
+                demotion_reason = InheritanceBlankReason.SEVERITY_CHANGED
+            elif (
                 inherited_digest is not None
                 and current_digest is not None
                 and inherited_digest == current_digest
@@ -383,14 +418,15 @@ def match_inherited_dispositions(
                     tier=InheritanceTier.EXACT_ID,
                 )
                 continue
-            if inherited_digest is None or inherited_body_digest is None:
-                demotion_reason = InheritanceBlankReason.SOURCE_DIGEST_MISSING
-            elif current_digest is None:
-                demotion_reason = InheritanceBlankReason.CURRENT_DIGEST_MISSING
-            elif inherited_digest != current_digest:
-                demotion_reason = InheritanceBlankReason.CONTENT_CHANGED
-            else:
-                demotion_reason = InheritanceBlankReason.DIAGNOSIS_CHANGED
+            if demotion_reason is None:
+                if inherited_digest is None or inherited_body_digest is None:
+                    demotion_reason = InheritanceBlankReason.SOURCE_DIGEST_MISSING
+                elif current_digest is None:
+                    demotion_reason = InheritanceBlankReason.CURRENT_DIGEST_MISSING
+                elif inherited_digest != current_digest:
+                    demotion_reason = InheritanceBlankReason.CONTENT_CHANGED
+                else:
+                    demotion_reason = InheritanceBlankReason.DIAGNOSIS_CHANGED
 
         inherited = inherited_by_pair.get(pair)
         if inherited is None:
@@ -537,6 +573,7 @@ def build_gate_verdict(
         findings=findings,
         actor=actor if accepted_blocker else None,
         verdict="BLOCK" if blocked else "PASS",
+        kind="completed",
         inheritance_summary=inheritance_summary,
     )
 
@@ -689,21 +726,37 @@ def _run(command: list[str]) -> str:
 _AUTHORIZATION_DIAGNOSTIC_LIMIT = 500
 _REDACTED = "[REDACTED]"
 _GITHUB_TOKEN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b")
-_AUTHORIZATION_HEADER = re.compile(r"(?i)(\bAuthorization\s*:\s*)[^\r\n]*")
+_AUTHORIZATION_HEADER = re.compile(r"(?i)(\bAuthorization\s*:\s*)[^\u2028]*")
 _BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 _LONG_HEX = re.compile(r"\b[0-9a-fA-F]{40,}\b")
 _LONG_BASE64 = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_ESCAPED_CONTROL_CHARACTER = re.compile(
+    r"\\(?:u(?P<unicode>[0-9a-fA-F]{4})|x(?P<byte>[0-9a-fA-F]{2}))"
+)
+
+
+def _strip_escaped_control_character(match: re.Match[str]) -> str:
+    raw_codepoint = match.group("unicode") or match.group("byte")
+    character = chr(int(raw_codepoint, 16))
+    if unicodedata.category(character) == "Cf":
+        return ""
+    if _CONTROL_CHARACTERS.fullmatch(character):
+        return " "
+    return match.group(0)
 
 
 def _redact_subprocess_diagnostic(value: str) -> str:
-    redacted = _GITHUB_TOKEN.sub(_REDACTED, value)
+    redacted = value.replace("\r\n", "\u2028").replace("\r", "\u2028").replace("\n", "\u2028")
+    redacted = _ESCAPED_CONTROL_CHARACTER.sub(_strip_escaped_control_character, redacted)
+    redacted = "".join(char for char in redacted if unicodedata.category(char) != "Cf")
+    redacted = _CONTROL_CHARACTERS.sub(" ", redacted).strip()
+    redacted = _GITHUB_TOKEN.sub(_REDACTED, redacted)
     redacted = _AUTHORIZATION_HEADER.sub(rf"\1{_REDACTED}", redacted)
     redacted = _BEARER_VALUE.sub(f"Bearer {_REDACTED}", redacted)
     redacted = _LONG_HEX.sub(_REDACTED, redacted)
     redacted = _LONG_BASE64.sub(_REDACTED, redacted)
-    redacted = "".join(char for char in redacted if unicodedata.category(char) != "Cf")
-    redacted = _CONTROL_CHARACTERS.sub(" ", redacted).strip()
+    redacted = redacted.replace("\u2028", " ").strip()
     truncation_marker = "...[truncated]"
     if len(redacted) > _AUTHORIZATION_DIAGNOSTIC_LIMIT:
         redacted = (
@@ -786,6 +839,12 @@ def github_actor_permission(
             actor=actor,
             detail=_authorization_error_detail(exc),
         ) from exc
+    if not permission:
+        raise GitHubAuthorizationError(
+            step="permission_lookup",
+            actor=actor,
+            detail="GitHub returned an empty repository permission",
+        )
     return actor, permission
 
 

@@ -19,6 +19,7 @@ from rvw.gate import (
     GateFinding,
     GateInvariantError,
     GatePlan,
+    GateVerdict,
     GitHubAuthorizationError,
     InheritanceBlankReason,
     InheritanceSummary,
@@ -388,13 +389,14 @@ def _inherited_finding(
     reason: str = "prior owner judgment",
     hunk_sha256: str | None = None,
     body_sha256: str | None = None,
+    severity: Severity = Severity.WARNING,
 ) -> GateFinding:
     return GateFinding(
         finding_id=finding_id,
         rule_id=rule_id,
         file=file,
         line=1,
-        severity=Severity.WARNING,
+        severity=severity,
         verdict=Verdict.CONFIRMED,
         disposition=decision,
         reason=reason,
@@ -499,6 +501,46 @@ def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None
     assert moved.reason == "prior owner judgment"
     assert moved.inherited_from == "run-prior"
     assert moved.blank_reason == "finding_id_changed"
+
+
+def test_inheritance_matcher_demotes_exact_id_when_severity_changes() -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+    merged.groups[0] = group.model_copy(update={"severity": Severity.BLOCKER})
+
+    matched = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id=group.key,
+                rule_id=group.rule_id,
+                file=group.file,
+                hunk_sha256="1" * 64,
+                body_sha256=BODY_SHA256,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+        current_hunk_sha256={group.key: "1" * 64},
+    )[group.key]
+
+    assert matched.tier is InheritanceTier.UNIQUE_PAIR
+    assert matched.decision is DispositionDecision.MUST_FIX
+    assert matched.reason == "prior owner judgment"
+    assert matched.blank_reason is InheritanceBlankReason.SEVERITY_CHANGED
+
+
+def test_inheritance_matcher_rejects_orphan_outcome_keys() -> None:
+    merged, outcome = _one_finding_merge()
+    outcome.verdicts["orphan-finding"] = Verdict.CONFIRMED
+
+    with pytest.raises(GateInvariantError, match="orphan-finding"):
+        match_inherited_dispositions(
+            [],
+            merged,
+            outcome,
+            inherited_run_id="run-prior",
+        )
 
 
 @pytest.mark.parametrize(
@@ -961,6 +1003,7 @@ def test_disposition_template_renders_carried_prefilled_and_blank_entries(
             reason="exact acceptance",
             hunk_sha256="1" * 64,
             body_sha256=body_set_sha256("blocker"),
+            severity=Severity.BLOCKER,
         ),
         _inherited_finding(
             finding_id="moved-finding-id",
@@ -1165,6 +1208,93 @@ def test_authorization_diagnostic_redacts_token_families_and_controls() -> None:
     assert "\x00" not in detail
     assert all(secret not in detail for secret in secrets)
     assert len(detail) <= 500
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "credential"),
+    [
+        ("ghp_\u202eSECRET123", "ghp_SECRET123"),
+        ("Authori\u200bzation: Basic private-value", "Basic private-value"),
+        ("Bearer\u200e private-value", "private-value"),
+    ],
+)
+def test_authorization_diagnostic_normalizes_before_redacting(
+    diagnostic: str,
+    credential: str,
+) -> None:
+    def failed_run(command: list[str]) -> str:
+        raise subprocess.CalledProcessError(
+            returncode=19,
+            cmd=command,
+            stderr=diagnostic,
+        )
+
+    with pytest.raises(GitHubAuthorizationError) as caught:
+        github_actor_permission("owner/repo", run=failed_run)
+
+    assert credential not in caught.value.detail
+    assert "[REDACTED]" in caught.value.detail
+
+
+@pytest.mark.parametrize(
+    ("actor_output", "permission_output", "step", "actor"),
+    [
+        ("   \n", "admin\n", "actor_lookup", None),
+        ("repo-owner\n", " \t\n", "permission_lookup", "repo-owner"),
+    ],
+)
+def test_authorization_lookup_rejects_empty_success_output(
+    actor_output: str,
+    permission_output: str,
+    step: str,
+    actor: str | None,
+) -> None:
+    def fake_run(command: list[str]) -> str:
+        if command[:3] == ["gh", "api", "user"]:
+            return actor_output
+        return permission_output
+
+    with pytest.raises(GitHubAuthorizationError) as caught:
+        github_actor_permission("owner/repo", run=fake_run)
+
+    assert caught.value.step == step
+    assert caught.value.actor == actor
+    assert "empty" in caught.value.detail
+
+
+def test_gate_verdict_legacy_kind_inference_and_closed_blank_reasons() -> None:
+    base = GateVerdict(
+        run_id="run-1",
+        repo="owner/repo",
+        pr_number=42,
+        anchor=GateAnchor(base_sha="a" * 40, head_sha="b" * 40),
+        counts={"CONFIRMED": 0, "REJECTED": 0, "UNCERTAIN": 0},
+        coverage=[],
+        findings=[],
+        verdict="BLOCK",
+        failures=["actionable findings require explicit dispositions"],
+    )
+    raw = base.model_dump(mode="json", exclude={"kind"})
+    assert GateVerdict.model_validate(raw).kind == "pause"
+    raw["failures"] = ["operational failure"]
+    assert GateVerdict.model_validate(raw).kind == "failure"
+    raw["findings"] = [
+        GateFinding(
+            finding_id="finding-1",
+            rule_id="rule/actionable",
+            file="src/a.py",
+            line=1,
+            severity=Severity.WARNING,
+            verdict=Verdict.CONFIRMED,
+            disposition=DispositionDecision.ACCEPTED,
+            reason="reviewed",
+        ).model_dump(mode="json")
+    ]
+    assert GateVerdict.model_validate(raw).kind == "completed"
+
+    raw["findings"][0]["inheritance_blank_reason"] = "content_digest_unknown"
+    with pytest.raises(ValidationError):
+        GateVerdict.model_validate(raw)
 
 
 def test_pull_request_requery_rejects_malformed_api_data() -> None:
