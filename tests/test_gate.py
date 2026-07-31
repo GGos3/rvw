@@ -24,6 +24,7 @@ from rvw.gate import (
     InheritanceSummary,
     InheritanceTier,
     PullRequestState,
+    _body_sha256,
     build_gate_verdict,
     github_actor_permission,
     load_dispositions,
@@ -46,7 +47,14 @@ from rvw.target import ResolvedTarget
 HUNK_TEXT = "@@ -1 +1 @@\n-old\n+new\n"
 HUNK_DIFF = f"diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n{HUNK_TEXT}"
 HUNK_SHA256 = hashlib.sha256(HUNK_TEXT.encode()).hexdigest()
-BODY_SHA256 = hashlib.sha256(b"actionable").hexdigest()
+
+
+def body_set_sha256(*bodies: str) -> str:
+    blocks = (hashlib.sha256(body.encode()).digest() for body in sorted(bodies))
+    return hashlib.sha256(b"".join(blocks)).hexdigest()
+
+
+BODY_SHA256 = body_set_sha256("actionable")
 
 
 def target() -> ResolvedTarget:
@@ -494,14 +502,16 @@ def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None
 
 
 @pytest.mark.parametrize(
-    ("source_digest", "blank_reason"),
+    ("source_digest", "current_digest", "blank_reason"),
     [
-        ("2" * 64, "content_changed"),
-        (None, "content_digest_unknown"),
+        ("2" * 64, "1" * 64, "content_changed"),
+        (None, "1" * 64, "source_digest_missing"),
+        ("1" * 64, None, "current_digest_missing"),
     ],
 )
 def test_inheritance_matcher_demotes_exact_id_without_equal_known_hunk_digest(
     source_digest: str | None,
+    current_digest: str | None,
     blank_reason: str,
 ) -> None:
     merged, outcome = _one_finding_merge()
@@ -520,7 +530,7 @@ def test_inheritance_matcher_demotes_exact_id_without_equal_known_hunk_digest(
         merged,
         outcome,
         inherited_run_id="run-prior",
-        current_hunk_sha256={group.key: "1" * 64},
+        current_hunk_sha256={group.key: current_digest},
     )[group.key]
 
     assert result.tier is InheritanceTier.UNIQUE_PAIR
@@ -533,8 +543,8 @@ def test_inheritance_matcher_demotes_exact_id_without_equal_known_hunk_digest(
 @pytest.mark.parametrize(
     ("source_digest", "blank_reason"),
     [
-        ("2" * 64, "content_changed"),
-        (None, "content_digest_unknown"),
+        ("2" * 64, "diagnosis_changed"),
+        (None, "source_digest_missing"),
     ],
 )
 def test_inheritance_matcher_requires_equal_known_body_digest_for_exact_carry(
@@ -567,7 +577,7 @@ def test_inheritance_matcher_requires_equal_known_body_digest_for_exact_carry(
 
 def test_inheritance_body_digest_binds_all_bodies_and_is_order_insensitive() -> None:
     source_bodies = ["diagnosis A", "diagnosis B"]
-    source_digest = hashlib.sha256("\n\0\n".join(sorted(source_bodies)).encode()).hexdigest()
+    source_digest = body_set_sha256(*source_bodies)
     changed, changed_outcome = _multi_body_merge(["diagnosis A", "diagnosis C"])
     reordered, reordered_outcome = _multi_body_merge(list(reversed(source_bodies)))
     source = _inherited_finding(
@@ -594,16 +604,23 @@ def test_inheritance_body_digest_binds_all_bodies_and_is_order_insensitive() -> 
     )[reordered.groups[0].key]
 
     assert changed_match.tier is InheritanceTier.UNIQUE_PAIR
-    assert changed_match.blank_reason is InheritanceBlankReason.CONTENT_CHANGED
+    assert changed_match.blank_reason is InheritanceBlankReason.DIAGNOSIS_CHANGED
     assert reordered_match.tier is InheritanceTier.EXACT_ID
     assert reordered_match.decision is DispositionDecision.ACCEPTED
 
 
-def test_legacy_single_body_digest_demotes_multi_body_finding() -> None:
+def test_inheritance_body_digest_has_unambiguous_body_boundaries() -> None:
+    separated, _ = _multi_body_merge(["a", "b"])
+    injected, _ = _multi_body_merge(["a\n\0\nb"])
+
+    assert _body_sha256(separated.groups[0]) != _body_sha256(injected.groups[0])
+
+
+def test_legacy_delimited_body_digest_demotes_after_digest_migration() -> None:
     bodies = ["diagnosis A", "diagnosis B"]
     merged, outcome = _multi_body_merge(bodies)
     group = merged.groups[0]
-    legacy_digest = hashlib.sha256(bodies[0].encode()).hexdigest()
+    legacy_digest = hashlib.sha256("\n\0\n".join(sorted(bodies)).encode()).hexdigest()
 
     matched = match_inherited_dispositions(
         [
@@ -622,7 +639,7 @@ def test_legacy_single_body_digest_demotes_multi_body_finding() -> None:
     )[group.key]
 
     assert matched.tier is InheritanceTier.UNIQUE_PAIR
-    assert matched.blank_reason is InheritanceBlankReason.CONTENT_CHANGED
+    assert matched.blank_reason == "diagnosis_changed"
 
 
 def test_empty_collapse_group_bodies_raise_gate_invariant() -> None:
@@ -716,7 +733,7 @@ def test_inheritance_matcher_leaves_ambiguous_pairs_blank(duplicate_side: str) -
             rule_id="rule/actionable",
             file="src/a.py",
             hunk_sha256="1" * 64,
-            body_sha256=hashlib.sha256(exact_group.bodies[0].encode()).hexdigest(),
+            body_sha256=body_set_sha256(*exact_group.bodies),
         )
     ]
     if duplicate_side == "inherited":
@@ -909,12 +926,14 @@ def test_inheritance_summary_reason_keys_use_closed_vocabulary() -> None:
 
     assert summary.model_dump(mode="json")["reasons"] == {"unmatched": 1}
     with pytest.raises(ValidationError, match="Input should be"):
-        InheritanceSummary(
-            source_run_id="run-prior",
-            carried=0,
-            prefilled=0,
-            blank=1,
-            reasons={"invented_reason": 1},  # ty: ignore[invalid-argument-type]
+        InheritanceSummary.model_validate(
+            {
+                "source_run_id": "run-prior",
+                "carried": 0,
+                "prefilled": 0,
+                "blank": 1,
+                "reasons": {"invented_reason": 1},
+            }
         )
 
 
@@ -941,7 +960,7 @@ def test_disposition_template_renders_carried_prefilled_and_blank_entries(
             file="src/a.py",
             reason="exact acceptance",
             hunk_sha256="1" * 64,
-            body_sha256=hashlib.sha256(b"blocker").hexdigest(),
+            body_sha256=body_set_sha256("blocker"),
         ),
         _inherited_finding(
             finding_id="moved-finding-id",

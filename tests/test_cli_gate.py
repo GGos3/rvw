@@ -33,7 +33,7 @@ runner = CliRunner()
 HUNK_TEXT = "@@ -1 +1 @@\n-old\n+new\n"
 HUNK_DIFF = f"diff --git a/src/a.py b/src/a.py\n--- a/src/a.py\n+++ b/src/a.py\n{HUNK_TEXT}"
 HUNK_SHA256 = hashlib.sha256(HUNK_TEXT.encode()).hexdigest()
-BODY_SHA256 = hashlib.sha256(b"actionable").hexdigest()
+BODY_SHA256 = hashlib.sha256(hashlib.sha256(b"actionable").digest()).hexdigest()
 
 
 def target() -> ResolvedTarget:
@@ -516,6 +516,68 @@ def test_gate_inheritance_source_requires_completed_actionable_dispositions(
     assert expected_text in (result.stderr + result.stdout)
 
 
+@pytest.mark.parametrize(
+    "counts",
+    [
+        {},
+        {"CONFIRMED": 1, "REJECTED": 0},
+        {"CONFIRMED": 1, "REJECTED": 0, "UNCERTAIN": 0, "EXTRA": 0},
+        {"CONFIRMED": "1", "REJECTED": 0, "UNCERTAIN": 0},
+    ],
+)
+def test_inheritance_source_rejects_non_closed_count_shape(
+    tmp_path: Path,
+    counts: dict[str, object],
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+    verdict_path = source.dir / "gate-verdict.json"
+    raw = json.loads(verdict_path.read_text(encoding="utf-8"))
+    raw["counts"] = counts
+    raw["findings"] = []
+    verdict_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="inherit_verdict_invalid"):
+        cli_module._load_inherited_dispositions(
+            source.run_id,
+            current_target=current.target,
+            out_root=out_root,
+        )
+
+
+def test_inheritance_source_rejects_blank_accepted_reason(tmp_path: Path) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+    verdict_path = source.dir / "gate-verdict.json"
+    raw = json.loads(verdict_path.read_text(encoding="utf-8"))
+    raw["findings"][0]["reason"] = "  \t"
+    verdict_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="inherit_verdict_invalid"):
+        cli_module._load_inherited_dispositions(
+            source.run_id,
+            current_target=current.target,
+            out_root=out_root,
+        )
+
+
+def test_inheritance_source_accepts_closed_counts_and_nonblank_reason(tmp_path: Path) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+
+    loaded = cli_module._load_inherited_dispositions(
+        source.run_id,
+        current_target=current.target,
+        out_root=out_root,
+    )
+
+    assert loaded.counts == {"CONFIRMED": 1, "REJECTED": 0, "UNCERTAIN": 0}
+    assert loaded.findings[0].reason == "accepted in prior run"
+
+
 def test_block_verdict_source_counts_mixed_dispositions_as_pair_ambiguity(
     tmp_path: Path,
 ) -> None:
@@ -664,6 +726,151 @@ def test_gate_resume_without_dispositions_preserves_completed_verdict(
     assert "--inherit" in result.stderr
     assert json_path.read_bytes() == original_json
     assert markdown_path.read_bytes() == original_markdown
+
+
+def test_gate_full_inheritance_does_not_overwrite_completed_block_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        current.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    source = inherited_source(out_root, current)
+    group = current.merged.groups[0]
+    save_gate_verdict(
+        current.run.dir,
+        GateVerdict(
+            run_id=current.run.run_id,
+            repo=current.target.repo,
+            pr_number=42,
+            anchor=GateAnchor(base_sha="a" * 40, head_sha="b" * 40),
+            counts={"CONFIRMED": 1, "REJECTED": 0, "UNCERTAIN": 0},
+            coverage=current.discovered.coverage,
+            findings=[
+                GateFinding(
+                    finding_id=group.key,
+                    rule_id=group.rule_id,
+                    file=group.file,
+                    line=group.line,
+                    severity=group.severity,
+                    verdict=Verdict.CONFIRMED,
+                    disposition=DispositionDecision.MUST_FIX,
+                    reason="must still be fixed",
+                    hunk_sha256=HUNK_SHA256,
+                    body_sha256=BODY_SHA256,
+                )
+            ],
+            verdict="BLOCK",
+        ),
+    )
+    verdict_path = current.run.dir / "gate-verdict.json"
+    original_verdict = verdict_path.read_bytes()
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            current.run.run_id,
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "verdict_already_completed" in result.stderr
+    assert verdict_path.read_bytes() == original_verdict
+
+
+def test_gate_full_inheritance_replaces_pause_stub_and_proceeds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        current.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    source = inherited_source(out_root, current)
+    save_gate_verdict(
+        current.run.dir,
+        GateVerdict(
+            run_id=current.run.run_id,
+            repo=current.target.repo,
+            pr_number=42,
+            anchor=GateAnchor(base_sha="a" * 40, head_sha="b" * 40),
+            counts={"CONFIRMED": 1, "REJECTED": 0, "UNCERTAIN": 0},
+            coverage=current.discovered.coverage,
+            findings=[],
+            verdict="BLOCK",
+            failures=["actionable findings require explicit dispositions"],
+        ),
+    )
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            current.run.run_id,
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    persisted = current.run.load_gate_verdict()
+    assert persisted.verdict == "PASS"
+    assert persisted.findings[0].inherited_from == source.run_id
+
+
+def test_gate_inheritance_matcher_invariant_persists_block_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        current.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    source = inherited_source(out_root, current)
+    current.merged.groups[0] = current.merged.groups[0].model_copy(update={"bodies": []})
+    current.run.save_merge(current.merged)
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--run",
+            current.run.run_id,
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "must contain at least" in result.stderr
+    assert "one body" in result.stderr
+    persisted = current.run.load_gate_verdict()
+    assert persisted.verdict == "BLOCK"
+    assert persisted.findings == []
+    assert persisted.failures == [
+        f"collapsed finding {current.merged.groups[0].key} must contain at least one body"
+    ]
 
 
 def test_gate_resume_without_dispositions_rewrites_existing_pause_stub(
@@ -894,7 +1101,7 @@ def test_gate_redacts_and_labels_carried_blocker_authorization_failure(
                 returncode=exit_status,
                 cmd=command,
                 stderr=(
-                    f"{fixture_label}\x00\n"
+                    f"{fixture_label}\u202e\u200e\x00\n"
                     f"Authorization: Bearer {bearer_secret}\n"
                     f"token={secret_token}\n" + "bounded diagnostic words " * 80
                 ),
@@ -937,6 +1144,8 @@ def test_gate_redacts_and_labels_carried_blocker_authorization_failure(
         assert secret_token not in sink
         assert bearer_secret not in sink
         assert "\x00" not in sink
+        assert "\u202e" not in sink
+        assert "\u200e" not in sink
         assert f"step={failed_step}" in sink
     assert not (current.run.dir / "publish-payload.json").exists()
 

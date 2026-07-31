@@ -92,6 +92,7 @@ DEFAULT_REGISTRY_ROOT = Path("~/.hermes/review").expanduser()
 DEFAULT_AUTO_POLICY = Path("~/.hermes/review/policies/auto.yaml").expanduser()
 _PLAN_REPLICAS = 1
 DEFAULT_RUN_ROOT = Path("/tmp/rvw")
+_ACTIONABLE_DISPOSITIONS_PAUSE = "actionable findings require explicit dispositions"
 
 _EXAMPLES: dict[str, list[str]] = {
     "review": [
@@ -613,18 +614,42 @@ def _load_inherited_dispositions(
         )
 
     try:
-        verdict = run.load_gate_verdict()
+        raw_verdict = run._load_contained_json("gate-verdict.json", "gate-verdict")
     except StageMissing as exc:
         raise _InheritanceSourceError("inherit_verdict_missing", str(exc)) from exc
     except (OSError, ValueError) as exc:
+        raise _InheritanceSourceError("inherit_verdict_invalid", str(exc)) from exc
+    expected_count_keys = {verdict.value for verdict in Verdict}
+    raw_counts = raw_verdict.get("counts") if isinstance(raw_verdict, dict) else None
+    if (
+        not isinstance(raw_counts, dict)
+        or set(raw_counts) != expected_count_keys
+        or any(type(value) is not int for value in raw_counts.values())
+    ):
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            "gate verdict counts must contain exactly CONFIRMED, REJECTED, and UNCERTAIN "
+            "with integer values",
+        )
+    try:
+        verdict = GateVerdict.model_validate(raw_verdict)
+    except ValueError as exc:
         raise _InheritanceSourceError("inherit_verdict_invalid", str(exc)) from exc
     if verdict.run_id != run_id or (verdict.repo, verdict.pr_number) != source_identity:
         raise _InheritanceSourceError(
             "inherit_verdict_invalid",
             "gate verdict identity does not match its persisted run target",
         )
-    actionable_count = verdict.counts.get(Verdict.CONFIRMED.value, 0) + verdict.counts.get(
-        Verdict.UNCERTAIN.value, 0
+    if any(
+        finding.disposition is DispositionDecision.ACCEPTED and not finding.reason.strip()
+        for finding in verdict.findings
+    ):
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            "accepted source findings must have nonblank reasons",
+        )
+    actionable_count = (
+        verdict.counts[Verdict.CONFIRMED.value] + verdict.counts[Verdict.UNCERTAIN.value]
     )
     if not verdict.findings and actionable_count > 0:
         raise _InheritanceSourceError(
@@ -796,6 +821,21 @@ async def _gate_pipeline(
         except (RunNotFound, StageMissing, OSError, ValueError) as exc:
             _error_console.print(str(exc), markup=False)
             raise typer.Exit(EXIT_NOT_FOUND) from exc
+        try:
+            existing_verdict = artifacts.run.load_gate_verdict()
+        except StageMissing:
+            existing_verdict = None
+        if existing_verdict is not None and (
+            existing_verdict.findings
+            or _ACTIONABLE_DISPOSITIONS_PAUSE not in existing_verdict.failures
+        ):
+            message = (
+                "verdict_already_completed: "
+                f"run {artifacts.run.run_id} already has a completed verdict; "
+                "start a new target run and use --inherit instead"
+            )
+            _error_console.print(message, markup=False)
+            raise typer.Exit(EXIT_USER_ERROR)
 
     target = artifacts.target
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
@@ -831,26 +871,29 @@ async def _gate_pipeline(
         _gate_invariant_failure(artifacts, GateInvariantError("adjudication outcome is required"))
     outcome = cast(AdjudicationOutcome, artifacts.outcome)
 
-    hunk_digests = hunk_sha256_by_id(target.diff)
-    current_hunk_sha256 = {
-        group.key: hunk_digests.get(group.hunk_id) for group in artifacts.merged.groups
-    }
-    inheritance = (
-        match_inherited_dispositions(
-            inherited_verdict.findings,
-            artifacts.merged,
-            outcome,
-            inherited_run_id=inherit_run_id,
-            current_hunk_sha256=current_hunk_sha256,
+    try:
+        hunk_digests = hunk_sha256_by_id(target.diff)
+        current_hunk_sha256 = {
+            group.key: hunk_digests.get(group.hunk_id) for group in artifacts.merged.groups
+        }
+        inheritance = (
+            match_inherited_dispositions(
+                inherited_verdict.findings,
+                artifacts.merged,
+                outcome,
+                inherited_run_id=inherit_run_id,
+                current_hunk_sha256=current_hunk_sha256,
+            )
+            if inherited_verdict is not None and inherit_run_id is not None
+            else None
         )
-        if inherited_verdict is not None and inherit_run_id is not None
-        else None
-    )
-    inheritance_summary = (
-        summarize_inheritance(inheritance, source_run_id=inherit_run_id)
-        if inheritance is not None and inherit_run_id is not None
-        else None
-    )
+        inheritance_summary = (
+            summarize_inheritance(inheritance, source_run_id=inherit_run_id)
+            if inheritance is not None and inherit_run_id is not None
+            else None
+        )
+    except GateInvariantError as exc:
+        _gate_invariant_failure(artifacts, exc)
 
     if dispositions_path is None:
         has_actionable = any(
@@ -860,35 +903,25 @@ async def _gate_pipeline(
         fully_inherited = inheritance is not None and all(
             matched.tier is InheritanceTier.EXACT_ID for matched in inheritance.values()
         )
-        if has_actionable and not fully_inherited and run_id is not None:
-            try:
-                existing_verdict = artifacts.run.load_gate_verdict()
-            except StageMissing:
-                existing_verdict = None
-            if existing_verdict is not None and (
-                existing_verdict.findings
-                or "actionable findings require explicit dispositions"
-                not in existing_verdict.failures
-            ):
-                message = (
-                    "verdict_already_completed: "
-                    f"run {artifacts.run.run_id} already has a completed verdict; "
-                    "start a new target run and use --inherit instead"
-                )
-                _error_console.print(message, markup=False)
-                raise typer.Exit(EXIT_USER_ERROR)
-        template_path = write_disposition_template(
-            artifacts.run.dir,
-            artifacts.merged,
-            outcome,
-            inheritance=inheritance,
-        )
+        try:
+            template_path = write_disposition_template(
+                artifacts.run.dir,
+                artifacts.merged,
+                outcome,
+                inheritance=inheritance,
+            )
+        except GateInvariantError as exc:
+            _gate_invariant_failure(
+                artifacts,
+                exc,
+                inheritance_summary=inheritance_summary,
+            )
         if has_actionable and not fully_inherited:
             save_gate_verdict(
                 artifacts.run.dir,
                 _gate_failure_verdict(
                     artifacts,
-                    "actionable findings require explicit dispositions",
+                    _ACTIONABLE_DISPOSITIONS_PAUSE,
                     inheritance_summary=inheritance_summary,
                 ),
             )

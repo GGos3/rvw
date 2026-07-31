@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
+import os
 import re
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -72,16 +75,32 @@ class RunHandle:
 
     def _load_contained_json(self, name: str, stage: str) -> Any:
         path = self.dir / name
-        if path.is_symlink():
-            raise InvalidRunId(self.run_id, self.dir.parent)
         try:
-            resolved_path = path.resolve(strict=True)
+            resolved_parent = path.parent.resolve(strict=True)
         except FileNotFoundError as exc:
             raise StageMissing(stage, self.dir) from exc
         resolved_dir = self.dir.resolve()
-        if not resolved_path.is_relative_to(resolved_dir) or resolved_path == resolved_dir:
+        if not resolved_parent.is_relative_to(resolved_dir):
             raise InvalidRunId(self.run_id, self.dir.parent)
-        return _load_json(resolved_path, stage)
+        try:
+            # O_NOFOLLOW protects the final component, which is the artifact swap vector;
+            # RunStore.open has already validated the run directory itself.
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError as exc:
+            raise StageMissing(stage, self.dir) from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise InvalidRunId(self.run_id, self.dir.parent) from exc
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise InvalidRunId(self.run_id, self.dir.parent)
+            with os.fdopen(fd, encoding="utf-8") as artifact:
+                fd = -1
+                return json.load(artifact)
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
     def save_target(self, target: ResolvedTarget) -> None:
         _write_json(self.dir / "target.json", target.model_dump(mode="json"))

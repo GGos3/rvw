@@ -73,3 +73,16 @@
 
 - [x] 15.1 Synchronize the delta and main pr-gate spec/context for diagnostic redaction, completed-verdict protection, and all-body digest binding.
 - [x] 15.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.
+
+## 16. Round-6 regression coverage
+
+- [x] 16.1 Add failing regressions for atomic no-follow artifact reads, delimiter-safe body digests and migration demotion, completed-verdict protection across full inheritance, matcher invariant persistence, closed source counts and nonblank accepted reasons, Unicode format-control redaction, and scoped hygiene.
+
+## 17. Round-6 hardening implementation
+
+- [x] 17.1 Implement descriptor-based contained JSON reads, hash-of-hashes body identity, unconditional completed-verdict resume protection, inheritance matcher invariant persistence, source-boundary validation, format-control stripping, and the requested hygiene changes.
+
+## 18. Round-6 specification and verification
+
+- [x] 18.1 Synchronize the delta and main pr-gate spec/context for completed-verdict rejection, inheritance source validation, digest construction, and demotion-reason vocabulary.
+- [x] 18.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.

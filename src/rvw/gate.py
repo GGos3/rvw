@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import subprocess
+import unicodedata
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from enum import StrEnum
@@ -105,6 +106,9 @@ class InheritanceBlankReason(StrEnum):
     CURRENT_PAIR_AMBIGUOUS = "current_pair_ambiguous"
     CONTENT_CHANGED = "content_changed"
     CONTENT_DIGEST_UNKNOWN = "content_digest_unknown"
+    SOURCE_DIGEST_MISSING = "source_digest_missing"
+    CURRENT_DIGEST_MISSING = "current_digest_missing"
+    DIAGNOSIS_CHANGED = "diagnosis_changed"
     FINDING_ID_CHANGED = "finding_id_changed"
 
 
@@ -310,8 +314,8 @@ def _body_sha256(group: CollapseGroup) -> str:
 
     if not group.bodies:
         raise GateInvariantError(f"collapsed finding {group.key} must contain at least one body")
-    canonical = "\n\0\n".join(sorted(group.bodies))
-    return hashlib.sha256(canonical.encode()).hexdigest()
+    body_digests = (hashlib.sha256(body.encode()).digest() for body in sorted(group.bodies))
+    return hashlib.sha256(b"".join(body_digests)).hexdigest()
 
 
 def match_inherited_dispositions(
@@ -379,13 +383,14 @@ def match_inherited_dispositions(
                     tier=InheritanceTier.EXACT_ID,
                 )
                 continue
-            demotion_reason = (
-                InheritanceBlankReason.CONTENT_DIGEST_UNKNOWN
-                if inherited_digest is None
-                or current_digest is None
-                or inherited_body_digest is None
-                else InheritanceBlankReason.CONTENT_CHANGED
-            )
+            if inherited_digest is None or inherited_body_digest is None:
+                demotion_reason = InheritanceBlankReason.SOURCE_DIGEST_MISSING
+            elif current_digest is None:
+                demotion_reason = InheritanceBlankReason.CURRENT_DIGEST_MISSING
+            elif inherited_digest != current_digest:
+                demotion_reason = InheritanceBlankReason.CONTENT_CHANGED
+            else:
+                demotion_reason = InheritanceBlankReason.DIAGNOSIS_CHANGED
 
         inherited = inherited_by_pair.get(pair)
         if inherited is None:
@@ -553,9 +558,7 @@ def requires_owner_authorization(
     )
     return any(
         group.severity is Severity.BLOCKER
-        and outcome.verdicts.get(group.key) in {Verdict.CONFIRMED, Verdict.UNCERTAIN}
-        and (record := by_id.get(group.key)) is not None
-        and record.decision is DispositionDecision.ACCEPTED
+        and by_id[group.key].decision is DispositionDecision.ACCEPTED
         for group, _ in actionable
     )
 
@@ -699,6 +702,7 @@ def _redact_subprocess_diagnostic(value: str) -> str:
     redacted = _BEARER_VALUE.sub(f"Bearer {_REDACTED}", redacted)
     redacted = _LONG_HEX.sub(_REDACTED, redacted)
     redacted = _LONG_BASE64.sub(_REDACTED, redacted)
+    redacted = "".join(char for char in redacted if unicodedata.category(char) != "Cf")
     redacted = _CONTROL_CHARACTERS.sub(" ", redacted).strip()
     truncation_marker = "...[truncated]"
     if len(redacted) > _AUTHORIZATION_DIAGNOSTIC_LIMIT:
