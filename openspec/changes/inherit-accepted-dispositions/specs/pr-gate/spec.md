@@ -2,7 +2,7 @@
 
 ### Requirement: Resume never repeats review
 
-The `rvw gate --run <run-id>` mode MUST load the run's persisted artifacts and MUST NOT execute discovery, merge, or adjudication again. The CLI MUST reject an invocation that supplies both or neither of `--target` and `--run`. Every newly persisted gate verdict MUST carry a typed `kind` of `pause`, `failure`, or `completed`. When loading a legacy artifact without `kind`, gate MUST infer `pause` when the failures contain the actionable-dispositions pause marker, `completed` when findings are nonempty, and `failure` otherwise. Before inheritance matching or disposition generation or validation, resume MUST preserve an existing `completed` verdict and exit 2 with machine-readable reason `verdict_already_completed`, except that `--execute` with neither `--dispositions` nor `--inherit` MUST publish that existing verdict without rewriting it. Verdicts of kind `pause` and `failure` MUST remain retryable and replaceable. Target mode and resume of an existing pause verdict MUST retain the ordinary template-and-pause behavior.
+The `rvw gate --run <run-id>` mode MUST load the run's persisted artifacts and MUST NOT execute discovery, merge, or adjudication again. The CLI MUST reject an invocation that supplies both or neither of `--target` and `--run`. Every newly persisted gate verdict MUST carry a typed `kind` of `pause`, `failure`, or `completed`. When loading a legacy artifact without `kind`, gate MUST infer `pause` when the failures contain the actionable-dispositions pause marker, `completed` when findings are nonempty, and `failure` otherwise. Before inheritance matching or disposition generation or validation, resume MUST preserve an existing `completed` verdict and exit 2 with machine-readable reason `verdict_already_completed`, except that `--execute` with neither `--dispositions` nor `--inherit` MUST publish that existing verdict without rewriting it. This publication-only resume MUST render its publish body from the completed JSON verdict as the source of truth. It MUST inspect any `gate-verdict.md` cache through the pinned run descriptor with final-component no-follow and regular-file checks, MUST reject a symlinked or non-regular cache without reading or publishing it, and MUST use the JSON-derived render when the cache is missing or differs. Verdicts of kind `pause` and `failure` MUST remain retryable and replaceable. Target mode and resume of an existing pause verdict MUST retain the ordinary template-and-pause behavior.
 
 #### Scenario: Operator supplies generated dispositions
 
@@ -18,6 +18,16 @@ The `rvw gate --run <run-id>` mode MUST load the run's persisted artifacts and M
 
 - **WHEN** resume finds an existing completed verdict and supplies `--execute` without `--dispositions` or `--inherit`
 - **THEN** gate publishes that existing verdict without regenerating dispositions or rewriting verdict evidence
+
+#### Scenario: Completed Markdown cache is missing or stale
+
+- **WHEN** publication-only resume finds no Markdown cache or finds regular-file bytes that differ from a fresh render of the completed JSON verdict
+- **THEN** gate publishes the fresh JSON-derived render and never publishes the missing or stale cache bytes
+
+#### Scenario: Completed Markdown cache is a symlink
+
+- **WHEN** publication-only resume finds a symlinked `gate-verdict.md`
+- **THEN** gate rejects the cache without following it and does not attempt publication
 
 #### Scenario: Corrected failure is resumed
 
@@ -47,7 +57,7 @@ Gate MUST classify CONFIRMED and UNCERTAIN groups as actionable, MUST require ex
 
 ### Requirement: Inheritance loads only a validated same-PR verdict
 
-The `rvw gate` command MUST accept an `--inherit <run-id>` option in target and resume modes, MUST load the inherited run's persisted gate verdict artifact as the sole carry source, and MUST fail closed with a usage error before writing any template when that run is missing, lacks a verdict artifact, or is anchored to a different repository or pull-request number. Run lookup MUST accept only identifiers matching `^[A-Za-z0-9._-]+$`, excluding `.` and `..`, and MUST reject path separators, control or Markdown-active characters, symlinked run entries, and any resolved path outside the configured output root before filesystem lookup. `RunStore.open` MUST pin the validated run directory with a no-follow directory descriptor. The source `target.json` and `gate-verdict.json` MUST each be opened relative to that descriptor with final-component no-follow semantics, verified as a regular file from the opened artifact descriptor, and read from that same descriptor. Resume mode MUST reject equal `--run` and `--inherit` identifiers with machine-readable reason `inherit_self_reference` before loading either run. A source verdict's counts MUST contain exactly the keys `CONFIRMED`, `REJECTED`, and `UNCERTAIN` with integer values, and every accepted source finding MUST have a nonblank reason; violations MUST fail with machine-readable reason `inherit_verdict_invalid`. Source-verdict validation diagnostics MUST pass through the bounded secret-redaction helper before reaching stderr. A source verdict with zero findings and a positive sum of CONFIRMED and UNCERTAIN counts MUST fail with machine-readable reason `inherit_source_incomplete`; a source with zero actionable counts and zero findings MUST remain valid. A completed BLOCK verdict MUST be accepted as a source, and all of its findings MUST remain available to ambiguity counting while only its `accepted` records are eligible to carry or prefill.
+The `rvw gate` command MUST accept an `--inherit <run-id>` option in target and resume modes, MUST load the inherited run's persisted gate verdict artifact as the sole carry source, and MUST fail closed with a usage error before writing any template when that run is missing, lacks a verdict artifact, or is anchored to a different repository or pull-request number. Repository-slug identity comparisons MUST be case-insensitive while pull-request numbers remain exact. Identity mismatch details MUST name the differing `repo`, `pr_number`, or `run_id` field and include its expected and observed identifier values. Run lookup MUST accept only identifiers matching `^[A-Za-z0-9._-]+$`, excluding `.` and `..`, and MUST reject path separators, control or Markdown-active characters, symlinked run entries, and any resolved path outside the configured output root before filesystem lookup. `RunStore.open` MUST pin the validated run directory with a no-follow directory descriptor. The source `target.json` and `gate-verdict.json` MUST each be opened relative to that descriptor with final-component no-follow semantics, verified as a regular file from the opened artifact descriptor, and read from that same descriptor. Resume mode MUST reject equal `--run` and `--inherit` identifiers with machine-readable reason `inherit_self_reference` before loading either run. A source verdict's counts MUST contain exactly the keys `CONFIRMED`, `REJECTED`, and `UNCERTAIN` with integer values, and every accepted source finding MUST have a nonblank reason; violations MUST fail with machine-readable reason `inherit_verdict_invalid`. Source-target and source-verdict validation diagnostics MUST pass through the bounded secret-redaction helper before reaching stderr. After legacy inference, the source verdict kind MUST be `completed`; a `pause` or `failure` source MUST fail with machine-readable reason `inherit_source_incomplete` even when it contains accepted finding records. A completed source with zero actionable counts and zero findings MUST remain valid. A completed BLOCK verdict MUST be accepted as a source, and all of its findings MUST remain available to ambiguity counting while only its `accepted` records are eligible to carry or prefill.
 
 #### Scenario: Inherited run belongs to another pull request
 
@@ -79,10 +89,10 @@ The `rvw gate` command MUST accept an `--inherit <run-id>` option in target and 
 - **WHEN** `--run A --inherit A` is requested
 - **THEN** gate exits 2 with reason `inherit_self_reference` before loading or rewriting run A
 
-#### Scenario: Source paused before disposition validation
+#### Scenario: Source is not completed
 
-- **WHEN** a source verdict has no finding records but reports one or more CONFIRMED or UNCERTAIN findings
-- **THEN** gate exits 2 with reason `inherit_source_incomplete` and directs the operator to resume the source with dispositions first
+- **WHEN** a source verdict has kind `pause` or `failure`, including an artifact that contains accepted finding records
+- **THEN** gate exits 2 with reason `inherit_source_incomplete` and directs the operator to complete the source first
 
 ### Requirement: Accepted dispositions carry by tiered identity matching
 
@@ -173,3 +183,17 @@ When every actionable finding of the current run is covered by a hunk-and-body-d
 
 - **WHEN** every actionable finding carries but one accepted blocker's re-verified actor lacks repository admin permission
 - **THEN** gate fails closed and does not publish
+
+### Requirement: Publication attempts persist status independently
+
+Every gate publication attempt MUST write `publish-status.json` in the run directory on success and failure. The artifact MUST contain `attempted_at`, mode `dry_run` or `execute`, boolean `ok`, a bounded secret-redacted failure `detail` or null on success, and boolean `republish`. Publication status MUST remain separate from the immutable completed `GateVerdict` evidence.
+
+#### Scenario: Publication fails
+
+- **WHEN** dry-run payload construction or execute publication raises an operational publication error
+- **THEN** gate persists `ok: false` with the attempt mode, republish state, timestamp, and redacted detail before exiting
+
+#### Scenario: Dry-run publication succeeds
+
+- **WHEN** gate successfully constructs its default dry-run publication payload
+- **THEN** gate persists `ok: true`, mode `dry_run`, null detail, and the applicable republish state

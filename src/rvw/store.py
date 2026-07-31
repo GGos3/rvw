@@ -130,6 +130,29 @@ class RunHandle:
             if fd >= 0:
                 os.close(fd)
 
+    def _load_contained_text(self, name: str, stage: str) -> str:
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=self._pinned_dir_fd(),
+            )
+        except FileNotFoundError as exc:
+            raise StageMissing(stage, self.dir) from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise InvalidRunId(self.run_id, self.dir.parent) from exc
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise InvalidRunId(self.run_id, self.dir.parent)
+            with os.fdopen(fd, encoding="utf-8") as artifact:
+                fd = -1
+                return artifact.read()
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
     def save_target(self, target: ResolvedTarget) -> None:
         _write_json(self.dir / "target.json", target.model_dump(mode="json"))
 

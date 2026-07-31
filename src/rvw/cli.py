@@ -8,7 +8,8 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal, Never, cast
 
@@ -23,6 +24,7 @@ from rvw.discover import DiscoverResult, resolve_lane_path
 from rvw.dispatch import PlannedRun, lpt_sort_key
 from rvw.doctor import DoctorReport, diagnose
 from rvw.gate import (
+    ACTIONABLE_DISPOSITIONS_PAUSE,
     DispositionDecision,
     DispositionDocument,
     GateAnchor,
@@ -40,6 +42,7 @@ from rvw.gate import (
     match_inherited_dispositions,
     provision_checkout,
     query_pull_request,
+    render_gate_verdict,
     requires_owner_authorization,
     save_gate_plan,
     save_gate_verdict,
@@ -93,7 +96,6 @@ DEFAULT_REGISTRY_ROOT = Path("~/.hermes/review").expanduser()
 DEFAULT_AUTO_POLICY = Path("~/.hermes/review/policies/auto.yaml").expanduser()
 _PLAN_REPLICAS = 1
 DEFAULT_RUN_ROOT = Path("/tmp/rvw")
-_ACTIONABLE_DISPOSITIONS_PAUSE = "actionable findings require explicit dispositions"
 
 _EXAMPLES: dict[str, list[str]] = {
     "review": [
@@ -603,15 +605,26 @@ def _load_inherited_dispositions(
     except StageMissing as exc:
         raise _InheritanceSourceError("inherit_target_missing", str(exc)) from exc
     except (OSError, ValueError) as exc:
-        raise _InheritanceSourceError("inherit_target_invalid", str(exc)) from exc
+        raise _InheritanceSourceError(
+            "inherit_target_invalid",
+            _redact_subprocess_diagnostic(str(exc)),
+        ) from exc
 
-    current_identity = (current_target.repo, current_target.pr_number)
-    source_identity = (source_target.repo, source_target.pr_number)
-    if source_target.kind != "pr" or source_identity != current_identity:
+    if source_target.kind != "pr":
         raise _InheritanceSourceError(
             "inherit_target_mismatch",
-            f"inherited run targets {source_identity[0]}#{source_identity[1]}, "
-            f"current run targets {current_identity[0]}#{current_identity[1]}",
+            f"field=kind expected=pr observed={source_target.kind}",
+        )
+    if source_target.repo.casefold() != current_target.repo.casefold():
+        raise _InheritanceSourceError(
+            "inherit_target_mismatch",
+            f"field=repo expected={current_target.repo} observed={source_target.repo}",
+        )
+    if source_target.pr_number != current_target.pr_number:
+        raise _InheritanceSourceError(
+            "inherit_target_mismatch",
+            "field=pr_number "
+            f"expected={current_target.pr_number} observed={source_target.pr_number}",
         )
 
     try:
@@ -639,10 +652,25 @@ def _load_inherited_dispositions(
             "inherit_verdict_invalid",
             _redact_subprocess_diagnostic(str(exc)),
         ) from exc
-    if verdict.run_id != run_id or (verdict.repo, verdict.pr_number) != source_identity:
+    if verdict.run_id != run_id:
         raise _InheritanceSourceError(
             "inherit_verdict_invalid",
-            "gate verdict identity does not match its persisted run target",
+            f"field=run_id expected={run_id} observed={verdict.run_id}",
+        )
+    if verdict.repo.casefold() != source_target.repo.casefold():
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            f"field=repo expected={source_target.repo} observed={verdict.repo}",
+        )
+    if verdict.pr_number != source_target.pr_number:
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            f"field=pr_number expected={source_target.pr_number} observed={verdict.pr_number}",
+        )
+    if verdict.kind != "completed":
+        raise _InheritanceSourceError(
+            "inherit_source_incomplete",
+            f"source run {run_id} has kind={verdict.kind}; expected completed",
         )
     if any(
         finding.disposition is DispositionDecision.ACCEPTED and not finding.reason.strip()
@@ -651,15 +679,6 @@ def _load_inherited_dispositions(
         raise _InheritanceSourceError(
             "inherit_verdict_invalid",
             "accepted source findings must have nonblank reasons",
-        )
-    actionable_count = (
-        verdict.counts[Verdict.CONFIRMED.value] + verdict.counts[Verdict.UNCERTAIN.value]
-    )
-    if not verdict.findings and actionable_count > 0:
-        raise _InheritanceSourceError(
-            "inherit_source_incomplete",
-            f"source run {run_id} has {actionable_count} actionable findings but no completed "
-            f"dispositions; resume that run with dispositions first",
         )
     return verdict
 
@@ -880,12 +899,20 @@ async def _gate_pipeline(
 
     if republish_verdict is not None:
         verdict_path = artifacts.run.dir / "gate-verdict.json"
-        markdown_path = artifacts.run.dir / "gate-verdict.md"
+        rendered_markdown = render_gate_verdict(republish_verdict)
         try:
-            verdict_markdown = markdown_path.read_text(encoding="utf-8")
-        except OSError as exc:
+            cached_markdown = artifacts.run._load_contained_text(
+                "gate-verdict.md",
+                "gate-verdict-markdown",
+            )
+        except StageMissing:
+            cached_markdown = None
+        except (InvalidRunId, OSError, UnicodeError) as exc:
             _error_console.print(str(exc), markup=False)
             raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+        verdict_markdown = (
+            cached_markdown if cached_markdown == rendered_markdown else rendered_markdown
+        )
         _publish_gate_verdict(
             artifacts=artifacts,
             target=target,
@@ -894,6 +921,7 @@ async def _gate_pipeline(
             verdict_path=verdict_path,
             verdict_markdown=verdict_markdown,
             execute=True,
+            republish=True,
             json_output=json_output,
         )
         return
@@ -948,7 +976,7 @@ async def _gate_pipeline(
                 artifacts.run.dir,
                 _gate_failure_verdict(
                     artifacts,
-                    _ACTIONABLE_DISPOSITIONS_PAUSE,
+                    ACTIONABLE_DISPOSITIONS_PAUSE,
                     inheritance_summary=inheritance_summary,
                     kind="pause",
                 ),
@@ -1064,7 +1092,30 @@ async def _gate_pipeline(
         verdict_path=verdict_path,
         verdict_markdown=verdict_markdown,
         execute=execute,
+        republish=False,
         json_output=json_output,
+    )
+
+
+def _save_publish_status(
+    run: RunHandle,
+    *,
+    attempted_at: str,
+    execute: bool,
+    ok: bool,
+    detail: str | None,
+    republish: bool,
+) -> None:
+    status = {
+        "attempted_at": attempted_at,
+        "mode": "execute" if execute else "dry_run",
+        "ok": ok,
+        "detail": detail,
+        "republish": republish,
+    }
+    (run.dir / "publish-status.json").write_text(
+        f"{json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True)}\n",
+        encoding="utf-8",
     )
 
 
@@ -1077,10 +1128,12 @@ def _publish_gate_verdict(
     verdict_path: Path,
     verdict_markdown: str,
     execute: bool,
+    republish: bool,
     json_output: bool,
 ) -> None:
     if target.pr_number is None:
         raise GateInvariantError("gate publication requires a pull-request number")
+    attempted_at = datetime.now(UTC).isoformat()
     try:
         publication = publish_review(
             run=artifacts.run,
@@ -1092,8 +1145,25 @@ def _publish_gate_verdict(
             execute=execute,
         )
     except (OSError, subprocess.CalledProcessError, PublishError) as exc:
-        _error_console.print(str(exc), markup=False)
+        detail = _redact_subprocess_diagnostic(str(exc))
+        _save_publish_status(
+            artifacts.run,
+            attempted_at=attempted_at,
+            execute=execute,
+            ok=False,
+            detail=detail,
+            republish=republish,
+        )
+        _error_console.print(detail, markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+    _save_publish_status(
+        artifacts.run,
+        attempted_at=attempted_at,
+        execute=execute,
+        ok=True,
+        detail=None,
+        republish=republish,
+    )
     payload = {
         "run_id": artifacts.run.run_id,
         "verdict": verdict.verdict,

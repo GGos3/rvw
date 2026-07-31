@@ -218,6 +218,56 @@ def test_contained_json_loader_uses_pinned_dir_fd_and_no_follow(
     assert dir_fd is not None
 
 
+def test_contained_text_loader_uses_pinned_dir_fd_and_no_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "runs"
+    run_dir = root / "safe-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "gate-verdict.md").write_text("trusted markdown\n", encoding="utf-8")
+    run = RunStore(root).open("safe-run")
+    real_open = os.open
+    artifact_opens: list[tuple[int, int | None]] = []
+
+    def recording_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == "gate-verdict.md":
+            artifact_opens.append((flags, dir_fd))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    try:
+        assert (
+            run._load_contained_text("gate-verdict.md", "gate-verdict-markdown")
+            == "trusted markdown\n"
+        )
+    finally:
+        run.close()
+
+    assert len(artifact_opens) == 1
+    flags, dir_fd = artifact_opens[0]
+    assert flags & os.O_NOFOLLOW
+    assert dir_fd is not None
+
+
+def test_contained_text_loader_rejects_symlinked_file(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "safe-run"
+    run_dir.mkdir(parents=True)
+    foreign = tmp_path / "foreign.md"
+    foreign.write_text("secret\n", encoding="utf-8")
+    (run_dir / "gate-verdict.md").symlink_to(foreign)
+    run = RunHandle(run_id="safe-run", dir=run_dir)
+
+    with pytest.raises(InvalidRunId, match="invalid run ID"):
+        run._load_contained_text("gate-verdict.md", "gate-verdict-markdown")
+
+
 def test_opened_run_reads_from_pinned_directory_after_path_swap(tmp_path: Path) -> None:
     root = tmp_path / "runs"
     run_dir = root / "safe-run"

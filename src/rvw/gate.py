@@ -23,6 +23,8 @@ from rvw.merge import CollapseGroup, MergeResult
 from rvw.schema import Severity, Verdict
 from rvw.target import ResolvedTarget
 
+ACTIONABLE_DISPOSITIONS_PAUSE = "actionable findings require explicit dispositions"
+
 
 class GateInvariantError(ValueError):
     """Persisted review data does not satisfy the fail-closed gate contract."""
@@ -190,9 +192,7 @@ class GateVerdict(BaseModel):
         inferred = dict(value)
         failures = inferred.get("failures")
         findings = inferred.get("findings")
-        if isinstance(failures, list) and (
-            "actionable findings require explicit dispositions" in failures
-        ):
+        if isinstance(failures, list) and ACTIONABLE_DISPOSITIONS_PAUSE in failures:
             inferred["kind"] = "pause"
         elif isinstance(findings, list) and findings:
             inferred["kind"] = "completed"
@@ -729,7 +729,13 @@ _GITHUB_TOKEN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_
 _AUTHORIZATION_HEADER = re.compile(r"(?i)(\bAuthorization\s*:\s*)[^\u2028]*")
 _BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
 _LONG_HEX = re.compile(r"\b[0-9a-fA-F]{40,}\b")
-_LONG_BASE64 = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
+_LONG_BASE64 = re.compile(
+    r"(?<![A-Za-z0-9+/_-])"
+    r"(?=[A-Za-z0-9+/_-]*[A-Za-z])"
+    r"(?=[A-Za-z0-9+/_-]*\d)"
+    r"[A-Za-z0-9+/_-]{40,}={0,2}"
+    r"(?![A-Za-z0-9+/_=-])"
+)
 _CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 _ESCAPED_CONTROL_CHARACTER = re.compile(
     r"\\(?:u(?P<unicode>[0-9a-fA-F]{4})|x(?P<byte>[0-9a-fA-F]{2}))"
@@ -883,6 +889,7 @@ def provision_checkout(
 
 
 __all__ = [
+    "ACTIONABLE_DISPOSITIONS_PAUSE",
     "DispositionDecision",
     "DispositionDocument",
     "DispositionInheritance",

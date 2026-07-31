@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.discover import EnrichedFinding, LaneCoverage, RunCoverage
 from rvw.gate import (
+    ACTIONABLE_DISPOSITIONS_PAUSE,
     DispositionDecision,
     DispositionDocument,
     DispositionRecord,
@@ -26,6 +27,7 @@ from rvw.gate import (
     InheritanceTier,
     PullRequestState,
     _body_sha256,
+    _redact_subprocess_diagnostic,
     build_gate_verdict,
     github_actor_permission,
     load_dispositions,
@@ -1210,6 +1212,26 @@ def test_authorization_diagnostic_redacts_token_families_and_controls() -> None:
     assert len(detail) <= 500
 
 
+def test_authorization_diagnostic_redacts_base64url_credentials() -> None:
+    credential = "Ab1_-" * 12
+
+    redacted = _redact_subprocess_diagnostic(f"credential={credential}")
+
+    assert credential not in redacted
+    assert redacted == "credential=[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    "diagnostic",
+    [
+        "rvw-20260731-030510-pr-8",
+        "ordinary-hyphenated-words-remain-readable-across-long-diagnostics",
+    ],
+)
+def test_authorization_diagnostic_preserves_non_credentials(diagnostic: str) -> None:
+    assert _redact_subprocess_diagnostic(diagnostic) == diagnostic
+
+
 @pytest.mark.parametrize(
     ("diagnostic", "credential"),
     [
@@ -1272,7 +1294,7 @@ def test_gate_verdict_legacy_kind_inference_and_closed_blank_reasons() -> None:
         coverage=[],
         findings=[],
         verdict="BLOCK",
-        failures=["actionable findings require explicit dispositions"],
+        failures=[ACTIONABLE_DISPOSITIONS_PAUSE],
     )
     raw = base.model_dump(mode="json", exclude={"kind"})
     assert GateVerdict.model_validate(raw).kind == "pause"
@@ -1295,6 +1317,17 @@ def test_gate_verdict_legacy_kind_inference_and_closed_blank_reasons() -> None:
     raw["findings"][0]["inheritance_blank_reason"] = "content_digest_unknown"
     with pytest.raises(ValidationError):
         GateVerdict.model_validate(raw)
+
+
+def test_actionable_dispositions_pause_sentinel_has_one_source_definition() -> None:
+    source_root = Path(__file__).parents[1] / "src"
+    sentinel = ACTIONABLE_DISPOSITIONS_PAUSE
+
+    occurrences = sum(
+        path.read_text(encoding="utf-8").count(sentinel) for path in source_root.rglob("*.py")
+    )
+
+    assert occurrences == 1
 
 
 def test_pull_request_requery_rejects_malformed_api_data() -> None:

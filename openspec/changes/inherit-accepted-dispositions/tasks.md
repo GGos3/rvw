@@ -99,3 +99,16 @@
 
 - [x] 21.1 Synchronize the delta and main pr-gate spec/context for verdict kinds and republishing, severity-bound matching, exact outcome keys, normalize-before-redact diagnostics, and pinned directory reads.
 - [x] 21.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.
+
+## 22. Round-10 regression coverage
+
+- [x] 22.1 Add failing regressions for completed-only inheritance sources, target diagnostic redaction, base64url redaction boundaries, shared pause-marker inference, case-insensitive repository identity, field-specific mismatch details, pinned Markdown cache reads with JSON-authoritative republish rendering, and persisted publication-attempt status.
+
+## 23. Round-10 hardening implementation
+
+- [x] 23.1 Implement the completed-kind trust boundary, bounded target diagnostics, base64url-safe redaction, shared pause marker, canonical repository comparisons, field-specific identity diagnostics, pinned no-follow text reads, JSON-authoritative republish rendering, and redacted publication status persistence.
+
+## 24. Round-10 specification and verification
+
+- [x] 24.1 Synchronize the delta and main pr-gate spec/context for completed inheritance sources, JSON-authoritative republishing, and publication status artifacts.
+- [x] 24.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.

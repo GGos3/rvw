@@ -20,6 +20,7 @@ from rvw.gate import (
     GateVerdict,
     PullRequestState,
     load_gate_plan,
+    render_gate_verdict,
     save_gate_plan,
     save_gate_verdict,
 )
@@ -468,19 +469,11 @@ def test_gate_inherit_rejects_symlinked_verdict_artifact(
     assert not (current.run.dir / "gate-dispositions.yaml").exists()
 
 
-@pytest.mark.parametrize(
-    ("source_kind", "expected_exit", "expected_text"),
-    [
-        ("stub", 2, "inherit_source_incomplete"),
-        ("clean", 1, "actionable findings require dispositions"),
-    ],
-)
-def test_gate_inheritance_source_requires_completed_actionable_dispositions(
+@pytest.mark.parametrize("source_kind", ["pause", "failure"])
+def test_gate_inheritance_source_requires_completed_kind(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     source_kind: str,
-    expected_exit: int,
-    expected_text: str,
 ) -> None:
     out_root = tmp_path / "runs"
     current = prepared_artifacts(out_root, actionable=True)
@@ -489,13 +482,7 @@ def test_gate_inheritance_source_requires_completed_actionable_dispositions(
         GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
     )
     source = inherited_source(out_root, current)
-    source_verdict = source.load_gate_verdict()
-    source_verdict.findings = []
-    if source_kind == "stub":
-        source_verdict.failures = ["actionable findings require explicit dispositions"]
-    else:
-        source_verdict.counts = {"CONFIRMED": 0, "REJECTED": 1, "UNCERTAIN": 0}
-        source_verdict.failures = []
+    source_verdict = source.load_gate_verdict().model_copy(update={"kind": source_kind})
     save_gate_verdict(source.dir, source_verdict)
     monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
 
@@ -512,8 +499,8 @@ def test_gate_inheritance_source_requires_completed_actionable_dispositions(
         ],
     )
 
-    assert result.exit_code == expected_exit
-    assert expected_text in (result.stderr + result.stdout)
+    assert result.exit_code == 2
+    assert "inherit_source_incomplete" in result.stderr
 
 
 @pytest.mark.parametrize(
@@ -598,6 +585,109 @@ def test_inheritance_source_validation_diagnostic_is_bounded_and_redacted(
     assert "ghp_SECRET123" not in result.stderr
     assert "[REDACTED]" in result.stderr
     assert len(result.stderr) <= 600
+
+
+def test_inheritance_target_validation_diagnostic_is_bounded_and_redacted(
+    tmp_path: Path,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+    target_path = source.dir / "target.json"
+    raw = json.loads(target_path.read_text(encoding="utf-8"))
+    token = "github_pat_11AA22BB33CC44DD55EE66FF"
+    raw["pr_number"] = token
+    target_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        cli_module._load_inherited_dispositions(
+            source.run_id,
+            current_target=current.target,
+            out_root=out_root,
+        )
+
+    detail = str(caught.value)
+    assert "inherit_target_invalid" in detail
+    assert token not in detail
+    assert "[REDACTED]" in detail
+    assert len(detail) <= 600
+
+
+def test_inheritance_source_repo_identity_is_case_insensitive(tmp_path: Path) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current, repo="OwNeR/RePo")
+
+    loaded = cli_module._load_inherited_dispositions(
+        source.run_id,
+        current_target=current.target,
+        out_root=out_root,
+    )
+
+    assert loaded.run_id == source.run_id
+
+
+@pytest.mark.parametrize(
+    ("field", "observed"),
+    [("repo", "different/repo"), ("pr_number", 99)],
+)
+def test_inheritance_target_mismatch_names_differing_field(
+    tmp_path: Path,
+    field: str,
+    observed: object,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+    source.save_target(target().model_copy(update={field: observed}))
+
+    with pytest.raises(ValueError) as caught:
+        cli_module._load_inherited_dispositions(
+            source.run_id,
+            current_target=current.target,
+            out_root=out_root,
+        )
+
+    detail = str(caught.value)
+    assert "inherit_target_mismatch" in detail
+    assert f"field={field}" in detail
+    assert "expected=" in detail
+    assert f"observed={observed}" in detail
+
+
+@pytest.mark.parametrize(
+    ("field", "observed"),
+    [
+        ("run_id", "copied-run"),
+        ("repo", "different/repo"),
+        ("pr_number", 99),
+    ],
+)
+def test_inheritance_verdict_mismatch_names_differing_field(
+    tmp_path: Path,
+    field: str,
+    observed: object,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+    verdict_path = source.dir / "gate-verdict.json"
+    raw = json.loads(verdict_path.read_text(encoding="utf-8"))
+    raw[field] = observed
+    verdict_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    with pytest.raises(ValueError) as caught:
+        cli_module._load_inherited_dispositions(
+            source.run_id,
+            current_target=current.target,
+            out_root=out_root,
+        )
+
+    detail = str(caught.value)
+    assert "inherit_verdict_invalid" in detail
+    assert f"field={field}" in detail
+    assert "expected=" in detail
+    assert f"observed={observed}" in detail
 
 
 def test_inheritance_source_accepts_closed_counts_and_nonblank_reason(tmp_path: Path) -> None:
@@ -792,8 +882,137 @@ def test_gate_completed_dry_run_can_be_republished_with_execute(
     )
 
     assert second.exit_code == 0, second.stderr
-    assert published == [(artifacts.run.dir / "gate-verdict.md").read_text(encoding="utf-8")]
+    assert published == [render_gate_verdict(artifacts.run.load_gate_verdict())]
     assert (artifacts.run.dir / "gate-verdict.json").read_bytes() == verdict_bytes
+    publish_status = json.loads(
+        (artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8")
+    )
+    assert publish_status["mode"] == "execute"
+    assert publish_status["ok"] is True
+    assert publish_status["detail"] is None
+    assert publish_status["republish"] is True
+
+
+@pytest.mark.parametrize("cache_state", ["missing", "stale"])
+def test_gate_completed_republish_renders_from_json_when_markdown_cache_is_unusable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cache_state: str,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, artifacts)
+    first = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+    assert first.exit_code == 0
+    markdown_path = artifacts.run.dir / "gate-verdict.md"
+    if cache_state == "missing":
+        markdown_path.unlink()
+    else:
+        markdown_path.write_text("# stale pause artifact\n", encoding="utf-8")
+    published: list[str] = []
+
+    def successful_publish(**kwargs: object) -> object:
+        published.append(str(kwargs["report_md"]))
+        return type("Result", (), {"review_url": "https://example.test/review/cache"})()
+
+    monkeypatch.setattr(cli_module, "publish_review", successful_publish)
+    second = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root), "--execute"],
+    )
+
+    assert second.exit_code == 0, second.stderr
+    assert published == [render_gate_verdict(artifacts.run.load_gate_verdict())]
+
+
+def test_gate_completed_republish_rejects_symlinked_markdown_without_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, artifacts)
+    first = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+    assert first.exit_code == 0
+    markdown_path = artifacts.run.dir / "gate-verdict.md"
+    markdown_path.unlink()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("never publish me", encoding="utf-8")
+    markdown_path.symlink_to(secret)
+    calls = 0
+
+    def forbidden_publish(**kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError(f"unexpected publish: {kwargs}")
+
+    monkeypatch.setattr(cli_module, "publish_review", forbidden_publish)
+    second = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root), "--execute"],
+    )
+
+    assert second.exit_code == 3
+    assert calls == 0
+    assert "never publish me" not in (second.stdout + second.stderr)
+
+
+def test_gate_successful_dry_run_writes_publish_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, artifacts)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    status = json.loads((artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8"))
+    assert status["attempted_at"]
+    assert status["mode"] == "dry_run"
+    assert status["ok"] is True
+    assert status["detail"] is None
+    assert status["republish"] is False
+
+
+def test_gate_failed_publish_writes_redacted_publish_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, artifacts)
+    token = "github_pat_11AA22BB33CC44DD55EE66FF"
+
+    def failed_publish(**kwargs: object) -> object:
+        del kwargs
+        raise cli_module.PublishError(f"publish failed with {token}")
+
+    monkeypatch.setattr(cli_module, "publish_review", failed_publish)
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root), "--execute"],
+    )
+
+    assert result.exit_code == 3
+    status = json.loads((artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8"))
+    assert status["attempted_at"]
+    assert status["mode"] == "execute"
+    assert status["ok"] is False
+    assert status["republish"] is False
+    assert "[REDACTED]" in status["detail"]
+    assert token not in status["detail"]
+    assert token not in result.stderr
 
 
 def test_gate_transient_publish_failure_retries_existing_completed_verdict(
