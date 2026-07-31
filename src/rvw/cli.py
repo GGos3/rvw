@@ -4,15 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import asdict
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Never, cast
+from typing import Annotated, Any, Literal, Never, cast
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
@@ -23,24 +26,34 @@ from rvw.discover import DiscoverResult, resolve_lane_path
 from rvw.dispatch import PlannedRun, lpt_sort_key
 from rvw.doctor import DoctorReport, diagnose
 from rvw.gate import (
+    ACTIONABLE_DISPOSITIONS_PAUSE,
+    DispositionDecision,
     DispositionDocument,
     GateAnchor,
     GateInvariantError,
     GatePlan,
     GateVerdict,
+    GitHubAuthorizationError,
+    InheritanceSummary,
+    InheritanceTier,
+    _redact_subprocess_diagnostic,
     build_gate_verdict,
     github_actor_permission,
     load_dispositions,
     load_gate_plan,
+    match_inherited_dispositions,
     provision_checkout,
     query_pull_request,
+    render_gate_verdict,
     requires_owner_authorization,
     save_gate_plan,
     save_gate_verdict,
+    summarize_inheritance,
     validate_coverage,
     verify_pull_request,
     write_disposition_template,
 )
+from rvw.hunks import hunk_sha256_by_id
 from rvw.lane import Lane, load_lane
 from rvw.pipeline import (
     PipelineArtifacts,
@@ -56,7 +69,7 @@ from rvw.registry import Registry, load_registry
 from rvw.report import render_report
 from rvw.runtimes.codex import CodexRuntime
 from rvw.sample import SampleReport, sample_lane
-from rvw.schema import Tier, Verdict, finding_schema, lane_output_schema
+from rvw.schema import Severity, Tier, Verdict, finding_schema, lane_output_schema
 from rvw.stack import (
     FindingLineage,
     MemberRunRef,
@@ -74,7 +87,7 @@ from rvw.stack import (
 from rvw.stack_adjudicate import adjudicate_presence
 from rvw.stack_report import render_stack_report
 from rvw.stack_store import StackRunNotFound, StackStageMissing, StackStore
-from rvw.store import RunHandle, RunNotFound, RunStore, StageMissing
+from rvw.store import InvalidRunId, RunHandle, RunNotFound, RunStore, StageMissing
 from rvw.target import ResolvedTarget, TargetResolutionError, resolve_target
 
 EXIT_OK = 0
@@ -125,6 +138,12 @@ Argument = cast(Callable[..., object], typer.Argument)
 
 
 _PipelineArtifacts = PipelineArtifacts
+
+
+class _InheritanceSourceError(ValueError):
+    def __init__(self, reason: str, detail: str) -> None:
+        self.reason = reason
+        super().__init__(f"{reason}: {detail}")
 
 
 def _write_json(payload: Any) -> None:
@@ -570,7 +589,116 @@ def _load_gate_artifacts(run_id: str, out_root: Path) -> _PipelineArtifacts:
     return load_pipeline_artifacts(run_id, out_root, require_outcome=True)
 
 
-def _gate_failure_verdict(artifacts: _PipelineArtifacts, message: str) -> GateVerdict:
+def _load_inherited_dispositions(
+    run_id: str,
+    *,
+    current_target: ResolvedTarget,
+    out_root: Path,
+) -> GateVerdict:
+    try:
+        run = RunStore(out_root).open(run_id)
+    except InvalidRunId as exc:
+        raise _InheritanceSourceError("inherit_run_invalid", str(exc)) from exc
+    except RunNotFound as exc:
+        raise _InheritanceSourceError("inherit_run_missing", str(exc)) from exc
+
+    try:
+        source_target = run.load_target()
+    except StageMissing as exc:
+        raise _InheritanceSourceError("inherit_target_missing", str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise _InheritanceSourceError(
+            "inherit_target_invalid",
+            _redact_subprocess_diagnostic(str(exc)),
+        ) from exc
+
+    if source_target.kind != "pr":
+        raise _InheritanceSourceError(
+            "inherit_target_mismatch",
+            f"field=kind expected=pr observed={source_target.kind}",
+        )
+    if source_target.repo.casefold() != current_target.repo.casefold():
+        raise _InheritanceSourceError(
+            "inherit_target_mismatch",
+            "field=repo "
+            f"expected={current_target.repo} "
+            f"observed={_redact_subprocess_diagnostic(source_target.repo)}",
+        )
+    if source_target.pr_number != current_target.pr_number:
+        raise _InheritanceSourceError(
+            "inherit_target_mismatch",
+            "field=pr_number "
+            f"expected={current_target.pr_number} observed={source_target.pr_number}",
+        )
+
+    try:
+        raw_verdict = run._load_contained_json("gate-verdict.json", "gate-verdict")
+    except StageMissing as exc:
+        raise _InheritanceSourceError("inherit_verdict_missing", str(exc)) from exc
+    except (OSError, ValueError) as exc:
+        raise _InheritanceSourceError("inherit_verdict_invalid", str(exc)) from exc
+    expected_count_keys = {verdict.value for verdict in Verdict}
+    raw_counts = raw_verdict.get("counts") if isinstance(raw_verdict, dict) else None
+    if (
+        not isinstance(raw_counts, dict)
+        or set(raw_counts) != expected_count_keys
+        or any(type(value) is not int for value in raw_counts.values())
+    ):
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            "gate verdict counts must contain exactly CONFIRMED, REJECTED, and UNCERTAIN "
+            "with integer values",
+        )
+    try:
+        verdict = GateVerdict.model_validate(raw_verdict)
+    except ValueError as exc:
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            _redact_subprocess_diagnostic(str(exc)),
+        ) from exc
+    if verdict.run_id != run_id:
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            "field=run_id "
+            f"expected={run_id} "
+            f"observed={_redact_subprocess_diagnostic(verdict.run_id)}",
+        )
+    if verdict.repo.casefold() != source_target.repo.casefold():
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            "field=repo "
+            f"expected={current_target.repo} "
+            f"observed={_redact_subprocess_diagnostic(verdict.repo)}",
+        )
+    if verdict.pr_number != source_target.pr_number:
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            f"field=pr_number expected={source_target.pr_number} observed={verdict.pr_number}",
+        )
+    if verdict.kind != "completed":
+        raise _InheritanceSourceError(
+            "inherit_source_incomplete",
+            f"source run {run_id} has kind={verdict.kind}; expected completed",
+        )
+    if any(
+        finding.disposition is DispositionDecision.ACCEPTED and not finding.reason.strip()
+        for finding in verdict.findings
+    ):
+        raise _InheritanceSourceError(
+            "inherit_verdict_invalid",
+            "accepted source findings must have nonblank reasons",
+        )
+    return verdict
+
+
+def _gate_failure_verdict(
+    artifacts: _PipelineArtifacts,
+    message: str,
+    *,
+    inheritance_summary: InheritanceSummary | None = None,
+    actor: str | None = None,
+    kind: Literal["pause", "failure"] = "failure",
+) -> GateVerdict:
     target = artifacts.target
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
         raise GateInvariantError("gate failure artifact requires a PR target")
@@ -582,13 +710,28 @@ def _gate_failure_verdict(artifacts: _PipelineArtifacts, message: str) -> GateVe
         counts=_verdict_counts(artifacts.outcome),
         coverage=artifacts.discovered.coverage,
         findings=[],
+        actor=actor,
         verdict="BLOCK",
+        kind=kind,
         failures=[message],
+        inheritance_summary=inheritance_summary,
     )
 
 
-def _gate_invariant_failure(artifacts: _PipelineArtifacts, exc: GateInvariantError) -> None:
-    save_gate_verdict(artifacts.run.dir, _gate_failure_verdict(artifacts, str(exc)))
+def _gate_invariant_failure(
+    artifacts: _PipelineArtifacts,
+    exc: GateInvariantError,
+    *,
+    inheritance_summary: InheritanceSummary | None = None,
+) -> None:
+    save_gate_verdict(
+        artifacts.run.dir,
+        _gate_failure_verdict(
+            artifacts,
+            str(exc),
+            inheritance_summary=inheritance_summary,
+        ),
+    )
     _error_console.print(str(exc), markup=False)
     raise typer.Exit(EXIT_NOT_FOUND) from exc
 
@@ -598,6 +741,7 @@ def gate(
     target: Annotated[str | None, Option("--target")] = None,
     run_id: Annotated[str | None, Option("--run")] = None,
     dispositions_path: Annotated[Path | None, Option("--dispositions")] = None,
+    inherit_run_id: Annotated[str | None, Option("--inherit")] = None,
     registry_root: Annotated[
         Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")
     ] = DEFAULT_REGISTRY_ROOT,
@@ -611,11 +755,18 @@ def gate(
     if (target is None) == (run_id is None):
         _error_console.print("gate requires exactly one of --target or --run", markup=False)
         raise typer.Exit(EXIT_USER_ERROR)
+    if run_id is not None and inherit_run_id == run_id:
+        _error_console.print(
+            "inherit_self_reference: --inherit must differ from --run",
+            markup=False,
+        )
+        raise typer.Exit(EXIT_USER_ERROR)
     asyncio.run(
         _gate_pipeline(
             target_spec=target,
             run_id=run_id,
             dispositions_path=dispositions_path,
+            inherit_run_id=inherit_run_id,
             registry_root=registry_root,
             replicas=replicas,
             out_root=out_root,
@@ -630,6 +781,7 @@ async def _gate_pipeline(
     target_spec: str | None,
     run_id: str | None,
     dispositions_path: Path | None,
+    inherit_run_id: str | None,
     registry_root: Path,
     replicas: int,
     out_root: Path,
@@ -638,6 +790,8 @@ async def _gate_pipeline(
 ) -> None:
     artifacts: _PipelineArtifacts
     plan: GatePlan
+    inherited_verdict: GateVerdict | None = None
+    republish_verdict: GateVerdict | None = None
     if target_spec is not None:
         try:
             resolved = _resolve_cli_target(target_spec)
@@ -648,6 +802,16 @@ async def _gate_pipeline(
             if resolved.kind != "pr" or resolved.pr_number is None or resolved.base_sha is None:
                 _error_console.print("rvw gate requires a PR target", markup=False)
                 raise typer.Exit(EXIT_USER_ERROR)
+            if inherit_run_id is not None:
+                try:
+                    inherited_verdict = _load_inherited_dispositions(
+                        inherit_run_id,
+                        current_target=resolved,
+                        out_root=out_root,
+                    )
+                except _InheritanceSourceError as exc:
+                    _error_console.print(str(exc), markup=False)
+                    raise typer.Exit(EXIT_USER_ERROR) from exc
             plan = _gate_plan(registry_root, resolved, replicas)
             with tempfile.TemporaryDirectory(prefix="rvw-gate-") as temporary_root:
                 checkout = provision_checkout(
@@ -685,14 +849,85 @@ async def _gate_pipeline(
         try:
             artifacts = _load_gate_artifacts(run_id, out_root)
             plan = load_gate_plan(artifacts.run.dir)
+        except InvalidRunId as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_USER_ERROR) from exc
         except (RunNotFound, StageMissing, OSError, ValueError) as exc:
             _error_console.print(str(exc), markup=False)
             raise typer.Exit(EXIT_NOT_FOUND) from exc
+        try:
+            existing_verdict = artifacts.run.load_gate_verdict()
+        except StageMissing:
+            existing_verdict = None
+        except (json.JSONDecodeError, ValidationError) as exc:
+            message = (
+                "verdict_artifact_corrupt: "
+                f"run {artifacts.run.run_id} has a damaged gate-verdict.json; "
+                "preserve the artifact and repair or restore it before resuming"
+            )
+            _error_console.print(message, markup=False)
+            raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+        if existing_verdict is not None and existing_verdict.kind == "completed":
+            if execute and dispositions_path is None and inherit_run_id is None:
+                republish_verdict = existing_verdict
+            else:
+                message = (
+                    "verdict_already_completed: "
+                    f"run {artifacts.run.run_id} already has a completed verdict; "
+                    "start a new target run and use --inherit instead"
+                )
+                _error_console.print(message, markup=False)
+                raise typer.Exit(EXIT_USER_ERROR)
 
     target = artifacts.target
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
         _error_console.print("rvw gate requires persisted PR artifacts", markup=False)
         raise typer.Exit(EXIT_USER_ERROR)
+    if republish_verdict is not None:
+        if artifacts.outcome is None:
+            message = (
+                "verdict_artifact_corrupt: "
+                f"run {artifacts.run.run_id} has no adjudication outcome for publication"
+            )
+            _error_console.print(message, markup=False)
+            raise typer.Exit(EXIT_SYSTEM_ERROR)
+        verdict_path = artifacts.run.dir / "gate-verdict.json"
+        rendered_markdown = render_gate_verdict(republish_verdict)
+        try:
+            cached_markdown = artifacts.run._load_contained_text(
+                "gate-verdict.md",
+                "gate-verdict-markdown",
+            )
+        except StageMissing:
+            cached_markdown = None
+        except (InvalidRunId, OSError, UnicodeError) as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+        verdict_markdown = (
+            cached_markdown if cached_markdown == rendered_markdown else rendered_markdown
+        )
+        _publish_gate_verdict(
+            artifacts=artifacts,
+            target=target,
+            outcome=artifacts.outcome,
+            verdict=republish_verdict,
+            verdict_path=verdict_path,
+            verdict_markdown=verdict_markdown,
+            execute=True,
+            republish=True,
+            json_output=json_output,
+        )
+        return
+    if inherit_run_id is not None and inherited_verdict is None:
+        try:
+            inherited_verdict = _load_inherited_dispositions(
+                inherit_run_id,
+                current_target=target,
+                out_root=out_root,
+            )
+        except _InheritanceSourceError as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_USER_ERROR) from exc
     anchor = GateAnchor(base_sha=target.base_sha, head_sha=target.head_sha)
     try:
         current = query_pull_request(target.repo, target.pr_number)
@@ -713,27 +948,87 @@ async def _gate_pipeline(
         _gate_invariant_failure(artifacts, GateInvariantError("adjudication outcome is required"))
     outcome = cast(AdjudicationOutcome, artifacts.outcome)
 
+    try:
+        hunk_digests = hunk_sha256_by_id(target.diff)
+        current_hunk_sha256 = {
+            group.key: hunk_digests.get(group.hunk_id) for group in artifacts.merged.groups
+        }
+        inheritance = (
+            match_inherited_dispositions(
+                inherited_verdict.findings,
+                artifacts.merged,
+                outcome,
+                inherited_run_id=inherit_run_id,
+                current_hunk_sha256=current_hunk_sha256,
+            )
+            if inherited_verdict is not None and inherit_run_id is not None
+            else None
+        )
+        inheritance_summary = (
+            summarize_inheritance(inheritance, source_run_id=inherit_run_id)
+            if inheritance is not None and inherit_run_id is not None
+            else None
+        )
+    except GateInvariantError as exc:
+        _gate_invariant_failure(artifacts, exc)
+
     if dispositions_path is None:
-        template_path = write_disposition_template(artifacts.run.dir, artifacts.merged, outcome)
-        if any(
+        has_actionable = any(
             verdict in {Verdict.CONFIRMED, Verdict.UNCERTAIN}
             for verdict in outcome.verdicts.values()
-        ):
+        )
+        fully_inherited = inheritance is not None and all(
+            matched.tier is InheritanceTier.EXACT_ID for matched in inheritance.values()
+        )
+        try:
+            template_path = write_disposition_template(
+                artifacts.run.dir,
+                artifacts.merged,
+                outcome,
+                inheritance=inheritance,
+            )
+        except GateInvariantError as exc:
+            _gate_invariant_failure(
+                artifacts,
+                exc,
+                inheritance_summary=inheritance_summary,
+            )
+        if has_actionable and not fully_inherited:
             save_gate_verdict(
                 artifacts.run.dir,
                 _gate_failure_verdict(
-                    artifacts, "actionable findings require explicit dispositions"
+                    artifacts,
+                    ACTIONABLE_DISPOSITIONS_PAUSE,
+                    inheritance_summary=inheritance_summary,
+                    kind="pause",
                 ),
             )
+            summary_text = ""
+            if inheritance_summary is not None:
+                reasons = ",".join(
+                    f"{reason}={count}" for reason, count in inheritance_summary.reasons.items()
+                )
+                summary_text = (
+                    f"; inheritance source={inheritance_summary.source_run_id} "
+                    f"carried={inheritance_summary.carried} "
+                    f"prefilled={inheritance_summary.prefilled} "
+                    f"blank={inheritance_summary.blank}"
+                    + (f" reasons={reasons}" if reasons else "")
+                )
             _console.print(
                 "actionable findings require dispositions — edit "
                 f"{template_path} then resume: rvw gate --run {artifacts.run.run_id} "
-                f"--dispositions {template_path}",
+                f"--dispositions {template_path}"
+                + (f" --inherit {inherit_run_id}" if inherit_run_id is not None else ""),
+                summary_text,
                 markup=False,
                 soft_wrap=True,
             )
             raise typer.Exit(EXIT_NOT_FOUND)
-        dispositions = DispositionDocument(schema_version=1, dispositions=[])
+        if has_actionable:
+            dispositions = load_dispositions(template_path)
+        else:
+            dispositions = DispositionDocument(schema_version=1, dispositions=[])
     else:
         try:
             dispositions = load_dispositions(dispositions_path)
@@ -744,8 +1039,48 @@ async def _gate_pipeline(
     actor: str | None = None
     permission: str | None = None
     try:
-        if requires_owner_authorization(artifacts.merged, outcome, dispositions):
-            actor, permission = github_actor_permission(target.repo)
+        if requires_owner_authorization(
+            artifacts.merged,
+            outcome,
+            dispositions,
+            inherited_run_id=inherit_run_id,
+            inheritance=inheritance,
+        ):
+            accepted_ids = {
+                record.finding_id
+                for record in dispositions.dispositions
+                if record.decision is DispositionDecision.ACCEPTED
+            }
+            blocker_ids = sorted(
+                group.key
+                for group in artifacts.merged.groups
+                if group.key in accepted_ids and group.severity is Severity.BLOCKER
+            )
+            if not blocker_ids:
+                raise GateInvariantError(
+                    "owner authorization required without any accepted blocker IDs"
+                )
+            try:
+                actor, permission = github_actor_permission(target.repo)
+            except GitHubAuthorizationError as exc:
+                actor = exc.actor
+                message = (
+                    "accepted_blocker_authorization_operational_failure: "
+                    f"run_id={artifacts.run.run_id} "
+                    f"finding_ids={','.join(blocker_ids)} "
+                    f"step={exc.step} actor={actor or '<unknown>'}; {exc.detail}"
+                )
+                save_gate_verdict(
+                    artifacts.run.dir,
+                    _gate_failure_verdict(
+                        artifacts,
+                        message,
+                        inheritance_summary=inheritance_summary,
+                        actor=actor,
+                    ),
+                )
+                _error_console.print(message, markup=False)
+                raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
         verdict = build_gate_verdict(
             run_id=artifacts.run.run_id,
             target=target,
@@ -755,15 +1090,102 @@ async def _gate_pipeline(
             dispositions=dispositions,
             actor=actor,
             actor_permission=permission,
+            inherited_run_id=inherit_run_id,
+            inheritance=inheritance,
+            inheritance_summary=inheritance_summary,
         )
     except GateInvariantError as exc:
-        _gate_invariant_failure(artifacts, exc)
+        _gate_invariant_failure(
+            artifacts,
+            exc,
+            inheritance_summary=inheritance_summary,
+        )
     except (OSError, subprocess.CalledProcessError, ValueError) as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
 
     verdict_path, markdown_path = save_gate_verdict(artifacts.run.dir, verdict)
     verdict_markdown = markdown_path.read_text(encoding="utf-8")
+    _publish_gate_verdict(
+        artifacts=artifacts,
+        target=target,
+        outcome=outcome,
+        verdict=verdict,
+        verdict_path=verdict_path,
+        verdict_markdown=verdict_markdown,
+        execute=execute,
+        republish=False,
+        json_output=json_output,
+    )
+
+
+def _save_publish_status(
+    run: RunHandle,
+    *,
+    attempted_at: str,
+    execute: bool,
+    ok: bool,
+    detail: str | None,
+    republish: bool,
+    inline_count: int | None,
+    body_fallback_count: int | None,
+) -> None:
+    status = {
+        "attempted_at": attempted_at,
+        "mode": "execute" if execute else "dry_run",
+        "ok": ok,
+        "detail": detail,
+        "republish": republish,
+    }
+    if ok:
+        if inline_count is None or body_fallback_count is None:
+            raise ValueError("successful publication status requires publication counts")
+        status["inline_count"] = inline_count
+        status["body_fallback_count"] = body_fallback_count
+    try:
+        existing = run._load_contained_json("publish-status.json", "publish-status")
+    except StageMissing:
+        attempts: list[object] = []
+    else:
+        if isinstance(existing, list):
+            attempts = existing
+        elif isinstance(existing, dict):
+            attempts = [existing]
+        else:
+            raise ValueError("publish-status.json must contain an object or array")
+    attempts.append(status)
+
+    fd = os.open(
+        "publish-status.json",
+        os.O_WRONLY | os.O_NOFOLLOW | os.O_CREAT | os.O_TRUNC,
+        0o600,
+        dir_fd=run._pinned_dir_fd(),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as artifact:
+            fd = -1
+            json.dump(attempts, artifact, ensure_ascii=False, indent=2, sort_keys=True)
+            artifact.write("\n")
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _publish_gate_verdict(
+    *,
+    artifacts: _PipelineArtifacts,
+    target: ResolvedTarget,
+    outcome: AdjudicationOutcome,
+    verdict: GateVerdict,
+    verdict_path: Path,
+    verdict_markdown: str,
+    execute: bool,
+    republish: bool,
+    json_output: bool,
+) -> None:
+    if target.pr_number is None:
+        raise GateInvariantError("gate publication requires a pull-request number")
+    attempted_at = datetime.now(UTC).isoformat()
     try:
         publication = publish_review(
             run=artifacts.run,
@@ -775,8 +1197,29 @@ async def _gate_pipeline(
             execute=execute,
         )
     except (OSError, subprocess.CalledProcessError, PublishError) as exc:
-        _error_console.print(str(exc), markup=False)
+        detail = _redact_subprocess_diagnostic(str(exc))
+        _save_publish_status(
+            artifacts.run,
+            attempted_at=attempted_at,
+            execute=execute,
+            ok=False,
+            detail=detail,
+            republish=republish,
+            inline_count=None,
+            body_fallback_count=None,
+        )
+        _error_console.print(detail, markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+    _save_publish_status(
+        artifacts.run,
+        attempted_at=attempted_at,
+        execute=execute,
+        ok=True,
+        detail=None,
+        republish=republish,
+        inline_count=publication.inline_count,
+        body_fallback_count=publication.body_fallback_count,
+    )
     payload = {
         "run_id": artifacts.run.run_id,
         "verdict": verdict.verdict,
@@ -928,6 +1371,9 @@ def report_command(
         discovered = run.load_discover()
         merged = run.load_merge()
         outcome = _optional_outcome(run)
+    except InvalidRunId as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_USER_ERROR) from exc
     except (RunNotFound, StageMissing) as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_NOT_FOUND) from exc
@@ -954,6 +1400,9 @@ def publish_command(
     try:
         run = RunStore(out_root).open(run_id)
         target = run.load_target()
+    except InvalidRunId as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_USER_ERROR) from exc
     except RunNotFound as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc

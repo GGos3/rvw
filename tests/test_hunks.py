@@ -1,4 +1,6 @@
-from rvw.hunks import hunk_for_line, is_anchorable, parse_hunks
+import hashlib
+
+from rvw.hunks import hunk_for_line, hunk_sha256_by_id, is_anchorable, parse_hunks
 
 MULTI_HUNK_DIFF = """\
 diff --git a/src/a.ts b/src/a.ts
@@ -168,3 +170,59 @@ rename to src/after.ts
 
     assert hunk.file == "src/after.ts"
     assert is_anchorable([hunk], "src/after.ts", 2)
+
+
+def test_hunk_digest_uses_canonical_parser_boundaries() -> None:
+    hunk_text = "@@ -1 +1 @@\n-old();\n+newCall();\n"
+    diff = (
+        "diff --git a/src/a.ts b/src/a.ts\n"
+        "--- a/src/a.ts\n"
+        "+++ b/src/a.ts\n"
+        f"{hunk_text}"
+        "trailing non-hunk text that must not affect the digest\n"
+    )
+
+    hunk = parse_hunks(diff)[0]
+    digests = hunk_sha256_by_id(diff)
+
+    assert hunk.raw_text == hunk_text
+    assert digests == {hunk.hunk_id: hashlib.sha256(hunk_text.encode()).hexdigest()}
+
+
+def test_no_newline_markers_are_canonical_hunk_text() -> None:
+    terminated = "@@ -1 +1 @@\n-old\n+new\n"
+    unterminated = terminated + "\\ No newline at end of file\n"
+    mid_hunk = "@@ -1,2 +1,2 @@\n-old\n\\ No newline at end of file\n+new\n context\n"
+
+    terminated_hunk = parse_hunks(f"--- a/a\n+++ b/a\n{terminated}")[0]
+    unterminated_hunk = parse_hunks(f"--- a/a\n+++ b/a\n{unterminated}")[0]
+    mid_hunk_result = parse_hunks(f"--- a/a\n+++ b/a\n{mid_hunk}")[0]
+
+    assert terminated_hunk.raw_text == terminated
+    assert unterminated_hunk.raw_text == unterminated
+    assert mid_hunk_result.raw_text == mid_hunk
+    assert (
+        hashlib.sha256(terminated_hunk.raw_text.encode()).hexdigest()
+        != hashlib.sha256(unterminated_hunk.raw_text.encode()).hexdigest()
+    )
+
+
+def test_unicode_line_separator_inside_diff_line_is_not_a_hunk_boundary() -> None:
+    hunk_text = "@@ -0,0 +1,1 @@\n+first\u2028second\n"
+    diff = f"--- /dev/null\n+++ b/generated.txt\n{hunk_text}"
+
+    hunk = parse_hunks(diff)[0]
+
+    assert hunk.added_lines == {1}
+    assert hunk.raw_text == hunk_text
+    assert hunk_sha256_by_id(diff) == {hunk.hunk_id: hashlib.sha256(hunk_text.encode()).hexdigest()}
+
+
+def test_large_hunk_raw_text_is_preserved() -> None:
+    lines = [f"+generated line {index}\n" for index in range(20_000)]
+    hunk_text = f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(lines)
+
+    hunk = parse_hunks(f"--- /dev/null\n+++ b/generated.txt\n{hunk_text}")[0]
+
+    assert hunk.raw_text == hunk_text
+    assert hunk.added_lines == set(range(1, len(lines) + 1))

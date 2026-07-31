@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -10,7 +11,7 @@ from rvw.diffbudget import DiffBudgetReport, DiffChunkPlacement
 from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage, RunCoverage
 from rvw.merge import merge
 from rvw.schema import Tier, Verdict
-from rvw.store import RunNotFound, RunStore, StageMissing
+from rvw.store import InvalidRunId, RunHandle, RunNotFound, RunStore, StageMissing
 from rvw.target import ResolvedTarget
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -116,6 +117,184 @@ def test_create_uses_target_specific_run_id(tmp_path: Path) -> None:
 def test_open_unknown_run_raises(tmp_path: Path) -> None:
     with pytest.raises(RunNotFound, match="missing-run"):
         RunStore(tmp_path).open("missing-run")
+
+
+@pytest.mark.parametrize("run_id", [".", "..", "nested/run"])
+def test_open_rejects_non_child_run_ids_before_lookup(tmp_path: Path, run_id: str) -> None:
+    with pytest.raises(ValueError, match="invalid run ID"):
+        RunStore(tmp_path).open(run_id)
+
+
+@pytest.mark.parametrize("run_id", ["bad\nrun", "bad`run", "bad\u202erun"])
+def test_open_rejects_unsafe_run_id_characters_before_filesystem_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    run_id: str,
+) -> None:
+    def forbidden_resolve(path: Path, *args: object, **kwargs: object) -> Path:
+        del path, args, kwargs
+        raise AssertionError("unsafe run ID reached filesystem resolution")
+
+    monkeypatch.setattr(Path, "resolve", forbidden_resolve)
+
+    with pytest.raises(InvalidRunId, match="invalid run ID"):
+        RunStore(tmp_path).open(run_id)
+
+
+def test_open_rejects_symlinked_run_directory(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked-run").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="invalid run ID"):
+        RunStore(root).open("linked-run")
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "loader_name"),
+    [("target.json", "load_target"), ("gate-verdict.json", "load_gate_verdict")],
+)
+def test_inheritance_artifact_loaders_reject_symlinked_files(
+    tmp_path: Path,
+    artifact_name: str,
+    loader_name: str,
+) -> None:
+    root = tmp_path / "runs"
+    run_dir = root / "safe-run"
+    run_dir.mkdir(parents=True)
+    foreign = tmp_path / "foreign.json"
+    foreign.write_text("{}\n", encoding="utf-8")
+    (run_dir / artifact_name).symlink_to(foreign)
+    run = RunHandle(run_id="safe-run", dir=run_dir)
+
+    with pytest.raises(InvalidRunId, match="invalid run ID"):
+        getattr(run, loader_name)()
+
+
+def test_contained_json_loader_reads_regular_file(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "safe-run"
+    run_dir.mkdir(parents=True)
+    artifact = run_dir / "target.json"
+    artifact.write_text('{"source": "original"}\n', encoding="utf-8")
+    run = RunHandle(run_id="safe-run", dir=run_dir)
+
+    assert run._load_contained_json("target.json", "target") == {"source": "original"}
+
+
+def test_contained_json_loader_uses_pinned_dir_fd_and_no_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "runs"
+    run_dir = root / "safe-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "target.json").write_text('{"source": "original"}\n', encoding="utf-8")
+    run = RunStore(root).open("safe-run")
+    real_open = os.open
+    artifact_opens: list[tuple[int, int | None]] = []
+
+    def recording_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == "target.json":
+            artifact_opens.append((flags, dir_fd))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    try:
+        assert run._load_contained_json("target.json", "target") == {"source": "original"}
+    finally:
+        run.close()
+
+    assert len(artifact_opens) == 1
+    flags, dir_fd = artifact_opens[0]
+    assert flags & os.O_NOFOLLOW
+    assert dir_fd is not None
+
+
+def test_contained_text_loader_uses_pinned_dir_fd_and_no_follow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "runs"
+    run_dir = root / "safe-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "gate-verdict.md").write_text("trusted markdown\n", encoding="utf-8")
+    run = RunStore(root).open("safe-run")
+    real_open = os.open
+    artifact_opens: list[tuple[int, int | None]] = []
+
+    def recording_open(
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if path == "gate-verdict.md":
+            artifact_opens.append((flags, dir_fd))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    try:
+        assert (
+            run._load_contained_text("gate-verdict.md", "gate-verdict-markdown")
+            == "trusted markdown\n"
+        )
+    finally:
+        run.close()
+
+    assert len(artifact_opens) == 1
+    flags, dir_fd = artifact_opens[0]
+    assert flags & os.O_NOFOLLOW
+    assert dir_fd is not None
+
+
+def test_contained_text_loader_rejects_symlinked_file(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "safe-run"
+    run_dir.mkdir(parents=True)
+    foreign = tmp_path / "foreign.md"
+    foreign.write_text("secret\n", encoding="utf-8")
+    (run_dir / "gate-verdict.md").symlink_to(foreign)
+    run = RunHandle(run_id="safe-run", dir=run_dir)
+
+    with pytest.raises(InvalidRunId, match="invalid run ID"):
+        run._load_contained_text("gate-verdict.md", "gate-verdict-markdown")
+
+
+def test_opened_run_reads_from_pinned_directory_after_path_swap(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    run_dir = root / "safe-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "target.json").write_text('{"source": "original"}\n', encoding="utf-8")
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    (foreign / "target.json").write_text('{"source": "foreign"}\n', encoding="utf-8")
+
+    run = RunStore(root).open("safe-run")
+    pinned_path = root / "pinned-run"
+    run_dir.rename(pinned_path)
+    run_dir.symlink_to(foreign, target_is_directory=True)
+    try:
+        assert run._load_contained_json("target.json", "target") == {"source": "original"}
+    finally:
+        run.close()
+
+
+def test_contained_json_loader_rejects_non_regular_file(tmp_path: Path) -> None:
+    run_dir = tmp_path / "runs" / "safe-run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "target.json").mkdir()
+    run = RunHandle(run_id="safe-run", dir=run_dir)
+
+    with pytest.raises(InvalidRunId, match="invalid run ID"):
+        run._load_contained_json("target.json", "target")
 
 
 def test_missing_stage_names_stage_and_directory(tmp_path: Path) -> None:

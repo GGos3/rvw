@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import errno
 import json
-from dataclasses import dataclass
+import os
+import re
+import stat
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.diffbudget import DiffBudgetReport
@@ -14,6 +18,12 @@ from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage
 from rvw.merge import MergeResult
 from rvw.schema import Verdict
 from rvw.target import ResolvedTarget
+
+if TYPE_CHECKING:
+    from rvw.gate import GateVerdict
+
+
+_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class RunNotFound(FileNotFoundError):
@@ -23,6 +33,15 @@ class RunNotFound(FileNotFoundError):
         self.run_id = run_id
         self.root = root
         super().__init__(f"run not found: {run_id} under {root}")
+
+
+class InvalidRunId(ValueError):
+    """A run identifier is not a safe direct child of the artifact root."""
+
+    def __init__(self, run_id: str, root: Path) -> None:
+        self.run_id = run_id
+        self.root = root
+        super().__init__(f"invalid run ID: {run_id!r} under {root}")
 
 
 class StageMissing(FileNotFoundError):
@@ -53,12 +72,92 @@ class RunHandle:
 
     run_id: str
     dir: Path
+    _dir_fd: int | None = field(default=None, repr=False, compare=False)
+
+    def _pinned_dir_fd(self) -> int:
+        fd = self._dir_fd
+        if fd is not None:
+            return fd
+        try:
+            fd = os.open(self.dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise InvalidRunId(self.run_id, self.dir.parent) from exc
+            raise
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise InvalidRunId(self.run_id, self.dir.parent)
+        object.__setattr__(self, "_dir_fd", fd)
+        return fd
+
+    def close(self) -> None:
+        fd = self._dir_fd
+        if fd is not None:
+            os.close(fd)
+            object.__setattr__(self, "_dir_fd", None)
+
+    def __enter__(self) -> RunHandle:
+        self._pinned_dir_fd()
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.close()
+
+    def __del__(self) -> None:
+        self.close()
+
+    def _load_contained_json(self, name: str, stage: str) -> Any:
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=self._pinned_dir_fd(),
+            )
+        except FileNotFoundError as exc:
+            raise StageMissing(stage, self.dir) from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise InvalidRunId(self.run_id, self.dir.parent) from exc
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise InvalidRunId(self.run_id, self.dir.parent)
+            with os.fdopen(fd, encoding="utf-8") as artifact:
+                fd = -1
+                return json.load(artifact)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
+    def _load_contained_text(self, name: str, stage: str) -> str:
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=self._pinned_dir_fd(),
+            )
+        except FileNotFoundError as exc:
+            raise StageMissing(stage, self.dir) from exc
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise InvalidRunId(self.run_id, self.dir.parent) from exc
+            raise
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise InvalidRunId(self.run_id, self.dir.parent)
+            with os.fdopen(fd, encoding="utf-8") as artifact:
+                fd = -1
+                return artifact.read()
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
     def save_target(self, target: ResolvedTarget) -> None:
         _write_json(self.dir / "target.json", target.model_dump(mode="json"))
 
     def load_target(self) -> ResolvedTarget:
-        return ResolvedTarget.model_validate(_load_json(self.dir / "target.json", "target"))
+        return ResolvedTarget.model_validate(self._load_contained_json("target.json", "target"))
 
     def save_discover(self, discovered: DiscoverResult) -> None:
         _write_json(
@@ -131,6 +230,13 @@ class RunHandle:
             raise StageMissing("report", self.dir)
         return path.read_text(encoding="utf-8")
 
+    def load_gate_verdict(self) -> GateVerdict:
+        from rvw.gate import GateVerdict
+
+        return GateVerdict.model_validate(
+            self._load_contained_json("gate-verdict.json", "gate-verdict")
+        )
+
 
 class RunStore:
     """Create and reopen run directories beneath one artifact root."""
@@ -155,12 +261,27 @@ class RunStore:
         return RunHandle(run_id=run_id, dir=run_dir)
 
     def open(self, run_id: str) -> RunHandle:
-        if Path(run_id).name != run_id:
-            raise RunNotFound(run_id, self.root)
+        if not _SAFE_RUN_ID.fullmatch(run_id) or run_id in {".", ".."}:
+            raise InvalidRunId(run_id, self.root)
         run_dir = self.root / run_id
-        if not run_dir.is_dir():
-            raise RunNotFound(run_id, self.root)
-        return RunHandle(run_id=run_id, dir=run_dir)
+        if run_dir.is_symlink():
+            raise InvalidRunId(run_id, self.root)
+        resolved_root = self.root.resolve()
+        resolved_run = run_dir.resolve()
+        if not resolved_run.is_relative_to(resolved_root) or resolved_run == resolved_root:
+            raise InvalidRunId(run_id, self.root)
+        try:
+            fd = os.open(run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError as exc:
+            raise RunNotFound(run_id, self.root) from exc
+        except OSError as exc:
+            if exc.errno in {errno.ELOOP, errno.ENOTDIR}:
+                raise InvalidRunId(run_id, self.root) from exc
+            raise
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise InvalidRunId(run_id, self.root)
+        return RunHandle(run_id=run_id, dir=run_dir, _dir_fd=fd)
 
 
-__all__ = ["RunHandle", "RunNotFound", "RunStore", "StageMissing"]
+__all__ = ["InvalidRunId", "RunHandle", "RunNotFound", "RunStore", "StageMissing"]
