@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
@@ -24,6 +25,7 @@ from rvw.schema import Verdict
 from rvw.store import RunHandle
 
 _HTTP_STATUS = re.compile(r"(?:HTTP\s+|status(?: code)?[=: ]+)(?P<status>[1-5][0-9]{2})", re.I)
+_COMMIT_ID = re.compile(r"^[0-9a-f]{40}$")
 _CONFIRMED_HEADING = "## 확정 발견 (CONFIRMED)"
 
 
@@ -216,4 +218,55 @@ def publish_review(
     )
 
 
-__all__ = ["PublishError", "PublishResult", "publish_review"]
+def publish_body_review(
+    *,
+    run_dir: Path,
+    repo: str,
+    pr_number: int,
+    commit_id: str,
+    body: str,
+    execute: bool,
+) -> PublishResult:
+    """Persist and optionally send one body-only GitHub COMMENT review."""
+
+    if _COMMIT_ID.fullmatch(commit_id) is None:
+        raise ValueError("stack publication commit_id must be a 40-character lowercase SHA")
+    payload = _payload(body=body, inline_groups=[], outcome=None)
+    payload["commit_id"] = commit_id
+    payload_text = _json_text(payload)
+    (run_dir / "publish-payload.json").write_text(
+        f"{payload_text}\n",
+        encoding="utf-8",
+    )
+    if not execute:
+        return PublishResult(
+            review_url=None,
+            inline_count=0,
+            body_fallback_count=0,
+            state="commented",
+        )
+
+    command = [
+        "gh",
+        "api",
+        "--method",
+        "POST",
+        f"repos/{repo}/pulls/{pr_number}/reviews",
+        "--input",
+        "-",
+    ]
+    raw = _run(command, payload_text)
+    return PublishResult(
+        review_url=_review_url(raw),
+        inline_count=0,
+        body_fallback_count=0,
+        state="commented",
+    )
+
+
+__all__ = [
+    "PublishError",
+    "PublishResult",
+    "publish_body_review",
+    "publish_review",
+]
