@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from rvw.gate import (
     GateFinding,
     GateInvariantError,
     GatePlan,
+    GitHubAuthorizationError,
     InheritanceBlankReason,
     InheritanceSummary,
     InheritanceTier,
@@ -420,6 +422,34 @@ def _one_finding_merge(
     return merged, outcome
 
 
+def _multi_body_merge(bodies: list[str]) -> tuple[MergeResult, AdjudicationOutcome]:
+    findings = [
+        EnrichedFinding(
+            rule_id="rule/actionable",
+            file="src/a.py",
+            hunk_id="src/a.py@@-1+1@@",
+            line=1,
+            severity=Severity.WARNING,
+            body=body,
+            anchorable=True,
+            lane_id="lane-a",
+            replica=index,
+        )
+        for index, body in enumerate(bodies, start=1)
+    ]
+    merged = merge(findings, lane_tiers={"lane-a": Tier.BASE})
+    key = merged.groups[0].key
+    outcome = AdjudicationOutcome(
+        verdicts={key: Verdict.CONFIRMED},
+        reasons={key: "confirmed"},
+        evidence={key: "evidence"},
+        replica_votes={key: [Verdict.CONFIRMED] * 3},
+        unresolved=[],
+        coerced_rejections=0,
+    )
+    return merged, outcome
+
+
 def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None:
     merged, outcome = _one_finding_merge()
     group = merged.groups[0]
@@ -533,6 +563,79 @@ def test_inheritance_matcher_requires_equal_known_body_digest_for_exact_carry(
     assert result.tier is InheritanceTier.UNIQUE_PAIR
     assert result.decision is DispositionDecision.MUST_FIX
     assert result.blank_reason == blank_reason
+
+
+def test_inheritance_body_digest_binds_all_bodies_and_is_order_insensitive() -> None:
+    source_bodies = ["diagnosis A", "diagnosis B"]
+    source_digest = hashlib.sha256("\n\0\n".join(sorted(source_bodies)).encode()).hexdigest()
+    changed, changed_outcome = _multi_body_merge(["diagnosis A", "diagnosis C"])
+    reordered, reordered_outcome = _multi_body_merge(list(reversed(source_bodies)))
+    source = _inherited_finding(
+        finding_id=changed.groups[0].key,
+        rule_id=changed.groups[0].rule_id,
+        file=changed.groups[0].file,
+        hunk_sha256="1" * 64,
+        body_sha256=source_digest,
+    )
+
+    changed_match = match_inherited_dispositions(
+        [source],
+        changed,
+        changed_outcome,
+        inherited_run_id="run-prior",
+        current_hunk_sha256={changed.groups[0].key: "1" * 64},
+    )[changed.groups[0].key]
+    reordered_match = match_inherited_dispositions(
+        [source],
+        reordered,
+        reordered_outcome,
+        inherited_run_id="run-prior",
+        current_hunk_sha256={reordered.groups[0].key: "1" * 64},
+    )[reordered.groups[0].key]
+
+    assert changed_match.tier is InheritanceTier.UNIQUE_PAIR
+    assert changed_match.blank_reason is InheritanceBlankReason.CONTENT_CHANGED
+    assert reordered_match.tier is InheritanceTier.EXACT_ID
+    assert reordered_match.decision is DispositionDecision.ACCEPTED
+
+
+def test_legacy_single_body_digest_demotes_multi_body_finding() -> None:
+    bodies = ["diagnosis A", "diagnosis B"]
+    merged, outcome = _multi_body_merge(bodies)
+    group = merged.groups[0]
+    legacy_digest = hashlib.sha256(bodies[0].encode()).hexdigest()
+
+    matched = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id=group.key,
+                rule_id=group.rule_id,
+                file=group.file,
+                hunk_sha256="1" * 64,
+                body_sha256=legacy_digest,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+        current_hunk_sha256={group.key: "1" * 64},
+    )[group.key]
+
+    assert matched.tier is InheritanceTier.UNIQUE_PAIR
+    assert matched.blank_reason is InheritanceBlankReason.CONTENT_CHANGED
+
+
+def test_empty_collapse_group_bodies_raise_gate_invariant() -> None:
+    merged, outcome = _one_finding_merge()
+    merged.groups[0] = merged.groups[0].model_copy(update={"bodies": []})
+
+    with pytest.raises(GateInvariantError, match="body"):
+        match_inherited_dispositions(
+            [],
+            merged,
+            outcome,
+            inherited_run_id="run-prior",
+        )
 
 
 def test_inheritance_matcher_ignores_must_fix_and_rejected_groups() -> None:
@@ -1007,6 +1110,42 @@ def test_pull_request_requery_and_actor_permission_commands() -> None:
             ".permission",
         ],
     ]
+
+
+def test_authorization_diagnostic_redacts_token_families_and_controls() -> None:
+    secrets = [
+        "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "gho_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+        "ghu_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+        "ghs_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD",
+        "ghr_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE",
+        "github_pat_11AA22BB33CC44DD55EE66FF",
+        "f" * 80,
+        "QWxhZGRpbjpvcGVuIHNlc2FtZQ" * 4,
+    ]
+
+    def failed_run(command: list[str]) -> str:
+        raise subprocess.CalledProcessError(
+            returncode=19,
+            cmd=command,
+            stderr=(
+                "\x00".join(secrets)
+                + "\nAuthorization: Basic private-value\n"
+                + "Bearer another-private-value\n"
+            ),
+        )
+
+    with pytest.raises(GitHubAuthorizationError) as caught:
+        github_actor_permission("owner/repo", run=failed_run)
+
+    detail = caught.value.detail
+    assert caught.value.step == "actor_lookup"
+    assert "exit status 19" in detail
+    assert "Authorization: [REDACTED]" in detail
+    assert "Bearer [REDACTED]" in detail
+    assert "\x00" not in detail
+    assert all(secret not in detail for secret in secrets)
+    assert len(detail) <= 500
 
 
 def test_pull_request_requery_rejects_malformed_api_data() -> None:

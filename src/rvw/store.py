@@ -81,7 +81,7 @@ class RunHandle:
         resolved_dir = self.dir.resolve()
         if not resolved_path.is_relative_to(resolved_dir) or resolved_path == resolved_dir:
             raise InvalidRunId(self.run_id, self.dir.parent)
-        return _load_json(path, stage)
+        return _load_json(resolved_path, stage)
 
     def save_target(self, target: ResolvedTarget) -> None:
         _write_json(self.dir / "target.json", target.model_dump(mode="json"))

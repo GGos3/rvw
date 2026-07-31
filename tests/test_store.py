@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import rvw.store as store_module
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.diffbudget import DiffBudgetReport, DiffChunkPlacement
 from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage, RunCoverage
@@ -170,6 +171,38 @@ def test_inheritance_artifact_loaders_reject_symlinked_files(
 
     with pytest.raises(InvalidRunId, match="invalid run ID"):
         getattr(run, loader_name)()
+
+
+def test_contained_json_read_uses_path_captured_during_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "runs" / "safe-run"
+    run_dir.mkdir(parents=True)
+    artifact = run_dir / "target.json"
+    snapshot = run_dir / "resolved-target.json"
+    foreign = tmp_path / "foreign.json"
+    artifact.write_text('{"source": "original"}\n', encoding="utf-8")
+    snapshot.write_text('{"source": "original"}\n', encoding="utf-8")
+    foreign.write_text('{"source": "foreign"}\n', encoding="utf-8")
+    run = RunHandle(run_id="safe-run", dir=run_dir)
+    original_resolve = Path.resolve
+    original_load_json = store_module._load_json
+
+    def captured_resolve(path: Path, strict: bool = False) -> Path:
+        if path == artifact:
+            return snapshot
+        return original_resolve(path, strict=strict)
+
+    def racing_load_json(path: Path, stage: str) -> object:
+        artifact.unlink()
+        artifact.symlink_to(foreign)
+        return original_load_json(path, stage)
+
+    monkeypatch.setattr(Path, "resolve", captured_resolve)
+    monkeypatch.setattr(store_module, "_load_json", racing_load_json)
+
+    assert run._load_contained_json("target.json", "target") == {"source": "original"}
 
 
 def test_missing_stage_names_stage_and_directory(tmp_path: Path) -> None:

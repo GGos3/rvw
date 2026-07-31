@@ -36,12 +36,17 @@ The `rvw gate --target <pr>` command MUST execute its shared review pipeline wit
 
 ### Requirement: Resume never repeats review
 
-The `rvw gate --run <run-id>` mode MUST load the run's persisted artifacts and MUST NOT execute discovery, merge, or adjudication again. The CLI MUST reject an invocation that supplies both or neither of `--target` and `--run`.
+The `rvw gate --run <run-id>` mode MUST load the run's persisted artifacts and MUST NOT execute discovery, merge, or adjudication again. The CLI MUST reject an invocation that supplies both or neither of `--target` and `--run`. When resume without `--dispositions` would pause for actionable findings, gate MUST preserve an existing completed verdict and exit 2 with machine-readable reason `verdict_already_completed`; a verdict is completed when it contains finding records or does not contain the actionable-dispositions pause marker. Target mode and resume of an existing pause stub MUST retain the ordinary template-and-pause behavior.
 
 #### Scenario: Operator supplies generated dispositions
 
 - **WHEN** an operator resumes a run with a disposition file
 - **THEN** gate validates and renders that run without a second review invocation
+
+#### Scenario: Resume would replace completed evidence with a pause stub
+
+- **WHEN** resume without `--dispositions` finds an existing completed verdict for an actionable run
+- **THEN** gate exits 2 with reason `verdict_already_completed` and leaves the verdict artifact byte-for-byte unchanged
 
 ### Requirement: Gate rejects stale pull-request anchors
 
@@ -136,7 +141,7 @@ The `rvw gate` command MUST accept an `--inherit <run-id>` option in target and 
 
 ### Requirement: Accepted dispositions carry by tiered identity matching
 
-For each actionable finding of the current run, gate MUST persist optional `hunk_sha256` and `body_sha256` values computed respectively from the run's canonical unified-diff hunk text and the representative finding body used for that verdict record. Gate MUST evaluate inherited and current `(file, rule_id)` multiplicity before exact-ID matching, and any pair duplicated on either side MUST remain blank even when IDs and digests match. On an unambiguous pair, gate MUST auto-carry the accepted decision and reason only when the public finding ID exactly matches an `accepted` inherited finding and both findings have equal known hunk and body digests. An exact-ID digest mismatch or unknown hunk or body digest MUST be demoted to tier-two handling and MUST NOT auto-carry. Gate MUST prefill only the reason while keeping the decision `must_fix` when an accepted `(file, rule_id)` candidate is unique among all inherited findings and all current actionable findings. Ambiguity counts MUST include inherited `accepted` and `must_fix` findings. Gate MUST NOT carry `must_fix` dispositions in any tier and MUST stamp every carried or prefilled record with the inherited run's identifier. Each persisted verdict finding MUST optionally record its inheritance tier and blank or demotion reason, and inheritance-summary reason keys MUST use the closed `InheritanceBlankReason` vocabulary.
+For each actionable finding of the current run, gate MUST persist optional `hunk_sha256` and `body_sha256` values computed respectively from the run's canonical unified-diff hunk text and the complete, order-insensitive set of collapsed finding bodies. Gate MUST fail with a gate invariant when an actionable collapsed finding has no bodies. Gate MUST evaluate inherited and current `(file, rule_id)` multiplicity before exact-ID matching, and any pair duplicated on either side MUST remain blank even when IDs and digests match. On an unambiguous pair, gate MUST auto-carry the accepted decision and reason only when the public finding ID exactly matches an `accepted` inherited finding and both findings have equal known hunk and body-set digests. An exact-ID digest mismatch or unknown hunk or body digest MUST be demoted to tier-two handling and MUST NOT auto-carry. Gate MUST prefill only the reason while keeping the decision `must_fix` when an accepted `(file, rule_id)` candidate is unique among all inherited findings and all current actionable findings. Ambiguity counts MUST include inherited `accepted` and `must_fix` findings. Gate MUST NOT carry `must_fix` dispositions in any tier and MUST stamp every carried or prefilled record with the inherited run's identifier. Each persisted verdict finding MUST optionally record its inheritance tier and blank or demotion reason, and inheritance-summary reason keys MUST use the closed `InheritanceBlankReason` vocabulary.
 
 Every non-carried match result MUST expose a machine-readable `blank_reason` that distinguishes a changed finding ID, unmatched findings, prior `must_fix` findings, source-side pair ambiguity, current-side pair ambiguity, changed content, and unknown content digests. Generated disposition templates MUST render the applicable reason as a YAML comment beside each affected entry.
 
@@ -157,8 +162,18 @@ Every non-carried match result MUST expose a machine-readable `blank_reason` tha
 
 #### Scenario: Exact finding has a changed diagnosis
 
-- **WHEN** an exact-ID finding has equal known hunk digests but unequal representative-body digests
+- **WHEN** an exact-ID finding has equal known hunk digests but any member of its collapsed body set changes
 - **THEN** gate records `content_changed`, applies tier-two handling, and does not auto-carry
+
+#### Scenario: Finding bodies recur in another order
+
+- **WHEN** an exact-ID finding has equal known hunk digests and the same nonempty collapsed body set in a different order
+- **THEN** the body digest remains equal and the finding remains eligible for tier-one carry
+
+#### Scenario: Collapsed finding has no bodies
+
+- **WHEN** an actionable collapsed finding has an empty body collection
+- **THEN** gate raises a gate invariant instead of assigning an ordinary digest
 
 #### Scenario: Prior must-fix finding recurs
 
@@ -177,7 +192,12 @@ Every non-carried match result MUST expose a machine-readable `blank_reason` tha
 
 ### Requirement: Fully inherited runs proceed without pausing
 
-When every actionable finding of the current run is covered by a hunk-and-body-digest-verified exact-match carried acceptance, gate MUST persist the generated disposition document under the run directory and MUST continue into disposition validation and verdict construction in the same invocation instead of exiting for a resume round. A partial-inheritance pause MUST report and persist the source run ID plus carried, prefilled, and blank counts grouped by machine-readable reason. Owner authorization for accepted blockers MUST be re-verified in the inheriting run, and a failed re-verification MUST persist the finding ID, verified actor, and returned permission. An operational authorization failure MUST persist a BLOCK verdict containing affected blocker IDs, the resolved actor when available, the failed lookup step, and captured subprocess stderr. The verdict artifact MUST render each carried record's inherited run identifier.
+When every actionable finding of the current run is covered by a hunk-and-body-digest-verified exact-match carried acceptance, gate MUST persist the generated disposition document under the run directory and MUST continue into disposition validation and verdict construction in the same invocation instead of exiting for a resume round. A partial-inheritance pause MUST report and persist the source run ID plus carried, prefilled, and blank counts grouped by machine-readable reason. Owner authorization for accepted blockers MUST be re-verified in the inheriting run, and a failed re-verification MUST persist the finding ID, verified actor, and returned permission. An operational authorization failure MUST persist a BLOCK verdict containing affected blocker IDs, the resolved actor when available, the failed lookup step, and a secret-redacted subprocess diagnostic of at most 500 characters with control characters removed and explicit truncation. The diagnostic MUST mask GitHub token prefixes, authorization-header and bearer values, and long base64 or hexadecimal runs before any console or artifact consumer receives it. The verdict artifact MUST render each carried record's inherited run identifier.
+
+#### Scenario: Authorization subprocess emits sensitive stderr
+
+- **WHEN** actor or permission lookup fails with stderr containing credentials, control characters, or an oversized response
+- **THEN** gate preserves the failed step and exit status while every console, JSON, and Markdown diagnostic contains only the bounded redacted form
 
 #### Scenario: Every actionable finding was previously accepted
 

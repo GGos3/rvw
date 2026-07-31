@@ -611,6 +611,99 @@ def test_gate_without_dispositions_writes_template_and_does_not_rerun(
     assert not (artifacts.run.dir / "publish-payload.json").exists()
 
 
+def test_gate_resume_without_dispositions_preserves_completed_verdict(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        artifacts.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    group = artifacts.merged.groups[0]
+    save_gate_verdict(
+        artifacts.run.dir,
+        GateVerdict(
+            run_id=artifacts.run.run_id,
+            repo=artifacts.target.repo,
+            pr_number=42,
+            anchor=GateAnchor(base_sha="a" * 40, head_sha="b" * 40),
+            counts={"CONFIRMED": 1, "REJECTED": 0, "UNCERTAIN": 0},
+            coverage=artifacts.discovered.coverage,
+            findings=[
+                GateFinding(
+                    finding_id=group.key,
+                    rule_id=group.rule_id,
+                    file=group.file,
+                    line=group.line,
+                    severity=group.severity,
+                    verdict=Verdict.CONFIRMED,
+                    disposition=DispositionDecision.ACCEPTED,
+                    reason="completed owner decision",
+                    hunk_sha256=HUNK_SHA256,
+                    body_sha256=BODY_SHA256,
+                )
+            ],
+            verdict="PASS",
+        ),
+    )
+    json_path = artifacts.run.dir / "gate-verdict.json"
+    markdown_path = artifacts.run.dir / "gate-verdict.md"
+    original_json = json_path.read_bytes()
+    original_markdown = markdown_path.read_bytes()
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 2
+    assert "verdict_already_completed" in result.stderr
+    assert "--inherit" in result.stderr
+    assert json_path.read_bytes() == original_json
+    assert markdown_path.read_bytes() == original_markdown
+
+
+def test_gate_resume_without_dispositions_rewrites_existing_pause_stub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root, actionable=True)
+    save_gate_plan(
+        artifacts.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    save_gate_verdict(
+        artifacts.run.dir,
+        GateVerdict(
+            run_id=artifacts.run.run_id,
+            repo=artifacts.target.repo,
+            pr_number=42,
+            anchor=GateAnchor(base_sha="a" * 40, head_sha="b" * 40),
+            counts={"CONFIRMED": 1, "REJECTED": 0, "UNCERTAIN": 0},
+            coverage=artifacts.discovered.coverage,
+            findings=[],
+            verdict="BLOCK",
+            failures=["actionable findings require explicit dispositions"],
+        ),
+    )
+    monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 1
+    assert "actionable findings require dispositions" in result.stdout
+    persisted = artifacts.run.load_gate_verdict()
+    assert persisted.findings == []
+    assert persisted.failures == ["actionable findings require explicit dispositions"]
+
+
 @pytest.mark.parametrize("mode", ["target", "run"])
 def test_gate_full_tier_one_inheritance_persists_document_and_auto_proceeds(
     tmp_path: Path,
@@ -769,24 +862,42 @@ def test_gate_carried_blocker_reverifies_owner_authorization(
     assert not (current.run.dir / "publish-payload.json").exists()
 
 
-def test_gate_persists_carried_blocker_authorization_operational_failure(
+@pytest.mark.parametrize(
+    ("failed_step", "exit_status", "expected_actor"),
+    [
+        ("actor_lookup", 17, None),
+        ("permission_lookup", 23, "repo-owner"),
+    ],
+)
+def test_gate_redacts_and_labels_carried_blocker_authorization_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failed_step: str,
+    exit_status: int,
+    expected_actor: str | None,
 ) -> None:
     out_root = tmp_path / "runs"
     current = prepared_artifacts(out_root, actionable=True, blocker=True)
     source = inherited_source(out_root, current)
     patch_target_dependencies(monkeypatch, current)
     real_permission_lookup = cli_module.github_actor_permission
+    secret_token = "github_pat_11AA22BB33CC44DD55EE66FF"
+    bearer_secret = "bearer-value-that-must-not-survive"
+    fixture_label = f"fixture-{failed_step}-only"
 
     def failed_permission_lookup(repo: str) -> tuple[str, str]:
         def fake_run(command: list[str]) -> str:
-            if command[:3] == ["gh", "api", "user"]:
+            is_actor_lookup = command[:3] == ["gh", "api", "user"]
+            if is_actor_lookup and failed_step == "permission_lookup":
                 return "repo-owner\n"
             raise subprocess.CalledProcessError(
-                returncode=1,
+                returncode=exit_status,
                 cmd=command,
-                stderr="permission endpoint denied the request",
+                stderr=(
+                    f"{fixture_label}\x00\n"
+                    f"Authorization: Bearer {bearer_secret}\n"
+                    f"token={secret_token}\n" + "bounded diagnostic words " * 80
+                ),
             )
 
         return real_permission_lookup(repo, run=fake_run)
@@ -809,14 +920,59 @@ def test_gate_persists_carried_blocker_authorization_operational_failure(
     assert result.exit_code == 3
     persisted = current.run.load_gate_verdict()
     assert persisted.verdict == "BLOCK"
-    assert persisted.actor == "repo-owner"
+    assert persisted.actor == expected_actor
     failure = persisted.failures[0]
     assert "accepted_blocker_authorization_operational_failure" in failure
     assert current.merged.groups[0].key in failure
-    assert "permission" in failure
-    assert "permission endpoint denied the request" in failure
-    assert "permission endpoint denied the request" in result.stderr
+    assert f"step={failed_step}" in failure
+    assert f"exit status {exit_status}" in failure
+    assert fixture_label in failure
+    assert "[REDACTED]" in failure
+    assert "[truncated]" in failure
+    detail = failure.split("; ", maxsplit=1)[1]
+    assert len(detail) <= 500
+    markdown = (current.run.dir / "gate-verdict.md").read_text(encoding="utf-8")
+    persisted_json = (current.run.dir / "gate-verdict.json").read_text(encoding="utf-8")
+    for sink in (failure, markdown, persisted_json, result.stderr):
+        assert secret_token not in sink
+        assert bearer_secret not in sink
+        assert "\x00" not in sink
+        assert f"step={failed_step}" in sink
     assert not (current.run.dir / "publish-payload.json").exists()
+
+
+def test_gate_owner_authorization_requires_nonempty_blocker_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+    patch_target_dependencies(monkeypatch, current)
+    monkeypatch.setattr(cli_module, "requires_owner_authorization", lambda *args, **kwargs: True)
+
+    def forbidden_permission(repo: str) -> tuple[str, str]:
+        raise AssertionError(f"authorization lookup reached with no blocker IDs for {repo}")
+
+    monkeypatch.setattr(cli_module, "github_actor_permission", forbidden_permission)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--target",
+            "42",
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "accepted blocker IDs" in result.stderr
+    persisted = current.run.load_gate_verdict()
+    assert any("accepted blocker IDs" in failure for failure in persisted.failures)
 
 
 @pytest.mark.parametrize("source_case", ["absent", "wrong_run", "unmatched"])

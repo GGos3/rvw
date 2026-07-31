@@ -67,26 +67,50 @@ def parse_hunks(diff: str) -> list[Hunk]:
     old_path: str | None = None
     file: str | None = None
     active: Hunk | None = None
+    active_raw_lines: list[str] = []
+    active_complete = False
+    previous_counted_line = False
     old_line = 0
     new_line = 0
 
+    def finalize_active() -> None:
+        nonlocal active, active_raw_lines, active_complete, previous_counted_line
+        if active is not None:
+            active.raw_text = "".join(active_raw_lines)
+        active = None
+        active_raw_lines = []
+        active_complete = False
+        previous_counted_line = False
+
     for raw_line in diff.splitlines(keepends=True):
         line = raw_line.rstrip("\r\n")
+        if active is not None and active_complete:
+            if line.startswith("\\") and previous_counted_line:
+                active_raw_lines.append(raw_line)
+                finalize_active()
+                continue
+            finalize_active()
+
         header = _HUNK_HEADER.match(line)
         if header:
             if file is None:
                 continue
-            active = _hunk_from_header(header, file)
-            active.raw_text = raw_line
-            hunks.append(active)
-            old_line = active.old_start
-            new_line = active.new_start
-            if active.old_count == 0 and active.new_count == 0:
-                active = None
+            finalize_active()
+            new_hunk = _hunk_from_header(header, file)
+            active = new_hunk
+            active_raw_lines = [raw_line]
+            hunks.append(new_hunk)
+            old_line = new_hunk.old_start
+            new_line = new_hunk.new_start
+            if new_hunk.old_count == 0 and new_hunk.new_count == 0:
+                finalize_active()
             continue
 
         if active is not None:
-            active.raw_text += raw_line
+            active_raw_lines.append(raw_line)
+            if line.startswith("\\") and previous_counted_line:
+                previous_counted_line = False
+                continue
             if line.startswith("+"):
                 active.added_lines.add(new_line)
                 new_line += 1
@@ -96,11 +120,12 @@ def parse_hunks(diff: str) -> list[Hunk]:
                 active.context_lines.add(new_line)
                 old_line += 1
                 new_line += 1
+            previous_counted_line = line.startswith(("+", "-", " "))
 
             old_complete = old_line >= active.old_start + active.old_count
             new_complete = new_line >= active.new_start + active.new_count
             if old_complete and new_complete:
-                active = None
+                active_complete = True
             continue
 
         if line.startswith("--- "):
@@ -114,6 +139,7 @@ def parse_hunks(diff: str) -> list[Hunk]:
             old_path = None
             file = None
 
+    finalize_active()
     return hunks
 
 

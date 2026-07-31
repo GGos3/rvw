@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -305,10 +306,12 @@ def _dispositions_by_id(
 
 
 def _body_sha256(group: CollapseGroup) -> str:
-    """Digest the representative body rendered for a collapsed finding."""
+    """Digest the complete order-insensitive body set for a collapsed finding."""
 
-    representative = group.bodies[0] if group.bodies else ""
-    return hashlib.sha256(representative.encode()).hexdigest()
+    if not group.bodies:
+        raise GateInvariantError(f"collapsed finding {group.key} must contain at least one body")
+    canonical = "\n\0\n".join(sorted(group.bodies))
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def match_inherited_dispositions(
@@ -340,6 +343,7 @@ def match_inherited_dispositions(
     }
 
     for group in actionable:
+        current_body_digest = _body_sha256(group)
         pair = (group.file, group.rule_id)
         if inherited_pair_counts[pair] > 1:
             results[group.key] = DispositionInheritance(
@@ -360,7 +364,6 @@ def match_inherited_dispositions(
             inherited_digest = exact.hunk_sha256
             current_digest = current_digests.get(group.key)
             inherited_body_digest = exact.body_sha256
-            current_body_digest = _body_sha256(group)
             if (
                 inherited_digest is not None
                 and current_digest is not None
@@ -680,13 +683,39 @@ def _run(command: list[str]) -> str:
     return subprocess.run(command, check=True, capture_output=True, text=True).stdout
 
 
+_AUTHORIZATION_DIAGNOSTIC_LIMIT = 500
+_REDACTED = "[REDACTED]"
+_GITHUB_TOKEN = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+)\b")
+_AUTHORIZATION_HEADER = re.compile(r"(?i)(\bAuthorization\s*:\s*)[^\r\n]*")
+_BEARER_VALUE = re.compile(r"(?i)\bBearer\s+[^\s,;]+")
+_LONG_HEX = re.compile(r"\b[0-9a-fA-F]{40,}\b")
+_LONG_BASE64 = re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b")
+_CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+
+
+def _redact_subprocess_diagnostic(value: str) -> str:
+    redacted = _GITHUB_TOKEN.sub(_REDACTED, value)
+    redacted = _AUTHORIZATION_HEADER.sub(rf"\1{_REDACTED}", redacted)
+    redacted = _BEARER_VALUE.sub(f"Bearer {_REDACTED}", redacted)
+    redacted = _LONG_HEX.sub(_REDACTED, redacted)
+    redacted = _LONG_BASE64.sub(_REDACTED, redacted)
+    redacted = _CONTROL_CHARACTERS.sub(" ", redacted).strip()
+    truncation_marker = "...[truncated]"
+    if len(redacted) > _AUTHORIZATION_DIAGNOSTIC_LIMIT:
+        redacted = (
+            redacted[: _AUTHORIZATION_DIAGNOSTIC_LIMIT - len(truncation_marker)].rstrip()
+            + truncation_marker
+        )
+    return redacted
+
+
 def _authorization_error_detail(exc: OSError | subprocess.CalledProcessError) -> str:
     detail = str(exc)
     if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
         stderr = str(exc.stderr).strip()
         if stderr:
             detail = f"{detail}; stderr: {stderr}"
-    return detail
+    return _redact_subprocess_diagnostic(detail)
 
 
 def query_pull_request(

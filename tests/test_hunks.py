@@ -187,3 +187,31 @@ def test_hunk_digest_uses_canonical_parser_boundaries() -> None:
 
     assert hunk.raw_text == hunk_text
     assert digests == {hunk.hunk_id: hashlib.sha256(hunk_text.encode()).hexdigest()}
+
+
+def test_no_newline_markers_are_canonical_hunk_text() -> None:
+    terminated = "@@ -1 +1 @@\n-old\n+new\n"
+    unterminated = terminated + "\\ No newline at end of file\n"
+    mid_hunk = "@@ -1,2 +1,2 @@\n-old\n\\ No newline at end of file\n+new\n context\n"
+
+    terminated_hunk = parse_hunks(f"--- a/a\n+++ b/a\n{terminated}")[0]
+    unterminated_hunk = parse_hunks(f"--- a/a\n+++ b/a\n{unterminated}")[0]
+    mid_hunk_result = parse_hunks(f"--- a/a\n+++ b/a\n{mid_hunk}")[0]
+
+    assert terminated_hunk.raw_text == terminated
+    assert unterminated_hunk.raw_text == unterminated
+    assert mid_hunk_result.raw_text == mid_hunk
+    assert (
+        hashlib.sha256(terminated_hunk.raw_text.encode()).hexdigest()
+        != hashlib.sha256(unterminated_hunk.raw_text.encode()).hexdigest()
+    )
+
+
+def test_large_hunk_raw_text_is_preserved() -> None:
+    lines = [f"+generated line {index}\n" for index in range(20_000)]
+    hunk_text = f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(lines)
+
+    hunk = parse_hunks(f"--- /dev/null\n+++ b/generated.txt\n{hunk_text}")[0]
+
+    assert hunk.raw_text == hunk_text
+    assert hunk.added_lines == set(range(1, len(lines) + 1))

@@ -60,3 +60,16 @@
 
 - [x] 12.1 Synchronize the delta and main pr-gate spec/context with all round-2 requirements and rationale.
 - [x] 12.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.
+
+## 13. Round-4 regression coverage
+
+- [x] 13.1 Add failing regressions for authorization diagnostic redaction, contained-read TOCTOU resistance, completed-verdict resume protection, all-body digest identity, no-newline hunk markers, and authorization step labels.
+
+## 14. Round-4 hardening implementation
+
+- [x] 14.1 Implement bounded secret-safe authorization diagnostics, resolved-path artifact reads, completed-verdict overwrite protection, order-insensitive all-body digests with empty-body invariants, linear canonical hunk parsing, and the scoped hygiene fixes.
+
+## 15. Round-4 specification and verification
+
+- [x] 15.1 Synchronize the delta and main pr-gate spec/context for diagnostic redaction, completed-verdict protection, and all-body digest binding.
+- [x] 15.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.

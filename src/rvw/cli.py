@@ -23,6 +23,7 @@ from rvw.discover import DiscoverResult, resolve_lane_path
 from rvw.dispatch import PlannedRun, lpt_sort_key
 from rvw.doctor import DoctorReport, diagnose
 from rvw.gate import (
+    DispositionDecision,
     DispositionDocument,
     GateAnchor,
     GateInvariantError,
@@ -142,15 +143,6 @@ class _InheritanceSourceError(ValueError):
 def _write_json(payload: Any) -> None:
     json.dump(payload, sys.stdout)
     sys.stdout.write("\n")
-
-
-def _operational_error_detail(exc: OSError | subprocess.CalledProcessError | ValueError) -> str:
-    detail = str(exc)
-    if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
-        stderr = str(exc.stderr).strip()
-        if stderr:
-            detail = f"{detail}; stderr: {stderr}"
-    return detail
 
 
 def _empty_review_failure(exc: EmptyReviewDiffError, *, json_output: bool) -> Never:
@@ -861,18 +853,35 @@ async def _gate_pipeline(
     )
 
     if dispositions_path is None:
-        template_path = write_disposition_template(
-            artifacts.run.dir,
-            artifacts.merged,
-            outcome,
-            inheritance=inheritance,
-        )
         has_actionable = any(
             verdict in {Verdict.CONFIRMED, Verdict.UNCERTAIN}
             for verdict in outcome.verdicts.values()
         )
         fully_inherited = inheritance is not None and all(
             matched.tier is InheritanceTier.EXACT_ID for matched in inheritance.values()
+        )
+        if has_actionable and not fully_inherited and run_id is not None:
+            try:
+                existing_verdict = artifacts.run.load_gate_verdict()
+            except StageMissing:
+                existing_verdict = None
+            if existing_verdict is not None and (
+                existing_verdict.findings
+                or "actionable findings require explicit dispositions"
+                not in existing_verdict.failures
+            ):
+                message = (
+                    "verdict_already_completed: "
+                    f"run {artifacts.run.run_id} already has a completed verdict; "
+                    "start a new target run and use --inherit instead"
+                )
+                _error_console.print(message, markup=False)
+                raise typer.Exit(EXIT_USER_ERROR)
+        template_path = write_disposition_template(
+            artifacts.run.dir,
+            artifacts.merged,
+            outcome,
+            inheritance=inheritance,
         )
         if has_actionable and not fully_inherited:
             save_gate_verdict(
@@ -929,13 +938,17 @@ async def _gate_pipeline(
             accepted_ids = {
                 record.finding_id
                 for record in dispositions.dispositions
-                if record.decision.value == "accepted"
+                if record.decision is DispositionDecision.ACCEPTED
             }
             blocker_ids = sorted(
                 group.key
                 for group in artifacts.merged.groups
                 if group.key in accepted_ids and group.severity is Severity.BLOCKER
             )
+            if not blocker_ids:
+                raise GateInvariantError(
+                    "owner authorization required without any accepted blocker IDs"
+                )
             try:
                 actor, permission = github_actor_permission(target.repo)
             except GitHubAuthorizationError as exc:
@@ -943,27 +956,8 @@ async def _gate_pipeline(
                 message = (
                     "accepted_blocker_authorization_operational_failure: "
                     f"run_id={artifacts.run.run_id} "
-                    f"finding_ids={','.join(blocker_ids) or '<none>'} "
+                    f"finding_ids={','.join(blocker_ids)} "
                     f"step={exc.step} actor={actor or '<unknown>'}; {exc.detail}"
-                )
-                save_gate_verdict(
-                    artifacts.run.dir,
-                    _gate_failure_verdict(
-                        artifacts,
-                        message,
-                        inheritance_summary=inheritance_summary,
-                        actor=actor,
-                    ),
-                )
-                _error_console.print(message, markup=False)
-                raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
-            except (OSError, subprocess.CalledProcessError, ValueError) as exc:
-                message = (
-                    "accepted_blocker_authorization_operational_failure: "
-                    f"run_id={artifacts.run.run_id} "
-                    f"finding_ids={','.join(blocker_ids) or '<none>'} "
-                    f"step=authorization_lookup actor={actor or '<unknown>'}; "
-                    f"{_operational_error_detail(exc)}"
                 )
                 save_gate_verdict(
                     artifacts.run.dir,
