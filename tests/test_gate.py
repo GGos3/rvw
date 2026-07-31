@@ -505,6 +505,33 @@ def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None
     assert moved.blank_reason == "finding_id_changed"
 
 
+def test_inheritance_matcher_rejects_exact_id_with_different_identity_pair() -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+
+    matched = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id=group.key,
+                rule_id="rule/forged",
+                file=group.file,
+                hunk_sha256="1" * 64,
+                body_sha256=BODY_SHA256,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+        current_hunk_sha256={group.key: "1" * 64},
+    )[group.key]
+
+    assert matched.tier is None
+    assert matched.decision is DispositionDecision.MUST_FIX
+    assert matched.reason == ""
+    assert matched.inherited_from is None
+    assert matched.blank_reason is InheritanceBlankReason.IDENTITY_MISMATCH
+
+
 def test_inheritance_matcher_demotes_exact_id_when_severity_changes() -> None:
     merged, outcome = _one_finding_merge()
     group = merged.groups[0]
@@ -1219,6 +1246,24 @@ def test_authorization_diagnostic_redacts_base64url_credentials() -> None:
 
     assert credential not in redacted
     assert redacted == "credential=[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "credential"),
+    [
+        ("Authori\x00zation: Basic secret", "Basic secret"),
+        ("gh\x01p_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "ghp_AAAAAAAAAA"),
+    ],
+)
+def test_authorization_diagnostic_deletes_controls_before_redacting_credentials(
+    diagnostic: str,
+    credential: str,
+) -> None:
+    redacted = _redact_subprocess_diagnostic(diagnostic)
+
+    assert credential not in redacted
+    assert "[REDACTED]" in redacted
+    assert all(ord(character) >= 32 for character in redacted)
 
 
 @pytest.mark.parametrize(

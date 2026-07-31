@@ -82,7 +82,13 @@ def parse_hunks(diff: str) -> list[Hunk]:
         active_complete = False
         previous_counted_line = False
 
-    for raw_line in diff.splitlines(keepends=True):
+    raw_lines = diff.split("\n")
+    for index, raw_line in enumerate(raw_lines):
+        if index == len(raw_lines) - 1:
+            if not raw_line:
+                break
+        else:
+            raw_line += "\n"
         line = raw_line.rstrip("\r\n")
         if active is not None and active_complete:
             if line.startswith("\\") and previous_counted_line:

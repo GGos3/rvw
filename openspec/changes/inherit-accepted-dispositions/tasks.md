@@ -112,3 +112,28 @@
 
 - [x] 24.1 Synchronize the delta and main pr-gate spec/context for completed inheritance sources, JSON-authoritative republishing, and publication status artifacts.
 - [x] 24.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.
+
+## 25. Round-12 blocker regression coverage
+
+- [x] 25.1 Add failing regressions for control-character deletion before credential redaction.
+- [x] 25.2 Add failing regressions for no-follow append-only publication status and successful publication counts.
+- [x] 25.3 Add a failing regression for sanitized artifact-derived identity mismatch values.
+- [x] 25.4 Add a failing regression for exact-ID source/current pair inequality.
+- [x] 25.5 Add a failing regression for corrupt completed-verdict resume probes.
+- [x] 25.6 Strengthen publication-only resume coverage to require byte-identical completed verdict evidence.
+- [x] 25.7 Add a failing regression for LF-only hunk parsing with embedded Unicode line separators.
+
+## 26. Round-12 blocker implementation
+
+- [x] 26.1 Delete controls before redaction, then map protected newline placeholders to spaces.
+- [x] 26.2 Persist append-only publication attempts through a pinned no-follow descriptor and include successful publication counts.
+- [x] 26.3 Redact observed artifact-derived identity values before mismatch diagnostics.
+- [x] 26.4 Fail exact-ID pair inequality closed with `identity_mismatch`.
+- [x] 26.5 Translate corrupt verdict artifacts into operational `verdict_artifact_corrupt` errors without rewriting evidence.
+- [x] 26.6 Keep publication-only resume strictly read-render-publish with status-only bookkeeping.
+- [x] 26.7 Parse unified diff text using LF as the only line delimiter.
+
+## 27. Round-12 specification and verification
+
+- [x] 27.1 Synchronize the delta and main pr-gate spec/context for exact identity, corrupt evidence, redaction, LF parsing, and append-only publication status.
+- [x] 27.2 Run focused regressions, every bare repository gate, `openspec validate --specs`, and `openspec validate inherit-accepted-dispositions`.

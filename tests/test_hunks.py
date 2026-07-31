@@ -207,6 +207,17 @@ def test_no_newline_markers_are_canonical_hunk_text() -> None:
     )
 
 
+def test_unicode_line_separator_inside_diff_line_is_not_a_hunk_boundary() -> None:
+    hunk_text = "@@ -0,0 +1,1 @@\n+first\u2028second\n"
+    diff = f"--- /dev/null\n+++ b/generated.txt\n{hunk_text}"
+
+    hunk = parse_hunks(diff)[0]
+
+    assert hunk.added_lines == {1}
+    assert hunk.raw_text == hunk_text
+    assert hunk_sha256_by_id(diff) == {hunk.hunk_id: hashlib.sha256(hunk_text.encode()).hexdigest()}
+
+
 def test_large_hunk_raw_text_is_preserved() -> None:
     lines = [f"+generated line {index}\n" for index in range(20_000)]
     hunk_text = f"@@ -0,0 +1,{len(lines)} @@\n" + "".join(lines)

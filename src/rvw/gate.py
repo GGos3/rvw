@@ -112,6 +112,7 @@ class InheritanceBlankReason(StrEnum):
     DIAGNOSIS_CHANGED = "diagnosis_changed"
     FINDING_ID_CHANGED = "finding_id_changed"
     SEVERITY_CHANGED = "severity_changed"
+    IDENTITY_MISMATCH = "identity_mismatch"
 
 
 class GateFinding(BaseModel):
@@ -398,6 +399,12 @@ def match_inherited_dispositions(
         exact = accepted_by_id.get(group.key)
         demotion_reason: InheritanceBlankReason | None = None
         if exact is not None:
+            if (exact.file, exact.rule_id) != pair:
+                results[group.key] = DispositionInheritance(
+                    finding_id=group.key,
+                    blank_reason=InheritanceBlankReason.IDENTITY_MISMATCH,
+                )
+                continue
             inherited_digest = exact.hunk_sha256
             current_digest = current_digests.get(group.key)
             inherited_body_digest = exact.body_sha256
@@ -748,7 +755,7 @@ def _strip_escaped_control_character(match: re.Match[str]) -> str:
     if unicodedata.category(character) == "Cf":
         return ""
     if _CONTROL_CHARACTERS.fullmatch(character):
-        return " "
+        return ""
     return match.group(0)
 
 
@@ -756,7 +763,7 @@ def _redact_subprocess_diagnostic(value: str) -> str:
     redacted = value.replace("\r\n", "\u2028").replace("\r", "\u2028").replace("\n", "\u2028")
     redacted = _ESCAPED_CONTROL_CHARACTER.sub(_strip_escaped_control_character, redacted)
     redacted = "".join(char for char in redacted if unicodedata.category(char) != "Cf")
-    redacted = _CONTROL_CHARACTERS.sub(" ", redacted).strip()
+    redacted = _CONTROL_CHARACTERS.sub("", redacted).strip()
     redacted = _GITHUB_TOKEN.sub(_REDACTED, redacted)
     redacted = _AUTHORIZATION_HEADER.sub(rf"\1{_REDACTED}", redacted)
     redacted = _BEARER_VALUE.sub(f"Bearer {_REDACTED}", redacted)

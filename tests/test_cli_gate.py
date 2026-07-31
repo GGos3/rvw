@@ -25,6 +25,7 @@ from rvw.gate import (
     save_gate_verdict,
 )
 from rvw.merge import merge
+from rvw.publish import PublishResult
 from rvw.schema import Severity, Tier, Verdict
 from rvw.store import RunHandle, RunStore
 from rvw.target import ResolvedTarget
@@ -613,6 +614,31 @@ def test_inheritance_target_validation_diagnostic_is_bounded_and_redacted(
     assert len(detail) <= 600
 
 
+def test_inheritance_target_mismatch_redacts_observed_repo_controls_and_token(
+    tmp_path: Path,
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current)
+    credential = "github_pat_11AA22BB33CC44DD55EE66FF"
+    observed = "github_\x00pat_11AA22BB33CC44DD55EE66FF/repo"
+    source.save_target(target().model_copy(update={"repo": observed}))
+
+    with pytest.raises(ValueError) as caught:
+        cli_module._load_inherited_dispositions(
+            source.run_id,
+            current_target=current.target,
+            out_root=out_root,
+        )
+
+    detail = str(caught.value)
+    assert "inherit_target_mismatch" in detail
+    assert "field=repo" in detail
+    assert credential not in detail
+    assert "\x00" not in detail
+    assert "[REDACTED]" in detail
+
+
 def test_inheritance_source_repo_identity_is_case_insensitive(tmp_path: Path) -> None:
     out_root = tmp_path / "runs"
     current = prepared_artifacts(out_root, actionable=True)
@@ -855,6 +881,29 @@ def test_gate_resume_without_dispositions_preserves_completed_verdict(
     assert markdown_path.read_bytes() == original_markdown
 
 
+def test_gate_resume_rejects_truncated_verdict_as_corrupt_without_rewriting(
+    tmp_path: Path,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    save_gate_plan(
+        artifacts.run.dir,
+        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+    )
+    verdict_path = artifacts.run.dir / "gate-verdict.json"
+    corrupt_bytes = b'{"run_id":'
+    verdict_path.write_bytes(corrupt_bytes)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 3
+    assert "verdict_artifact_corrupt" in result.stderr
+    assert verdict_path.read_bytes() == corrupt_bytes
+
+
 def test_gate_completed_dry_run_can_be_republished_with_execute(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -870,10 +919,15 @@ def test_gate_completed_dry_run_can_be_republished_with_execute(
     verdict_bytes = (artifacts.run.dir / "gate-verdict.json").read_bytes()
     published: list[str] = []
 
-    def successful_publish(**kwargs: object) -> object:
+    def successful_publish(**kwargs: object) -> PublishResult:
         assert kwargs["execute"] is True
         published.append(str(kwargs["report_md"]))
-        return type("Result", (), {"review_url": "https://example.test/review/1"})()
+        return PublishResult(
+            review_url="https://example.test/review/1",
+            inline_count=2,
+            body_fallback_count=1,
+            state="commented",
+        )
 
     monkeypatch.setattr(cli_module, "publish_review", successful_publish)
     second = runner.invoke(
@@ -884,13 +938,62 @@ def test_gate_completed_dry_run_can_be_republished_with_execute(
     assert second.exit_code == 0, second.stderr
     assert published == [render_gate_verdict(artifacts.run.load_gate_verdict())]
     assert (artifacts.run.dir / "gate-verdict.json").read_bytes() == verdict_bytes
-    publish_status = json.loads(
+    publish_attempts = json.loads(
         (artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8")
     )
+    assert len(publish_attempts) == 2
+    publish_status = publish_attempts[-1]
     assert publish_status["mode"] == "execute"
     assert publish_status["ok"] is True
     assert publish_status["detail"] is None
     assert publish_status["republish"] is True
+    assert publish_status["inline_count"] == 2
+    assert publish_status["body_fallback_count"] == 1
+
+
+def test_gate_completed_republish_skips_gate_revalidation_and_preserves_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_root = tmp_path / "runs"
+    artifacts = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, artifacts)
+    first = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+    assert first.exit_code == 0, first.stderr
+    json_path = artifacts.run.dir / "gate-verdict.json"
+    markdown_path = artifacts.run.dir / "gate-verdict.md"
+    original_json = json_path.read_bytes()
+    original_markdown = markdown_path.read_bytes()
+    published: list[str] = []
+
+    monkeypatch.setattr(
+        cli_module,
+        "query_pull_request",
+        lambda repo, number: current_state(head_sha="c" * 40),
+    )
+
+    def successful_publish(**kwargs: object) -> PublishResult:
+        published.append(str(kwargs["report_md"]))
+        return PublishResult(
+            review_url="https://example.test/review/immutable",
+            inline_count=0,
+            body_fallback_count=0,
+            state="commented",
+        )
+
+    monkeypatch.setattr(cli_module, "publish_review", successful_publish)
+    second = runner.invoke(
+        cli_module.app,
+        ["gate", "--run", artifacts.run.run_id, "--out", str(out_root), "--execute"],
+    )
+
+    assert second.exit_code == 0, second.stderr
+    assert published == [render_gate_verdict(artifacts.run.load_gate_verdict())]
+    assert json_path.read_bytes() == original_json
+    assert markdown_path.read_bytes() == original_markdown
 
 
 @pytest.mark.parametrize("cache_state", ["missing", "stale"])
@@ -914,9 +1017,14 @@ def test_gate_completed_republish_renders_from_json_when_markdown_cache_is_unusa
         markdown_path.write_text("# stale pause artifact\n", encoding="utf-8")
     published: list[str] = []
 
-    def successful_publish(**kwargs: object) -> object:
+    def successful_publish(**kwargs: object) -> PublishResult:
         published.append(str(kwargs["report_md"]))
-        return type("Result", (), {"review_url": "https://example.test/review/cache"})()
+        return PublishResult(
+            review_url="https://example.test/review/cache",
+            inline_count=0,
+            body_fallback_count=0,
+            state="commented",
+        )
 
     monkeypatch.setattr(cli_module, "publish_review", successful_publish)
     second = runner.invoke(
@@ -963,7 +1071,7 @@ def test_gate_completed_republish_rejects_symlinked_markdown_without_publishing(
     assert "never publish me" not in (second.stdout + second.stderr)
 
 
-def test_gate_successful_dry_run_writes_publish_status(
+def test_gate_successful_dry_run_writes_publish_status_with_counts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -977,12 +1085,65 @@ def test_gate_successful_dry_run_writes_publish_status(
     )
 
     assert result.exit_code == 0, result.stderr
-    status = json.loads((artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8"))
+    attempts = json.loads((artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8"))
+    assert len(attempts) == 1
+    status = attempts[0]
     assert status["attempted_at"]
     assert status["mode"] == "dry_run"
     assert status["ok"] is True
     assert status["detail"] is None
     assert status["republish"] is False
+    assert status["inline_count"] == 0
+    assert status["body_fallback_count"] == 0
+
+
+def test_save_publish_status_migrates_legacy_object_and_appends(tmp_path: Path) -> None:
+    run = RunStore(tmp_path / "runs").create(target())
+    legacy = {
+        "attempted_at": "2026-07-31T00:00:00+00:00",
+        "mode": "execute",
+        "ok": False,
+        "detail": "legacy failure",
+        "republish": False,
+    }
+    (run.dir / "publish-status.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    cli_module._save_publish_status(
+        run,
+        attempted_at="2026-07-31T00:01:00+00:00",
+        execute=True,
+        ok=True,
+        detail=None,
+        republish=True,
+        inline_count=0,
+        body_fallback_count=0,
+    )
+
+    attempts = json.loads((run.dir / "publish-status.json").read_text(encoding="utf-8"))
+    assert attempts[0] == legacy
+    assert attempts[1]["ok"] is True
+    assert attempts[1]["republish"] is True
+
+
+def test_save_publish_status_rejects_symlinked_artifact(tmp_path: Path) -> None:
+    run = RunStore(tmp_path / "runs").create(target())
+    victim = tmp_path / "victim.json"
+    victim.write_text("preserve me", encoding="utf-8")
+    (run.dir / "publish-status.json").symlink_to(victim)
+
+    with pytest.raises((OSError, ValueError)):
+        cli_module._save_publish_status(
+            run,
+            attempted_at="2026-07-31T00:00:00+00:00",
+            execute=False,
+            ok=True,
+            detail=None,
+            republish=False,
+            inline_count=0,
+            body_fallback_count=0,
+        )
+
+    assert victim.read_text(encoding="utf-8") == "preserve me"
 
 
 def test_gate_failed_publish_writes_redacted_publish_status(
@@ -1005,7 +1166,9 @@ def test_gate_failed_publish_writes_redacted_publish_status(
     )
 
     assert result.exit_code == 3
-    status = json.loads((artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8"))
+    attempts = json.loads((artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8"))
+    assert len(attempts) == 1
+    status = attempts[0]
     assert status["attempted_at"]
     assert status["mode"] == "execute"
     assert status["ok"] is False
@@ -1024,11 +1187,16 @@ def test_gate_transient_publish_failure_retries_existing_completed_verdict(
     patch_target_dependencies(monkeypatch, artifacts)
     calls: list[str] = []
 
-    def flaky_publish(**kwargs: object) -> object:
+    def flaky_publish(**kwargs: object) -> PublishResult:
         calls.append(str(kwargs["report_md"]))
         if len(calls) == 1:
             raise cli_module.PublishError("transient publish failure")
-        return type("Result", (), {"review_url": "https://example.test/review/2"})()
+        return PublishResult(
+            review_url="https://example.test/review/2",
+            inline_count=1,
+            body_fallback_count=0,
+            state="commented",
+        )
 
     monkeypatch.setattr(cli_module, "publish_review", flaky_publish)
     first = runner.invoke(
@@ -1047,6 +1215,8 @@ def test_gate_transient_publish_failure_retries_existing_completed_verdict(
     assert len(calls) == 2
     assert calls[0] == calls[1]
     assert (artifacts.run.dir / "gate-verdict.json").read_bytes() == verdict_bytes
+    attempts = json.loads((artifacts.run.dir / "publish-status.json").read_text(encoding="utf-8"))
+    assert [attempt["ok"] for attempt in attempts] == [False, True]
 
 
 def test_gate_completed_verdict_rejects_disposition_regeneration_with_execute(

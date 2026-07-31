@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Never, cast
 
 import typer
+from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
 
@@ -618,7 +620,9 @@ def _load_inherited_dispositions(
     if source_target.repo.casefold() != current_target.repo.casefold():
         raise _InheritanceSourceError(
             "inherit_target_mismatch",
-            f"field=repo expected={current_target.repo} observed={source_target.repo}",
+            "field=repo "
+            f"expected={current_target.repo} "
+            f"observed={_redact_subprocess_diagnostic(source_target.repo)}",
         )
     if source_target.pr_number != current_target.pr_number:
         raise _InheritanceSourceError(
@@ -655,12 +659,16 @@ def _load_inherited_dispositions(
     if verdict.run_id != run_id:
         raise _InheritanceSourceError(
             "inherit_verdict_invalid",
-            f"field=run_id expected={run_id} observed={verdict.run_id}",
+            "field=run_id "
+            f"expected={run_id} "
+            f"observed={_redact_subprocess_diagnostic(verdict.run_id)}",
         )
     if verdict.repo.casefold() != source_target.repo.casefold():
         raise _InheritanceSourceError(
             "inherit_verdict_invalid",
-            f"field=repo expected={source_target.repo} observed={verdict.repo}",
+            "field=repo "
+            f"expected={current_target.repo} "
+            f"observed={_redact_subprocess_diagnostic(verdict.repo)}",
         )
     if verdict.pr_number != source_target.pr_number:
         raise _InheritanceSourceError(
@@ -851,6 +859,14 @@ async def _gate_pipeline(
             existing_verdict = artifacts.run.load_gate_verdict()
         except StageMissing:
             existing_verdict = None
+        except (json.JSONDecodeError, ValidationError) as exc:
+            message = (
+                "verdict_artifact_corrupt: "
+                f"run {artifacts.run.run_id} has a damaged gate-verdict.json; "
+                "preserve the artifact and repair or restore it before resuming"
+            )
+            _error_console.print(message, markup=False)
+            raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
         if existing_verdict is not None and existing_verdict.kind == "completed":
             if execute and dispositions_path is None and inherit_run_id is None:
                 republish_verdict = existing_verdict
@@ -867,6 +883,41 @@ async def _gate_pipeline(
     if target.kind != "pr" or target.pr_number is None or target.base_sha is None:
         _error_console.print("rvw gate requires persisted PR artifacts", markup=False)
         raise typer.Exit(EXIT_USER_ERROR)
+    if republish_verdict is not None:
+        if artifacts.outcome is None:
+            message = (
+                "verdict_artifact_corrupt: "
+                f"run {artifacts.run.run_id} has no adjudication outcome for publication"
+            )
+            _error_console.print(message, markup=False)
+            raise typer.Exit(EXIT_SYSTEM_ERROR)
+        verdict_path = artifacts.run.dir / "gate-verdict.json"
+        rendered_markdown = render_gate_verdict(republish_verdict)
+        try:
+            cached_markdown = artifacts.run._load_contained_text(
+                "gate-verdict.md",
+                "gate-verdict-markdown",
+            )
+        except StageMissing:
+            cached_markdown = None
+        except (InvalidRunId, OSError, UnicodeError) as exc:
+            _error_console.print(str(exc), markup=False)
+            raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+        verdict_markdown = (
+            cached_markdown if cached_markdown == rendered_markdown else rendered_markdown
+        )
+        _publish_gate_verdict(
+            artifacts=artifacts,
+            target=target,
+            outcome=artifacts.outcome,
+            verdict=republish_verdict,
+            verdict_path=verdict_path,
+            verdict_markdown=verdict_markdown,
+            execute=True,
+            republish=True,
+            json_output=json_output,
+        )
+        return
     if inherit_run_id is not None and inherited_verdict is None:
         try:
             inherited_verdict = _load_inherited_dispositions(
@@ -896,35 +947,6 @@ async def _gate_pipeline(
     if artifacts.outcome is None:
         _gate_invariant_failure(artifacts, GateInvariantError("adjudication outcome is required"))
     outcome = cast(AdjudicationOutcome, artifacts.outcome)
-
-    if republish_verdict is not None:
-        verdict_path = artifacts.run.dir / "gate-verdict.json"
-        rendered_markdown = render_gate_verdict(republish_verdict)
-        try:
-            cached_markdown = artifacts.run._load_contained_text(
-                "gate-verdict.md",
-                "gate-verdict-markdown",
-            )
-        except StageMissing:
-            cached_markdown = None
-        except (InvalidRunId, OSError, UnicodeError) as exc:
-            _error_console.print(str(exc), markup=False)
-            raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
-        verdict_markdown = (
-            cached_markdown if cached_markdown == rendered_markdown else rendered_markdown
-        )
-        _publish_gate_verdict(
-            artifacts=artifacts,
-            target=target,
-            outcome=outcome,
-            verdict=republish_verdict,
-            verdict_path=verdict_path,
-            verdict_markdown=verdict_markdown,
-            execute=True,
-            republish=True,
-            json_output=json_output,
-        )
-        return
 
     try:
         hunk_digests = hunk_sha256_by_id(target.diff)
@@ -1105,6 +1127,8 @@ def _save_publish_status(
     ok: bool,
     detail: str | None,
     republish: bool,
+    inline_count: int | None,
+    body_fallback_count: int | None,
 ) -> None:
     status = {
         "attempted_at": attempted_at,
@@ -1113,10 +1137,38 @@ def _save_publish_status(
         "detail": detail,
         "republish": republish,
     }
-    (run.dir / "publish-status.json").write_text(
-        f"{json.dumps(status, ensure_ascii=False, indent=2, sort_keys=True)}\n",
-        encoding="utf-8",
+    if ok:
+        if inline_count is None or body_fallback_count is None:
+            raise ValueError("successful publication status requires publication counts")
+        status["inline_count"] = inline_count
+        status["body_fallback_count"] = body_fallback_count
+    try:
+        existing = run._load_contained_json("publish-status.json", "publish-status")
+    except StageMissing:
+        attempts: list[object] = []
+    else:
+        if isinstance(existing, list):
+            attempts = existing
+        elif isinstance(existing, dict):
+            attempts = [existing]
+        else:
+            raise ValueError("publish-status.json must contain an object or array")
+    attempts.append(status)
+
+    fd = os.open(
+        "publish-status.json",
+        os.O_WRONLY | os.O_NOFOLLOW | os.O_CREAT | os.O_TRUNC,
+        0o600,
+        dir_fd=run._pinned_dir_fd(),
     )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as artifact:
+            fd = -1
+            json.dump(attempts, artifact, ensure_ascii=False, indent=2, sort_keys=True)
+            artifact.write("\n")
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _publish_gate_verdict(
@@ -1153,6 +1205,8 @@ def _publish_gate_verdict(
             ok=False,
             detail=detail,
             republish=republish,
+            inline_count=None,
+            body_fallback_count=None,
         )
         _error_console.print(detail, markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
@@ -1163,6 +1217,8 @@ def _publish_gate_verdict(
         ok=True,
         detail=None,
         republish=republish,
+        inline_count=publication.inline_count,
+        body_fallback_count=publication.body_fallback_count,
     )
     payload = {
         "run_id": artifacts.run.run_id,
