@@ -300,6 +300,7 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
                 "valid": True,
                 "findings": 0,
                 "invalid_reason": None,
+                "diagnostic": None,
             }
             for replica in (1, 2)
         ],
@@ -316,6 +317,7 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
                 "valid": False,
                 "findings": 0,
                 "invalid_reason": "scripted invalid",
+                "diagnostic": None,
             }
             for replica in (1, 2)
         ],

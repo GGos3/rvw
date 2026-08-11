@@ -13,7 +13,7 @@ from typing import Any, cast
 from pydantic import BaseModel, ValidationError
 
 from rvw.lane import Lane
-from rvw.runtimes import RunResult, RunStatus
+from rvw.runtimes import RunDiagnostic, RunResult, RunStatus
 from rvw.schema import RuntimeLaneOutput
 
 _REPLICA_DIRECTORY = re.compile(r"r([1-9][0-9]*)")
@@ -84,6 +84,7 @@ class CodexRuntime:
                 invalid_reason=None,
                 wall_seconds=result.wall_seconds,
                 artifact_dir=result.artifact_dir,
+                diagnostic=result.diagnostic,
             )
         return RunResult(
             lane_id=lane.id,
@@ -93,6 +94,7 @@ class CodexRuntime:
             invalid_reason=result.invalid_reason,
             wall_seconds=result.wall_seconds,
             artifact_dir=result.artifact_dir,
+            diagnostic=result.diagnostic,
         )
 
     async def execute_raw(
@@ -153,6 +155,7 @@ class CodexRuntime:
                 run_id=run_id,
                 replica=replica,
                 reason=f"spawn_error:{type(error).__name__}",
+                detail=f"{type(error).__name__}: {error}",
                 started=started,
                 run_dir=run_dir,
             )
@@ -162,14 +165,25 @@ class CodexRuntime:
                 run_id=run_id,
                 replica=replica,
                 reason=f"exit_nonzero:{exit_code}",
+                exit_code=exit_code,
                 started=started,
                 run_dir=run_dir,
             )
-        if not output_path.is_file() or output_path.stat().st_size == 0:
+        if not output_path.is_file():
             return self._invalid_result(
                 run_id=run_id,
                 replica=replica,
-                reason="missing_artifact",
+                reason="missing",
+                exit_code=exit_code,
+                started=started,
+                run_dir=run_dir,
+            )
+        if output_path.stat().st_size == 0:
+            return self._invalid_result(
+                run_id=run_id,
+                replica=replica,
+                reason="empty",
+                exit_code=exit_code,
                 started=started,
                 run_dir=run_dir,
             )
@@ -180,7 +194,8 @@ class CodexRuntime:
             return self._invalid_result(
                 run_id=run_id,
                 replica=replica,
-                reason="json_parse_error",
+                reason="unparseable",
+                exit_code=exit_code,
                 started=started,
                 run_dir=run_dir,
             )
@@ -191,7 +206,8 @@ class CodexRuntime:
             return self._invalid_result(
                 run_id=run_id,
                 replica=replica,
-                reason="schema_validation_error",
+                reason="schema-invalid",
+                exit_code=exit_code,
                 started=started,
                 run_dir=run_dir,
             )
@@ -205,6 +221,7 @@ class CodexRuntime:
                 run_id=run_id,
                 replica=replica,
                 reason="no_completion_marker",
+                exit_code=exit_code,
                 started=started,
                 run_dir=run_dir,
             )
@@ -227,7 +244,11 @@ class CodexRuntime:
         reason: str,
         started: float,
         run_dir: Path,
+        exit_code: int | None = None,
+        detail: str | None = None,
     ) -> RunResult[BaseModel]:
+        log_path = run_dir / "run.log"
+        output_path = run_dir / "out.json"
         return RunResult(
             lane_id=run_id,
             replica=replica,
@@ -236,6 +257,14 @@ class CodexRuntime:
             invalid_reason=reason,
             wall_seconds=time.perf_counter() - started,
             artifact_dir=run_dir,
+            diagnostic=RunDiagnostic(
+                exit_code=exit_code,
+                detail=detail,
+                log_path=str(log_path),
+                log_bytes=log_path.stat().st_size if log_path.is_file() else None,
+                output_path=str(output_path),
+                output_bytes=output_path.stat().st_size if output_path.is_file() else None,
+            ),
         )
 
 

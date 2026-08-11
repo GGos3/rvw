@@ -41,7 +41,11 @@ def outcome(
 ) -> AdjudicationOutcome:
     return AdjudicationOutcome(
         verdicts=verdicts,
-        reasons={},
+        reasons={
+            key: "requires manual verification"
+            for key, verdict in verdicts.items()
+            if verdict is Verdict.UNCERTAIN
+        },
         evidence={},
         replica_votes={},
         unresolved=unresolved or [],

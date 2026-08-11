@@ -8,7 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from rvw.lane import Lane
 from rvw.schema import RuntimeLaneOutput
@@ -17,6 +17,19 @@ from rvw.schema import RuntimeLaneOutput
 class RunStatus(StrEnum):
     VALID = "valid"
     INVALID = "invalid"
+
+
+class RunDiagnostic(BaseModel):
+    """Inspectable process and artifact facts retained for an invalid execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    exit_code: int | None = None
+    detail: str | None = None
+    log_path: str | None = None
+    log_bytes: int | None = Field(default=None, ge=0)
+    output_path: str | None = None
+    output_bytes: int | None = Field(default=None, ge=0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +42,7 @@ class RunResult[OutputT: BaseModel]:
     wall_seconds: float
     artifact_dir: Path
     chunk: int = 1
+    diagnostic: RunDiagnostic | None = None
 
     def __post_init__(self) -> None:
         if self.replica < 1:
@@ -68,4 +82,4 @@ class Runtime(Protocol):
     ) -> RunResult[BaseModel]: ...
 
 
-__all__: list[str] = ["RunResult", "RunStatus", "Runtime"]
+__all__: list[str] = ["RunDiagnostic", "RunResult", "RunStatus", "Runtime"]

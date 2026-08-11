@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
 from rvw.merge import CollapseGroup, MergeResult
 from rvw.runtimes import RunResult, RunStatus, Runtime
 from rvw.schema import RuntimeAdjudication, RuntimeAdjudicationItem, Verdict
@@ -93,14 +95,55 @@ def build_adjudication_prompt(groups: Sequence[CollapseGroup], *, diff: str, exp
     return "\n\n".join(parts)
 
 
-@dataclass(frozen=True)
-class AdjudicationOutcome:
+class AdjudicationOutcome(BaseModel):
+    """Strict persisted adjudication outcome."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     verdicts: dict[str, Verdict]
     reasons: dict[str, str]
     evidence: dict[str, str]
     replica_votes: dict[str, list[Verdict]]
     unresolved: list[str]
-    coerced_rejections: int
+    coerced_rejections: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def _uncertain_verdicts_require_reasons(self) -> AdjudicationOutcome:
+        for key, verdict in self.verdicts.items():
+            if verdict is Verdict.UNCERTAIN and not self.reasons.get(key, "").strip():
+                raise ValueError(f"UNCERTAIN verdict {key!r} requires a non-empty reason")
+        return self
+
+
+class AdjudicationAttempt(BaseModel):
+    """One invalid runtime attempt retained in an infrastructure error."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    wave: str
+    replica: int = Field(ge=1)
+    reason: str
+    artifact_dir: str
+    exit_code: int | None = None
+    detail: str | None = None
+    log_path: str | None = None
+    log_bytes: int | None = Field(default=None, ge=0)
+    output_path: str | None = None
+    output_bytes: int | None = Field(default=None, ge=0)
+
+
+class AdjudicationInfrastructureError(RuntimeError):
+    """A required adjudication pass exhausted its retry without valid output."""
+
+    def __init__(self, pass_name: str, attempts: Sequence[AdjudicationAttempt]) -> None:
+        self.pass_name = pass_name
+        self.attempts = list(attempts)
+        self.outcome = None
+        reasons = ", ".join(sorted({attempt.reason for attempt in attempts}))
+        super().__init__(
+            f"no valid adjudication output for {pass_name} pass after retry"
+            + (f" ({reasons})" if reasons else "")
+        )
 
 
 @dataclass(frozen=True)
@@ -119,6 +162,40 @@ class _BatchVote:
     coerced_rejections: int
 
 
+def _adjudication_attempt(result: RunResult[Any]) -> AdjudicationAttempt:
+    diagnostic = result.diagnostic
+    log_path = result.artifact_dir / "run.log"
+    output_path = result.artifact_dir / "out.json"
+    return AdjudicationAttempt(
+        wave=result.artifact_dir.parent.name,
+        replica=result.replica,
+        reason=result.invalid_reason or "unknown",
+        artifact_dir=str(result.artifact_dir),
+        exit_code=diagnostic.exit_code if diagnostic is not None else None,
+        detail=diagnostic.detail if diagnostic is not None else None,
+        log_path=(
+            diagnostic.log_path
+            if diagnostic is not None and diagnostic.log_path is not None
+            else str(log_path)
+        ),
+        log_bytes=(
+            diagnostic.log_bytes
+            if diagnostic is not None
+            else (log_path.stat().st_size if log_path.is_file() else None)
+        ),
+        output_path=(
+            diagnostic.output_path
+            if diagnostic is not None and diagnostic.output_path is not None
+            else str(output_path)
+        ),
+        output_bytes=(
+            diagnostic.output_bytes
+            if diagnostic is not None
+            else (output_path.stat().st_size if output_path.is_file() else None)
+        ),
+    )
+
+
 def _vote_batch(groups: Sequence[CollapseGroup], results: Sequence[RunResult[Any]]) -> _BatchVote:
     valid_outputs = [
         cast(RuntimeAdjudication, result.output)
@@ -134,15 +211,17 @@ def _vote_batch(groups: Sequence[CollapseGroup], results: Sequence[RunResult[Any
         for group in groups:
             adjudication_item = by_key.get(group.key)
             if adjudication_item is None:
-                votes_by_key[group.key].append(_Vote(Verdict.UNCERTAIN, "", ""))
+                votes_by_key[group.key].append(
+                    _Vote(Verdict.UNCERTAIN, "adjudicator omitted this candidate", "")
+                )
                 continue
             verdict = adjudication_item.verdict
+            reason = adjudication_item.reason
             if verdict is Verdict.REJECTED and not adjudication_item.evidence.strip():
                 verdict = Verdict.UNCERTAIN
+                reason = "REJECTED vote lacked required evidence"
                 coerced_rejections += 1
-            votes_by_key[group.key].append(
-                _Vote(verdict, adjudication_item.reason, adjudication_item.evidence)
-            )
+            votes_by_key[group.key].append(_Vote(verdict, reason, adjudication_item.evidence))
 
     verdicts: dict[str, Verdict] = {}
     reasons: dict[str, str] = {}
@@ -159,7 +238,10 @@ def _vote_batch(groups: Sequence[CollapseGroup], results: Sequence[RunResult[Any
                 break
         verdicts[group.key] = verdict
         supporting_vote = next((vote for vote in group_votes if vote.verdict is verdict), None)
-        reasons[group.key] = supporting_vote.reason if supporting_vote is not None else ""
+        if verdict is Verdict.UNCERTAIN and supporting_vote is None:
+            reasons[group.key] = "no strict majority across valid adjudication replicas"
+        else:
+            reasons[group.key] = supporting_vote.reason if supporting_vote is not None else ""
         evidence[group.key] = supporting_vote.evidence if supporting_vote is not None else ""
 
     return _BatchVote(
@@ -191,7 +273,14 @@ async def adjudicate(
     if concurrency < 1:
         raise ValueError("concurrency must be at least 1")
     if not merged.groups:
-        return AdjudicationOutcome({}, {}, {}, {}, [], 0)
+        return AdjudicationOutcome(
+            verdicts={},
+            reasons={},
+            evidence={},
+            replica_votes={},
+            unresolved=[],
+            coerced_rejections=0,
+        )
 
     semaphore = asyncio.Semaphore(concurrency)
 
@@ -224,12 +313,16 @@ async def adjudicate(
     ) -> list[RunResult[Any]]:
         results = await execute_wave(groups, expanded=expanded, label=label, deadline=deadline)
         if all(result.status is RunStatus.INVALID for result in results):
-            return await execute_wave(
+            retry_results = await execute_wave(
                 groups,
                 expanded=expanded,
                 label=f"{label}-retry",
                 deadline=deadline,
             )
+            if all(result.status is RunStatus.INVALID for result in retry_results):
+                attempts = [_adjudication_attempt(result) for result in [*results, *retry_results]]
+                raise AdjudicationInfrastructureError(label, attempts)
+            return retry_results
         return results
 
     initial_results = await execute_pass(
@@ -275,6 +368,8 @@ async def adjudicate(
 
 
 __all__ = [
+    "AdjudicationAttempt",
+    "AdjudicationInfrastructureError",
     "AdjudicationOutcome",
     "adjudicate",
     "adjudication_schema",

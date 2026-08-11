@@ -122,7 +122,32 @@ async def test_missing_output_artifact_is_invalid(
     result = await execute_fixture(lane, run_dir)
 
     assert result.status is RunStatus.INVALID
-    assert result.invalid_reason == "missing_artifact"
+    assert result.invalid_reason == "missing"
+
+
+async def test_empty_output_artifact_is_distinct_from_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "r1"
+
+    async def fake_spawn(
+        cmd: list[str], stdin_text: str, log_path: Path, *, cwd: Path | None = None
+    ) -> int:
+        del cwd, cmd, stdin_text
+        log_path.write_text("", encoding="utf-8")
+        (run_dir / "out.json").write_bytes(b"")
+        return 0
+
+    monkeypatch.setattr(codex_module, "_spawn", fake_spawn)
+
+    result = await execute_fixture(lane, run_dir)
+
+    assert result.status is RunStatus.INVALID
+    assert result.invalid_reason == "empty"
+    assert result.output is None
+    assert result.diagnostic is not None
+    assert result.diagnostic.log_bytes == 0
 
 
 async def test_malformed_json_is_invalid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -143,7 +168,7 @@ async def test_malformed_json_is_invalid(monkeypatch: pytest.MonkeyPatch, tmp_pa
     result = await execute_fixture(lane, run_dir)
 
     assert result.status is RunStatus.INVALID
-    assert result.invalid_reason == "json_parse_error"
+    assert result.invalid_reason == "unparseable"
 
 
 async def test_out_of_enum_rule_id_is_invalid(
@@ -168,7 +193,7 @@ async def test_out_of_enum_rule_id_is_invalid(
     result = await execute_fixture(lane, run_dir)
 
     assert result.status is RunStatus.INVALID
-    assert result.invalid_reason == "schema_validation_error"
+    assert result.invalid_reason == "schema-invalid"
 
 
 async def test_missing_completion_marker_is_invalid(

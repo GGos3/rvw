@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 from typer.testing import CliRunner, Result
 
 import rvw.cli as cli_module
 import rvw.publish as publish_module
-from rvw.adjudicate import AdjudicationOutcome
+from rvw.adjudicate import (
+    AdjudicationAttempt,
+    AdjudicationInfrastructureError,
+    AdjudicationOutcome,
+)
 from rvw.lane import Lane
 from rvw.merge import MergeResult
 from rvw.runtimes import RunResult, RunStatus
@@ -181,9 +186,19 @@ def test_review_end_to_end_writes_all_stages_and_json_shape(
     result, payload = invoke_review(out_root, registry_root, "--repo-dir", str(repo_dir), "--json")
 
     assert result.exit_code == 0, result.stdout
-    assert set(payload) == {"run_id", "report_path", "verdict_counts", "coverage_totals"}
+    assert set(payload) == {
+        "run_id",
+        "report_path",
+        "status",
+        "failed_lanes",
+        "verdict_counts",
+        "coverage_totals",
+        "error",
+        "build",
+    }
     run_dir = out_root / str(payload["run_id"])
     assert {path.name for path in run_dir.iterdir()} >= {
+        "run.json",
         "target.json",
         "discover.json",
         "merge.json",
@@ -197,7 +212,179 @@ def test_review_end_to_end_writes_all_stages_and_json_shape(
         "UNCERTAIN": 0,
     }
     assert payload["coverage_totals"] == {"dispatched": 1, "valid": 1, "findings": 1}
+    assert payload["status"] == "complete"
+    assert payload["failed_lanes"] == []
+    assert payload["error"] is None
+    assert cast(dict[str, object], payload["build"])["build_id"]
     assert "## 확정 발견 (CONFIRMED)" in (run_dir / "report.md").read_text()
+
+
+def test_review_surfaces_failed_lane_as_degraded_partial_result(
+    tmp_path: Path,
+    registry_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    layers = registry_root / "layers.yaml"
+    layers.write_text(
+        """layers:
+  - id: base
+    tier: base
+    lanes: [test-lane, failed-lane]
+""",
+        encoding="utf-8",
+    )
+    (registry_root / "lanes" / "base" / "failed-lane.md").write_text(
+        """---
+lane: failed-lane
+tier: base
+cost: light
+rules:
+  - failed/rule
+---
+
+# failed lane
+""",
+        encoding="utf-8",
+    )
+
+    class PartialRuntime(FakeRuntime):
+        async def execute(
+            self,
+            *,
+            lane: Lane,
+            prompt: str,
+            run_dir: Path,
+            deadline_seconds: int,
+        ) -> RunResult[RuntimeLaneOutput]:
+            if lane.id == "test-lane":
+                return await super().execute(
+                    lane=lane,
+                    prompt=prompt,
+                    run_dir=run_dir,
+                    deadline_seconds=deadline_seconds,
+                )
+            return RunResult(
+                lane_id=lane.id,
+                replica=1,
+                status=RunStatus.INVALID,
+                output=None,
+                invalid_reason="missing",
+                wall_seconds=0.01,
+                artifact_dir=run_dir,
+            )
+
+    def fake_resolve_target(spec: str, *, cwd: Path) -> ResolvedTarget:
+        del spec, cwd
+        return pr_target()
+
+    async def fake_adjudicate(merged: MergeResult, **kwargs: object) -> AdjudicationOutcome:
+        del kwargs
+        return AdjudicationOutcome(
+            verdicts={group.key: Verdict.CONFIRMED for group in merged.groups},
+            reasons={group.key: "verified" for group in merged.groups},
+            evidence={group.key: "new" for group in merged.groups},
+            replica_votes={group.key: [Verdict.CONFIRMED] for group in merged.groups},
+            unresolved=[],
+            coerced_rejections=0,
+        )
+
+    monkeypatch.setattr(cli_module, "resolve_target", fake_resolve_target)
+    monkeypatch.setattr(cli_module, "CodexRuntime", PartialRuntime)
+    monkeypatch.setattr(cli_module, "adjudicate", fake_adjudicate)
+    out_root = tmp_path / "runs"
+    repo_dir = tmp_path / "checkout"
+    repo_dir.mkdir()
+
+    result, payload = invoke_review(out_root, registry_root, "--repo-dir", str(repo_dir), "--json")
+
+    assert result.exit_code == 0, result.stdout
+    assert payload["status"] == "degraded"
+    assert payload["coverage_totals"] == {"dispatched": 2, "valid": 1, "findings": 1}
+    assert payload["failed_lanes"] == [
+        {
+            "lane_id": "failed-lane",
+            "failures": [
+                {
+                    "replica": 1,
+                    "chunk": 1,
+                    "reason": "missing",
+                    "diagnostic": None,
+                }
+            ],
+        }
+    ]
+    run_dir = out_root / str(payload["run_id"])
+    summary = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "degraded"
+    assert summary["failed_lanes"] == payload["failed_lanes"]
+    report = (run_dir / "report.md").read_text(encoding="utf-8")
+    assert "degraded" in report
+    assert "failed-lane" in report
+    assert "missing" in report
+    assert "partial" in report
+
+
+def test_review_adjudication_empty_output_is_failed_without_outcome_map(
+    tmp_path: Path,
+    registry_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_resolve_target(spec: str, *, cwd: Path) -> ResolvedTarget:
+        del spec, cwd
+        return pr_target()
+
+    async def failed_adjudicate(merged: MergeResult, **kwargs: object) -> AdjudicationOutcome:
+        del merged, kwargs
+        raise AdjudicationInfrastructureError(
+            "initial",
+            [
+                AdjudicationAttempt(
+                    wave="initial",
+                    replica=1,
+                    reason="empty",
+                    artifact_dir="/tmp/adjudicate/initial/r1",
+                    log_path="/tmp/adjudicate/initial/r1/run.log",
+                    log_bytes=0,
+                    output_path="/tmp/adjudicate/initial/r1/out.json",
+                    output_bytes=0,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(cli_module, "resolve_target", fake_resolve_target)
+    monkeypatch.setattr(cli_module, "CodexRuntime", FakeRuntime)
+    monkeypatch.setattr(cli_module, "adjudicate", failed_adjudicate)
+    out_root = tmp_path / "runs"
+    repo_dir = tmp_path / "checkout"
+    repo_dir.mkdir()
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "review",
+            "--target",
+            "42",
+            "--registry",
+            str(registry_root),
+            "--repo-dir",
+            str(repo_dir),
+            "--out",
+            str(out_root),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == 3
+    payload = json.loads(result.stdout)
+    assert payload["status"] == "failed"
+    assert payload["error"]["reason"] == "no-valid-output"
+    assert payload["error"]["attempts"][0]["reason"] == "empty"
+    assert payload["verdict_counts"] == {"CONFIRMED": 0, "REJECTED": 0, "UNCERTAIN": 0}
+    run_dir = out_root / str(payload["run_id"])
+    assert not (run_dir / "outcome.json").exists()
+    report = (run_dir / "report.md").read_text(encoding="utf-8")
+    assert "status: `failed`" in report
+    assert "no-valid-output" in report
 
 
 def test_pause_stops_after_merge_with_resume_hint(
@@ -229,6 +416,100 @@ def test_without_repo_dir_skips_adjudication_and_renders_unadjudicated(
     run_dir = next(out_root.iterdir())
     assert not (run_dir / "outcome.json").exists()
     assert "## 발견 (미판정)" in (run_dir / "report.md").read_text(encoding="utf-8")
+
+
+def test_adjudicate_run_reuses_persisted_discovery_and_rewrites_outcome_report(
+    tmp_path: Path,
+    registry_root: Path,
+    patched_pipeline: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del patched_pipeline
+    out_root = tmp_path / "runs"
+    review_result, payload = invoke_review(out_root, registry_root, "--json")
+    assert review_result.exit_code == 0
+    run_id = str(payload["run_id"])
+    run_dir = out_root / run_id
+    discover_before = (run_dir / "discover.json").read_bytes()
+    repo_dir = tmp_path / "checkout"
+    repo_dir.mkdir()
+    calls: list[dict[str, object]] = []
+
+    async def fake_readjudicate(merged: MergeResult, **kwargs: object) -> AdjudicationOutcome:
+        calls.append(kwargs)
+        return AdjudicationOutcome(
+            verdicts={group.key: Verdict.REJECTED for group in merged.groups},
+            reasons={group.key: "rechecked from preserved merge" for group in merged.groups},
+            evidence={group.key: "safe source" for group in merged.groups},
+            replica_votes={group.key: [Verdict.REJECTED] for group in merged.groups},
+            unresolved=[],
+            coerced_rejections=0,
+        )
+
+    monkeypatch.setattr(cli_module, "adjudicate", fake_readjudicate)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "adjudicate",
+            "--run",
+            run_id,
+            "--repo-dir",
+            str(repo_dir),
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert len(calls) == 1
+    assert calls[0]["repo_dir"] == repo_dir
+    assert (run_dir / "discover.json").read_bytes() == discover_before
+    outcome = json.loads((run_dir / "outcome.json").read_text(encoding="utf-8"))
+    assert set(outcome["verdicts"].values()) == {"REJECTED"}
+    report = (run_dir / "report.md").read_text(encoding="utf-8")
+    assert "rechecked from preserved merge" not in report
+    assert "## 기각 (REJECTED)" in report
+
+
+@pytest.mark.parametrize("artifact_name", ["target.json", "discover.json", "merge.json"])
+def test_adjudicate_run_names_missing_required_artifact_without_runtime_call(
+    tmp_path: Path,
+    registry_root: Path,
+    patched_pipeline: None,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_name: str,
+) -> None:
+    del patched_pipeline
+    out_root = tmp_path / "runs"
+    review_result, payload = invoke_review(out_root, registry_root, "--json")
+    assert review_result.exit_code == 0
+    run_id = str(payload["run_id"])
+    (out_root / run_id / artifact_name).unlink()
+    repo_dir = tmp_path / "checkout"
+    repo_dir.mkdir()
+
+    async def forbidden_adjudicate(*args: object, **kwargs: object) -> AdjudicationOutcome:
+        raise AssertionError(f"adjudicator called with missing input: {args!r} {kwargs!r}")
+
+    monkeypatch.setattr(cli_module, "adjudicate", forbidden_adjudicate)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "adjudicate",
+            "--run",
+            run_id,
+            "--repo-dir",
+            str(repo_dir),
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert artifact_name in result.stderr
+    assert "not implemented" not in result.stderr
 
 
 def test_report_resume_injects_synthesis_and_unknown_run_exits_one(
