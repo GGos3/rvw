@@ -42,7 +42,7 @@ The pipeline catches only this expected infrastructure failure, writes a failed 
 
 ### Re-adjudication calls the stage directly and writes only after success
 
-The command requires `--run`, `--repo-dir`, and optionally `--out`/`--replicas`. It loads `target.json`, `discover.json`, then `merge.json` in that order and invokes the same adjudicator with a timestamped runtime-attempt directory beneath the run. Discovery is never called. Outcome, report, and final summary are written only after a valid outcome is available; file replacement uses temporary siblings plus rename so readers never observe partial JSON.
+The command requires `--run`, `--repo-dir`, and optionally `--out`/`--replicas`. It loads `target.json`, `discover.json`, then `merge.json` in that order and invokes the same adjudicator with a timestamped runtime-attempt directory beneath the run. Discovery is never called. Outcome and report are replaced only after a valid outcome is available; a failed attempt updates only the run summary error and retains the previous outcome/report. File replacement uses temporary siblings plus rename so readers never observe partial JSON.
 
 Alternative considered: resume the entire common pipeline. This was rejected because it would create a new run and repeat discovery, defeating recovery.
 
@@ -60,7 +60,7 @@ Alternative considered: read the local checkout HEAD at runtime and call it the 
 - [A single invalid replica makes an otherwise useful replicated lane degraded] → Preserve all valid findings and exact coverage while making reduced confidence explicit.
 - [Custom build wrapping adds packaging complexity] → Keep delegation thin, test wheel contents and provenance, and retain uv_build as the actual packager.
 - [Old runs lack `run.json` and embedded provenance] → Derive failure status from strict persisted coverage when loading legacy runs and label provenance unknown; never backfill a guessed commit.
-- [Re-adjudication can fail while an older outcome exists] → Mark the run failed in its summary and replace outcome/report only together after success, so the terminal summary remains the authority.
+- [Re-adjudication can fail while an older outcome exists] → Mark the failed attempt in the run summary while retaining the previous outcome/report; replace outcome/report only after success, so the terminal summary remains the authority.
 
 ## Migration Plan
 

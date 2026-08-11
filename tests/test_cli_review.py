@@ -431,6 +431,9 @@ def test_adjudicate_run_reuses_persisted_discovery_and_rewrites_outcome_report(
     run_id = str(payload["run_id"])
     run_dir = out_root / run_id
     discover_before = (run_dir / "discover.json").read_bytes()
+    merge_before = (run_dir / "merge.json").read_bytes()
+    (run_dir / "outcome.json").write_text('{"legacy": "void"}\n', encoding="utf-8")
+    (run_dir / "report.md").write_text("# stale report\n", encoding="utf-8")
     repo_dir = tmp_path / "checkout"
     repo_dir.mkdir()
     calls: list[dict[str, object]] = []
@@ -464,12 +467,79 @@ def test_adjudicate_run_reuses_persisted_discovery_and_rewrites_outcome_report(
     assert result.exit_code == 0, result.stdout
     assert len(calls) == 1
     assert calls[0]["repo_dir"] == repo_dir
+    runtime_root = cast(Path, calls[0]["out_root"])
+    assert runtime_root.parent == run_dir / "adjudicate-runtime"
+    assert runtime_root.name.startswith("readjudicate-")
     assert (run_dir / "discover.json").read_bytes() == discover_before
+    assert (run_dir / "merge.json").read_bytes() == merge_before
     outcome = json.loads((run_dir / "outcome.json").read_text(encoding="utf-8"))
     assert set(outcome["verdicts"].values()) == {"REJECTED"}
     report = (run_dir / "report.md").read_text(encoding="utf-8")
-    assert "rechecked from preserved merge" not in report
+    assert report != "# stale report\n"
+    assert "safe source" in report
     assert "## 기각 (REJECTED)" in report
+
+
+def test_failed_readjudication_preserves_current_outcome_and_report(
+    tmp_path: Path,
+    registry_root: Path,
+    patched_pipeline: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del patched_pipeline
+    out_root = tmp_path / "runs"
+    repo_dir = tmp_path / "checkout"
+    repo_dir.mkdir()
+    review_result, payload = invoke_review(
+        out_root, registry_root, "--repo-dir", str(repo_dir), "--json"
+    )
+    assert review_result.exit_code == 0
+    run_id = str(payload["run_id"])
+    run_dir = out_root / run_id
+    outcome_before = (run_dir / "outcome.json").read_bytes()
+    report_before = (run_dir / "report.md").read_bytes()
+
+    async def failed_readjudicate(merged: MergeResult, **kwargs: object) -> AdjudicationOutcome:
+        del merged, kwargs
+        raise AdjudicationInfrastructureError(
+            "initial",
+            [
+                AdjudicationAttempt(
+                    wave="initial-retry",
+                    replica=1,
+                    reason="empty",
+                    artifact_dir="/tmp/readjudicate/initial-retry/r1",
+                    exit_code=0,
+                    log_path="/tmp/readjudicate/initial-retry/r1/run.log",
+                    log_bytes=0,
+                    output_path="/tmp/readjudicate/initial-retry/r1/out.json",
+                    output_bytes=0,
+                )
+            ],
+        )
+
+    monkeypatch.setattr(cli_module, "adjudicate", failed_readjudicate)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "adjudicate",
+            "--run",
+            run_id,
+            "--repo-dir",
+            str(repo_dir),
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 3
+    assert "no valid adjudication output" in result.stderr
+    assert (run_dir / "outcome.json").read_bytes() == outcome_before
+    assert (run_dir / "report.md").read_bytes() == report_before
+    summary = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    assert summary["status"] == "failed"
+    assert summary["error"]["reason"] == "no-valid-output"
 
 
 @pytest.mark.parametrize("artifact_name", ["target.json", "discover.json", "merge.json"])

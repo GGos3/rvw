@@ -1412,6 +1412,9 @@ def adjudicate_command(
     except (RunNotFound, StageMissing) as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_NOT_FOUND) from exc
+    except ValueError as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_USER_ERROR) from exc
     except AdjudicationInfrastructureError as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
@@ -1453,17 +1456,6 @@ async def _adjudicate_existing_run(
             attempts=exc.attempts,
         )
         summary = summarize_run(run.run_id, discovered, error=error, build=build)
-        report_md = render_report(
-            target=target,
-            merged=merged,
-            outcome=None,
-            coverage=discovered.coverage,
-            budget=discovered.budget,
-            synthesis=None,
-            summary=summary,
-        )
-        _archive_prior_outcome(run, attempt_id)
-        run.save_report(report_md)
         run.save_summary(summary)
         raise
 
@@ -1481,14 +1473,6 @@ async def _adjudicate_existing_run(
     run.save_report(report_md)
     run.save_summary(summary)
     return run.dir / "report.md"
-
-
-def _archive_prior_outcome(run: RunHandle, attempt_id: str) -> None:
-    """Keep an old outcome inspectable without leaving it current after a failed retry."""
-
-    path = run.dir / "outcome.json"
-    if path.is_file():
-        path.replace(run.dir / f"outcome.{attempt_id}.previous.json")
 
 
 @app.command("report")
