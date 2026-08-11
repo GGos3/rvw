@@ -11,13 +11,15 @@ Adjudication is a machine stage that checks merged claims against the target che
 - ADR-008 turns that uncertainty into a single wider pass. The real PR #1119 smoke adjudicated 13 collapse groups with three unanimous replicas in about 197 seconds after DISCOVER took about 410 seconds.
 - Owner decision (2026-07-30): one adjudication replica is the ordinary default, while multiple replicas remain opt-in heavy verification for high-stakes or large-scope reviews.
 - Missing items become UNCERTAIN votes so a model cannot create an implicit rejection by omission. Majority is strict (`> 50%`), making ties uncertain; at the one-replica default, one valid vote wins because `1 > 1 / 2`.
+- A pass with no valid response after its one retry is infrastructure failure, not uncertainty. This prevents absent or zero-byte adjudicator output from manufacturing a verdict map; required-pass diagnostics retain every failed attempt.
+- UNCERTAIN is a claim about available evidence, so both runtime items and persisted outcomes require an explanation. Omission, unsupported-rejection coercion, and ties receive stable generated reasons when needed.
 
 ## Constraints
 
 - The current runtime may be the same Codex model used for discovery, so shared blind spots remain possible.
 - The expanded prompt authorizes broad exploration of definitions, callers, and tests; it is not programmatically limited to a computed symbol set.
 - The evidence coercion checks only that text is non-empty. It does not mechanically prove the text is a verbatim source quote.
-- Invalid replicas do not cast votes; a pass with no valid outputs yields UNCERTAIN with an empty vote list.
+- Invalid replicas do not cast votes; a pass with no valid outputs after retry raises a typed infrastructure error and produces no outcome.
 
 ## Failure modes
 

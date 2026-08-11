@@ -9,6 +9,8 @@ This capability makes the review inspectable before any network action and trans
 - ADR-012 makes the file the artifact of record. JSON stage files allow REPORT and publish to be rerun from a run ID without rerunning model discovery.
 - The coverage table makes a zero-finding valid lane distinguishable from an all-INVALID lane and from a lane that never activated.
 - Persisted coverage keeps exact replica-chunk entries for fail-closed validation, while the report derives readable per-lane dispatched and valid totals. Diff-budget output also exposes the number and file placement of prompt chunks.
+- `run.json` is the terminal machine summary shared with `review --json`: `complete`, `degraded`, or `failed`, structured failed-lane details, coverage totals, optional run error, and immutable producing-build provenance.
+- Reports retain successful findings from degraded discovery but put the partial status and failed lane reasons ahead of the finding sections. Adjudication infrastructure failure renders an explicitly failed unadjudicated report and no current outcome map.
 - Only `## 종합` is author-written. Finding identity, votes, evidence, folds, coverage, and diff-budget accounting remain machine-generated.
 - PR #1119 supplied concrete scale: 39/39 discovery runs produced 21 findings, merge produced 13 groups, and folds rendered five review items. DISCOVER took about 410s and ADJUDICATE about 197s.
 - That run excluded 2,846,073 generated characters (about 2.84 MB) and reviewed 26,195 source characters, making the exclusion accounting a material report fact rather than a hidden prompt optimization.
@@ -41,6 +43,7 @@ This capability makes the review inspectable before any network action and trans
 - GitHub errors without a recognizable status code cannot trigger the 422 fallback.
 - If the report heading structure is manually changed, body removal for inline findings may not find `## 확정 발견 (CONFIRMED)`.
 - A run can legitimately lack `outcome.json`; the report then renders findings as unadjudicated and publication creates no inline comments.
+- Build provenance records a deterministic packaged-source digest plus build-time Git commit, dirty state, and UTC timestamp when verifiable. Unknown fields stay null; runtime never substitutes a checkout's later HEAD.
 - The current code has no ADR-012 pre-publication guard for open state, head match, merge state, or BEHIND/DIRTY status.
 - A failed stack member leaves an intentionally incomplete directory without
   `stack-report.md`; `stack publish` rejects it rather than reconstructing or

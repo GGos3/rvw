@@ -19,6 +19,7 @@ DISCOVER resolves active lanes into bounded runtime work, supplies each lane the
 - The covered-rules section is prompt guidance. The strict schema prevents foreign IDs but cannot prove the model avoided semantically duplicate findings.
 - The default per-file and per-chunk limits are characters, not tokens or bytes.
 - Cross-chunk prompts list all kept paths and mark the current subset, but do not duplicate other chunks' source text.
+- Terminal review status is derived from final strict coverage: any invalid planned execution prevents `complete`, while valid findings survive under `degraded` when at least one lane execution succeeded.
 - Concurrency above 16 has not been measured and is not the default.
 - PR fallback uses title and body; linked issues from ADR-010 are not resolved by the current target model.
 
@@ -27,6 +28,7 @@ DISCOVER resolves active lanes into bounded runtime work, supplies each lane the
 - A base registry missing `unscoped-sweep` creates a silent coverage gap.
 - A generated file not matched by the default globs may create extra chunks and model work.
 - If all replicas remain invalid after the replacement wave, the lane contributes no findings but remains visible with zero valid coverage.
+- Failed lane entries retain replica/chunk identity, normalized reason, and available runtime diagnostics in `run.json`; aggregate valid counts never substitute for that detail.
 - Missing, duplicated, unexpected, or invalid lane-replica-chunk coverage remains a fail-closed gate condition.
 - A PR body can be wrong or adversarial; it is intent provenance, not correctness evidence.
 - Empty or malformed diffs can fail file segmentation instead of reaching a runtime.

@@ -11,6 +11,7 @@ This capability defines the machine boundary between rvw and a model runtime. It
 - The enum-versus-free fixture produced five findings in each condition with near-identical text. Both missed the same deep defects, so rule scope—not the ID enum—was the suppressing factor; ADR-005 added sweep coverage rather than weakening IDs.
 - OpenAI strict output rejects object schemas whose `required` array omits defaulted properties. The implementation rewrites both root and item schemas so every property is required.
 - The four-part validity contract prevents a zero exit or parseable partial artifact from being silently treated as PASS. On the PR #1119 smoke, all 39 discovery runs were valid; the complete discovery/adjudication walls were about 410s and 197s.
+- Output-artifact reasons now distinguish absence, zero bytes, malformed JSON, and schema failure as `missing`, `empty`, `unparseable`, and `schema-invalid`. Invalid results also retain exit, log, and output-file facts so stage-level errors can explain infrastructure loss without parsing prompts or using size heuristics.
 
 ## Constraints
 
@@ -23,7 +24,7 @@ This capability defines the machine boundary between rvw and a model runtime. It
 ## Failure modes
 
 - Codex log wording changes can classify otherwise complete runs as `no_completion_marker`.
-- Spawn failures, nonzero exits, missing artifacts, JSON parse errors, and schema validation errors are distinct invalid reasons.
+- Spawn failures, nonzero exits, incomplete logs, missing artifacts, empty artifacts, JSON parse errors, and schema validation errors are distinct invalid reasons.
 - A validator that raises an unexpected exception type is not normalized into an invalid result.
 - Schema files are self-contained by replacing Pydantic `$defs`; future nested models need the same care.
 

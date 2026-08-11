@@ -18,6 +18,8 @@ This capability defines how operators and CI enter the common pipeline, how YAML
   loading helpers, then invokes that same implementation once per captured
   member. Stack-specific code owns only chain sequencing, immutable anchors,
   presence rechecks, and stack-level artifacts.
+- `adjudicate --run` is the recovery seam for expensive discovery: it reads the existing target, discovery, and merge artifacts, uses a new timestamped adjudication runtime directory, and atomically replaces the current outcome/report only after a valid result.
+- The package build wrapper delegates to `uv_build` while embedding a deterministic source digest and only build-time-verifiable Git facts. Version output is read-only; once per new run, clean embedded commit ancestry plus the install's local `direct_url.json` can prove a source checkout moved ahead and emit the exact reinstall command.
 
 ## Constraints
 
@@ -26,6 +28,7 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 - The `auto` command uses the default external registry and default run root rather than exposing all review command overrides.
 - Sample gap detection compares rule-ID sets against the lane enum. `(file, line)` differences remain a separate variance signal and body text is not semantically compared.
 - Doctor reads only persisted runs with `discover.json` and defaults to the newest 20.
+- Re-adjudication requires an operator-provisioned checkout but never calls discovery or edits the external review registry.
 - Stack members run sequentially and do not inherit auto policy or gate
   dispositions; presence adjudication is a separate claim-status pass after
   each ordinary member review.
