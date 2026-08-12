@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import os
+import re
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+import rvw.store as store_module
 from rvw.adjudicate import AdjudicationOutcome
 from rvw.diffbudget import DiffBudgetReport, DiffChunkPlacement
 from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage, RunCoverage
 from rvw.merge import merge
 from rvw.schema import Tier, Verdict
-from rvw.store import InvalidRunId, RunHandle, RunNotFound, RunStore, StageMissing
+from rvw.store import _SAFE_RUN_ID, InvalidRunId, RunHandle, RunNotFound, RunStore, StageMissing
 from rvw.target import ResolvedTarget
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -106,9 +109,90 @@ def test_round_trips_every_stage(tmp_path: Path) -> None:
     assert reopened.load_report() == report
 
 
-def test_create_uses_target_specific_run_id(tmp_path: Path) -> None:
+def test_create_retries_same_target_same_timestamp_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = datetime(2026, 8, 12, 12, 34, 56, 123456, tzinfo=UTC)
+    timestamps = iter([frozen, frozen, frozen + timedelta(microseconds=1)])
+
+    class StubDateTime:
+        @classmethod
+        def now(cls, timezone: object) -> datetime:
+            assert timezone is UTC
+            return next(timestamps)
+
+    monkeypatch.setattr(store_module, "datetime", StubDateTime)
+    store = RunStore(tmp_path)
+
+    first = store.create(target_fixture())
+    second = store.create(target_fixture())
+
+    assert first.dir.is_dir()
+    assert second.dir.is_dir()
+    assert first.dir != second.dir
+
+
+def test_create_spins_until_timestamp_advances_after_collision(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = datetime(2026, 8, 12, 12, 34, 56, 123456, tzinfo=UTC)
+    advanced = frozen + timedelta(microseconds=1)
+    calls = 0
+
+    class StubDateTime:
+        @classmethod
+        def now(cls, timezone: object) -> datetime:
+            nonlocal calls
+            assert timezone is UTC
+            calls += 1
+            return frozen if calls <= 5 else advanced
+
+    monkeypatch.setattr(store_module, "datetime", StubDateTime)
+    colliding_run_id = f"rvw-{frozen.strftime('%Y%m%d-%H%M%S-%f')}-pr-1119"
+    (tmp_path / colliding_run_id).mkdir()
+
     run = RunStore(tmp_path).create(target_fixture())
 
+    assert run.run_id == f"rvw-{advanced.strftime('%Y%m%d-%H%M%S-%f')}-pr-1119"
+    assert run.dir.is_dir()
+    assert calls == 6
+
+
+def test_create_frozen_clock_exhausts_bounded_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frozen = datetime(2026, 8, 12, 12, 34, 56, 123456, tzinfo=UTC)
+    calls = 0
+
+    class StubDateTime:
+        @classmethod
+        def now(cls, timezone: object) -> datetime:
+            nonlocal calls
+            assert timezone is UTC
+            calls += 1
+            return frozen
+
+    monkeypatch.setattr(store_module, "datetime", StubDateTime)
+    monkeypatch.setattr(store_module, "_RUN_TIMESTAMP_REGENERATION_SPINS", 2)
+    colliding_run_id = f"rvw-{frozen.strftime('%Y%m%d-%H%M%S-%f')}-pr-1119"
+    (tmp_path / colliding_run_id).mkdir()
+
+    with pytest.raises(FileExistsError):
+        RunStore(tmp_path).create(target_fixture())
+
+    assert calls == 1 + store_module._RUN_DIRECTORY_COLLISION_RETRIES * 2
+
+
+def test_create_uses_safe_reopenable_target_specific_run_id(tmp_path: Path) -> None:
+    store = RunStore(tmp_path)
+    run = store.create(target_fixture())
+
+    assert _SAFE_RUN_ID.fullmatch(run.run_id)
+    assert re.fullmatch(r"rvw-\d{8}-\d{6}-\d{6}-pr-1119", run.run_id)
+    assert store.open(run.run_id).dir == run.dir
     assert run.run_id.startswith("rvw-")
     assert run.run_id.endswith("-pr-1119")
     assert run.dir.is_dir()

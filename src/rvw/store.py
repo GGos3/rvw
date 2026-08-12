@@ -24,6 +24,8 @@ if TYPE_CHECKING:
 
 
 _SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+_RUN_DIRECTORY_COLLISION_RETRIES = 3
+_RUN_TIMESTAMP_REGENERATION_SPINS = 1000
 
 
 class RunNotFound(FileNotFoundError):
@@ -245,7 +247,6 @@ class RunStore:
         self.root = root
 
     def create(self, target: ResolvedTarget) -> RunHandle:
-        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         if target.kind == "pr":
             kind = "pr"
             short = str(target.pr_number)
@@ -255,6 +256,20 @@ class RunStore:
         else:
             kind = "wt"
             short = "dirty"
+        timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+        for _attempt in range(_RUN_DIRECTORY_COLLISION_RETRIES):
+            run_id = f"rvw-{timestamp}-{kind}-{short}"
+            run_dir = self.root / run_id
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError:
+                previous_timestamp = timestamp
+                for _ in range(_RUN_TIMESTAMP_REGENERATION_SPINS):
+                    timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S-%f")
+                    if timestamp != previous_timestamp:
+                        break
+                continue
+            return RunHandle(run_id=run_id, dir=run_dir)
         run_id = f"rvw-{timestamp}-{kind}-{short}"
         run_dir = self.root / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
