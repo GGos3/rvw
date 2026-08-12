@@ -1150,16 +1150,40 @@ def test_gate_plan_round_trip_is_strict(tmp_path: Path) -> None:
         schema_version=1,
         lane_ids=["lane-a", "lane-b"],
         replicas=3,
+        adjudicate_replicas=1,
         chunk_count=2,
     )
     path = save_gate_plan(tmp_path, plan)
 
     assert load_gate_plan(tmp_path) == plan
     raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["replicas"] == 3
+    assert raw["adjudicate_replicas"] == 1
     raw["extra"] = True
     path.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ValidationError):
         load_gate_plan(tmp_path)
+
+
+def test_legacy_gate_plan_derives_adjudicate_replicas_from_replicas(tmp_path: Path) -> None:
+    """Pre-split plans ran one combined count: their historical adjudication
+    count IS the stored replicas value, never the new default of 3."""
+
+    legacy = {
+        "schema_version": 1,
+        "lane_ids": ["lane-a"],
+        "replicas": 1,
+        "chunk_count": 1,
+    }
+    (tmp_path / "gate-plan.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+    plan = load_gate_plan(tmp_path)
+    assert plan.replicas == 1
+    assert plan.adjudicate_replicas == 1
+
+    legacy["replicas"] = 3
+    (tmp_path / "gate-plan.json").write_text(json.dumps(legacy), encoding="utf-8")
+    assert load_gate_plan(tmp_path).adjudicate_replicas == 3
 
 
 def test_pull_request_requery_and_actor_permission_commands() -> None:

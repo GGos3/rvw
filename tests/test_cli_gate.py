@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import Literal
@@ -142,8 +143,12 @@ def patch_target_dependencies(
     monkeypatch.setattr(
         cli_module,
         "_gate_plan",
-        lambda registry_root, resolved, replicas: GatePlan(
-            schema_version=1, lane_ids=["lane-a"], replicas=replicas, chunk_count=1
+        lambda registry_root, resolved, replicas, adjudicate_replicas: GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=replicas,
+            adjudicate_replicas=adjudicate_replicas,
+            chunk_count=1,
         ),
     )
 
@@ -168,12 +173,21 @@ def inherited_source(
     *,
     repo: str = "owner/repo",
     pr_number: int = 42,
+    run_id: str = "source-run",
+    target_kind: Literal["pr", "commit"] = "pr",
     write_verdict: bool = True,
+    include_findings: bool = True,
     verdict: Literal["PASS", "BLOCK"] = "PASS",
 ) -> RunHandle:
-    run = RunHandle(run_id="source-run", dir=out_root / "source-run")
+    run = RunHandle(run_id=run_id, dir=out_root / run_id)
     run.dir.mkdir(parents=True)
-    source_target = target().model_copy(update={"repo": repo, "pr_number": pr_number})
+    source_target = target().model_copy(
+        update={
+            "kind": target_kind,
+            "repo": repo,
+            "pr_number": pr_number if target_kind == "pr" else None,
+        }
+    )
     run.save_target(source_target)
     if write_verdict:
         group = current.merged.groups[0]
@@ -186,21 +200,26 @@ def inherited_source(
                 anchor=GateAnchor(base_sha="c" * 40, head_sha="d" * 40),
                 counts={"CONFIRMED": 1, "REJECTED": 0, "UNCERTAIN": 0},
                 coverage=[],
-                findings=[
-                    GateFinding(
-                        finding_id=group.key,
-                        rule_id=group.rule_id,
-                        file=group.file,
-                        line=group.line,
-                        severity=group.severity,
-                        verdict=Verdict.CONFIRMED,
-                        disposition=DispositionDecision.ACCEPTED,
-                        reason="accepted in prior run",
-                        hunk_sha256=HUNK_SHA256,
-                        body_sha256=BODY_SHA256,
-                    )
-                ],
+                findings=(
+                    [
+                        GateFinding(
+                            finding_id=group.key,
+                            rule_id=group.rule_id,
+                            file=group.file,
+                            line=group.line,
+                            severity=group.severity,
+                            verdict=Verdict.CONFIRMED,
+                            disposition=DispositionDecision.ACCEPTED,
+                            reason="accepted in prior run",
+                            hunk_sha256=HUNK_SHA256,
+                            body_sha256=BODY_SHA256,
+                        )
+                    ]
+                    if include_findings
+                    else []
+                ),
                 verdict=verdict,
+                kind="completed",
             ),
         )
     return run
@@ -212,6 +231,376 @@ def update_source_finding(source: RunHandle, **updates: object) -> None:
     )
     verdict.findings[0] = verdict.findings[0].model_copy(update=updates)
     save_gate_verdict(source.dir, verdict)
+
+
+def test_gate_auto_inherit_selects_newest_qualifying_run_among_decoys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-100000-pr-42",
+    )
+    selected = inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-110000-pr-42",
+    )
+    inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-120000-pr-99",
+        pr_number=99,
+    )
+    inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-130000-pr-42",
+        repo="other/repo",
+    )
+    inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-140000-commit-abcdef123",
+        target_kind="commit",
+    )
+    inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-150000-pr-42",
+        include_findings=False,
+    )
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert f"auto-inherit: selected {selected.run_id}" in result.stdout
+    persisted = current.run.load_gate_verdict()
+    assert persisted.inheritance_summary is not None
+    assert persisted.inheritance_summary.source_run_id == selected.run_id
+    assert persisted.findings[0].inherited_from == selected.run_id
+
+
+def test_gate_auto_inherit_rejects_suffixed_run_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run-root entry extending the canonical PR run-id grammar with extra
+    safe characters must never qualify or reach output/provenance."""
+
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    hostile = "rvw-20250810-160000-pr-42-github_pat_SECRETSECRET"
+    inherited_source(out_root, current, run_id=hostile)
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert "auto-inherit: no qualifying prior run found" in result.stdout
+    assert hostile not in result.stdout
+
+
+def test_gate_auto_inherit_skips_unreadable_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One candidate raising a raw OSError must be skipped with a reported
+    reason instead of aborting the scan; an older qualifying run still wins."""
+
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    older = inherited_source(out_root, current, run_id="rvw-20250810-100000-pr-42")
+    inherited_source(out_root, current, run_id="rvw-20250810-110000-pr-42")
+    original = cli_module._load_inherited_dispositions
+
+    def flaky(
+        run_id: str,
+        *,
+        current_target: ResolvedTarget,
+        out_root: Path,
+        require_owned: bool = False,
+    ) -> GateVerdict:
+        if run_id == "rvw-20250810-110000-pr-42":
+            raise PermissionError(13, "Permission denied")
+        return original(
+            run_id,
+            current_target=current_target,
+            out_root=out_root,
+            require_owned=require_owned,
+        )
+
+    monkeypatch.setattr(cli_module, "_load_inherited_dispositions", flaky)
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert f"auto-inherit: selected {older.run_id}" in result.stdout
+    assert "rvw-20250810-110000-pr-42: PermissionError" in result.stdout
+
+
+def test_gate_auto_inherit_reports_scan_failure_distinctly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercises the REAL iterdir failure path: no stubbing of discovery."""
+
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    original_iterdir = Path.iterdir
+
+    def failing_iterdir(self: Path) -> object:
+        if self == out_root:
+            raise PermissionError(13, "Permission denied")
+        return original_iterdir(self)
+
+    monkeypatch.setattr(Path, "iterdir", failing_iterdir)
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert "auto-inherit: run-root scan failed (PermissionError" in result.stdout
+    assert "no qualifying prior run found" not in result.stdout
+    # The gate must PROCEED past the failed scan, not abort: the actionable
+    # fixture pauses with a disposition template and a persisted pause verdict.
+    assert result.exit_code == 1, result.stdout
+    assert "actionable findings require dispositions" in result.stdout
+    assert (current.run.dir / "gate-dispositions.yaml").is_file()
+    persisted = current.run.load_gate_verdict()
+    assert persisted.kind == "pause"
+
+
+def test_gate_auto_inherit_excludes_runs_newer_than_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A concurrent gate allocated AFTER the current run must never be
+    selected as the current run's 'prior' source (order inversion)."""
+
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    older = inherited_source(out_root, current, run_id="rvw-20250810-100000-pr-42")
+    inherited_source(out_root, current, run_id="rvw-20990101-000000-pr-42")
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert f"auto-inherit: selected {older.run_id}" in result.stdout
+    assert "rvw-20990101-000000-pr-42: newer_than_current" in result.stdout
+    persisted = current.run.load_gate_verdict()
+    assert persisted.inheritance_summary is not None
+    assert persisted.inheritance_summary.source_run_id == older.run_id
+
+
+def test_gate_auto_inherit_excludes_current_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The current run itself carries a completed verdict with findings; if
+    exclusion regressed, discovery would select it. The only correct outcome
+    is the no-qualifying-prior-run path."""
+
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    group = current.merged.groups[0]
+    save_gate_verdict(
+        current.run.dir,
+        GateVerdict(
+            run_id=current.run.run_id,
+            repo="owner/repo",
+            pr_number=42,
+            anchor=GateAnchor(base_sha="c" * 40, head_sha="d" * 40),
+            counts={"CONFIRMED": 1, "REJECTED": 0, "UNCERTAIN": 0},
+            coverage=[],
+            findings=[
+                GateFinding(
+                    finding_id=group.key,
+                    rule_id=group.rule_id,
+                    file=group.file,
+                    line=group.line,
+                    severity=group.severity,
+                    verdict=Verdict.CONFIRMED,
+                    disposition=DispositionDecision.ACCEPTED,
+                    reason="accepted in the same run",
+                    hunk_sha256=HUNK_SHA256,
+                    body_sha256=BODY_SHA256,
+                )
+            ],
+            verdict="PASS",
+            kind="completed",
+        ),
+    )
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert "auto-inherit: no qualifying prior run found" in result.stdout
+    assert f"auto-inherit: selected {current.run.run_id}" not in result.stdout
+
+
+def test_parse_pr_run_id_rejects_trailing_newline() -> None:
+    """`$` matches before a trailing newline; fullmatch semantics must not."""
+
+    from rvw.store import parse_pr_run_id
+
+    canonical = "rvw-20250810-100000-pr-42"
+    assert parse_pr_run_id(canonical) is not None
+    assert parse_pr_run_id(canonical + "\n") is None
+    assert parse_pr_run_id("rvw-20250810-100000-123456-pr-42") is not None
+    assert parse_pr_run_id("rvw-20250810-100000-123456-pr-42\n") is None
+
+
+def test_gate_auto_inherit_rejects_foreign_owned_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auto-discovery must reject candidates not owned by the scanning user
+    (planted-artifact defense) via fstat on the pinned descriptor."""
+
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(out_root, current, run_id="rvw-20250810-100000-pr-42")
+    real_euid = os.geteuid()
+    monkeypatch.setattr(cli_module.os, "geteuid", lambda: real_euid + 1)
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert "auto-inherit: no qualifying prior run found" in result.stdout
+    assert f"{source.run_id}: inherit_source_foreign_owner" in result.stdout
+
+
+def test_run_id_generator_and_parser_cannot_drift(tmp_path: Path) -> None:
+    """Drift tripwire: every PR run id the generator produces MUST parse.
+
+    If _RUN_ID_TIMESTAMP_FORMAT or the id layout changes without updating
+    _PR_RUN_ID/parse_pr_run_id, auto-inherit would silently stop discovering
+    new runs; discovery also refuses to scan when the current id fails to
+    parse, and this test pins the invariant at the source.
+    """
+
+    from rvw.store import parse_pr_run_id
+
+    run = RunStore(tmp_path).create(target())
+    parsed = parse_pr_run_id(run.run_id)
+    assert parsed is not None
+    assert parsed[1] == 42
+
+
+def test_gate_no_inherit_suppresses_auto_discovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    source = inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-110000-pr-42",
+    )
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--no-inherit", "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 1
+    assert "auto-inherit:" not in result.stdout
+    assert source.run_id not in result.stdout
+    persisted = current.run.load_gate_verdict()
+    assert persisted.inheritance_summary is None
+
+
+def test_gate_explicit_inherit_wins_over_newer_automatic_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True)
+    explicit = inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-100000-pr-42",
+    )
+    inherited_source(
+        out_root,
+        current,
+        run_id="rvw-20250810-150000-pr-42",
+    )
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--target",
+            "42",
+            "--inherit",
+            explicit.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    persisted = current.run.load_gate_verdict()
+    assert persisted.inheritance_summary is not None
+    assert persisted.inheritance_summary.source_run_id == explicit.run_id
+    assert persisted.findings[0].inherited_from == explicit.run_id
+
+
+def test_gate_auto_inherit_fails_open_without_qualifying_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root)
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--out", str(out_root)],
+    )
+
+    assert result.exit_code == 0, result.stderr
+    assert (
+        "auto-inherit: no qualifying prior run found; proceeding without inheritance"
+        in result.stdout
+    )
+
+
+def test_gate_rejects_inherit_with_no_inherit_before_target_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_resolve(spec: str) -> ResolvedTarget:
+        raise AssertionError(f"conflicting flags reached target resolution: {spec}")
+
+    monkeypatch.setattr(cli_module, "_resolve_cli_target", forbidden_resolve)
+
+    result = runner.invoke(
+        cli_module.app,
+        ["gate", "--target", "42", "--inherit", "source-run", "--no-inherit"],
+    )
+
+    assert result.exit_code == 2
+    assert "--inherit cannot be combined with --no-inherit" in result.stderr
 
 
 def test_gate_target_executes_review_once_and_writes_dry_run_artifacts(
@@ -228,7 +617,8 @@ def test_gate_target_executes_review_once_and_writes_dry_run_artifacts(
 
     assert result.exit_code == 0, result.stdout
     assert len(calls) == 1
-    assert calls[0]["replicas"] == 1
+    assert calls[0]["discover_replicas"] == 1
+    assert calls[0]["adjudicate_replicas"] == 3
     assert calls[0]["resolved_target"] == target()
     repo_dir = calls[0]["repo_dir"]
     assert isinstance(repo_dir, Path)
@@ -236,7 +626,9 @@ def test_gate_target_executes_review_once_and_writes_dry_run_artifacts(
     payload = json.loads(result.stdout)
     assert payload["verdict"] == "PASS"
     assert (artifacts.run.dir / "gate-plan.json").is_file()
-    assert load_gate_plan(artifacts.run.dir).replicas == 1
+    plan = load_gate_plan(artifacts.run.dir)
+    assert plan.replicas == 1
+    assert plan.adjudicate_replicas == 3
     assert (artifacts.run.dir / "gate-verdict.json").is_file()
     publish_payload = json.loads(
         (artifacts.run.dir / "publish-payload.json").read_text(encoding="utf-8")
@@ -245,7 +637,7 @@ def test_gate_target_executes_review_once_and_writes_dry_run_artifacts(
     assert "rvw gate — PASS" in publish_payload["body"]
 
 
-def test_gate_preserves_explicit_replica_override(
+def test_gate_preserves_explicit_split_replica_overrides(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     out_root = tmp_path / "runs"
@@ -260,6 +652,8 @@ def test_gate_preserves_explicit_replica_override(
             "42",
             "--replicas",
             "3",
+            "--adjudicate-replicas",
+            "1",
             "--concurrency",
             "4",
             "--out",
@@ -268,9 +662,12 @@ def test_gate_preserves_explicit_replica_override(
     )
 
     assert result.exit_code == 0, result.stdout
-    assert calls[0]["replicas"] == 3
+    assert calls[0]["discover_replicas"] == 3
+    assert calls[0]["adjudicate_replicas"] == 1
     assert calls[0]["concurrency"] == 4
-    assert load_gate_plan(artifacts.run.dir).replicas == 3
+    plan = load_gate_plan(artifacts.run.dir)
+    assert plan.replicas == 3
+    assert plan.adjudicate_replicas == 1
 
 
 @pytest.mark.parametrize(
@@ -309,8 +706,12 @@ def test_gate_target_invalid_inherit_stops_before_provision_or_review(
     monkeypatch.setattr(
         cli_module,
         "_gate_plan",
-        lambda registry_root, resolved, replicas: GatePlan(
-            schema_version=1, lane_ids=["lane-a"], replicas=replicas, chunk_count=1
+        lambda registry_root, resolved, replicas, adjudicate_replicas: GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=replicas,
+            adjudicate_replicas=adjudicate_replicas,
+            chunk_count=1,
         ),
     )
 
@@ -417,7 +818,13 @@ def test_gate_inherit_source_errors_before_template_writing(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     if source_setup == "missing_verdict":
         inherited_source(out_root, current, write_verdict=False)
@@ -451,7 +858,13 @@ def test_gate_inherit_rejects_symlinked_verdict_artifact(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     source = inherited_source(out_root, current)
     foreign = tmp_path / "foreign-verdict.json"
@@ -491,7 +904,13 @@ def test_gate_inheritance_source_requires_completed_kind(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     source = inherited_source(out_root, current)
     source_verdict = source.load_gate_verdict().model_copy(update={"kind": source_kind})
@@ -570,7 +989,13 @@ def test_inheritance_source_validation_diagnostic_is_bounded_and_redacted(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     source = inherited_source(out_root, current)
     verdict_path = source.dir / "gate-verdict.json"
@@ -800,8 +1225,12 @@ def test_gate_checkout_failure_is_operational_error(
     monkeypatch.setattr(
         cli_module,
         "_gate_plan",
-        lambda registry_root, resolved, replicas: GatePlan(
-            schema_version=1, lane_ids=["lane-a"], replicas=replicas, chunk_count=1
+        lambda registry_root, resolved, replicas, adjudicate_replicas: GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=replicas,
+            adjudicate_replicas=adjudicate_replicas,
+            chunk_count=1,
         ),
     )
 
@@ -845,7 +1274,13 @@ def test_gate_resume_without_dispositions_preserves_completed_verdict(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     group = artifacts.merged.groups[0]
     save_gate_verdict(
@@ -899,7 +1334,13 @@ def test_gate_resume_rejects_truncated_verdict_as_corrupt_without_rewriting(
     artifacts = prepared_artifacts(out_root)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     verdict_path = artifacts.run.dir / "gate-verdict.json"
     corrupt_bytes = b'{"run_id":'
@@ -1271,7 +1712,13 @@ def test_gate_failure_verdict_is_retryable_after_dispositions_are_corrected(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
     invalid = tmp_path / "invalid.yaml"
@@ -1325,7 +1772,13 @@ def test_gate_orphan_outcome_key_persists_failure_verdict(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     assert artifacts.outcome is not None
     artifacts.outcome.verdicts["orphan-finding"] = Verdict.CONFIRMED
@@ -1353,7 +1806,13 @@ def test_gate_full_inheritance_does_not_overwrite_completed_block_verdict(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     source = inherited_source(out_root, current)
     group = current.merged.groups[0]
@@ -1413,7 +1872,13 @@ def test_gate_full_inheritance_replaces_pause_stub_and_proceeds(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     source = inherited_source(out_root, current)
     save_gate_verdict(
@@ -1459,7 +1924,13 @@ def test_gate_inheritance_matcher_invariant_persists_block_verdict(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     source = inherited_source(out_root, current)
     current.merged.groups[0] = current.merged.groups[0].model_copy(update={"bodies": []})
@@ -1498,7 +1969,13 @@ def test_gate_resume_without_dispositions_rewrites_existing_pause_stub(
     artifacts = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     save_gate_verdict(
         artifacts.run.dir,
@@ -1544,7 +2021,13 @@ def test_gate_full_tier_one_inheritance_persists_document_and_auto_proceeds(
         calls = []
         save_gate_plan(
             current.run.dir,
-            GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+            GatePlan(
+                schema_version=1,
+                lane_ids=["lane-a"],
+                replicas=1,
+                adjudicate_replicas=1,
+                chunk_count=1,
+            ),
         )
         monkeypatch.setattr(cli_module, "query_pull_request", lambda repo, number: current_state())
         mode_args = ["--run", current.run.run_id]
@@ -1811,7 +2294,13 @@ def test_gate_rejects_unbound_inherited_from_claims(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     source = inherited_source(out_root, current) if source_case != "absent" else None
     if source_case == "unmatched":
@@ -1857,7 +2346,13 @@ def test_gate_allows_fresh_disposition_when_inheritance_source_is_selected(
     current = prepared_artifacts(out_root, actionable=True)
     save_gate_plan(
         current.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=1, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=1,
+            adjudicate_replicas=1,
+            chunk_count=1,
+        ),
     )
     source = inherited_source(out_root, current)
     update_source_finding(source, finding_id="other-id", file="src/other.py")
@@ -1900,7 +2395,13 @@ def test_gate_resume_uses_artifacts_without_review(
     artifacts = prepared_artifacts(out_root, actionable=True, replicas=3)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=3,
+            adjudicate_replicas=3,
+            chunk_count=1,
+        ),
     )
     finding_id = artifacts.merged.groups[0].key
     disposition_path = tmp_path / "dispositions.yaml"
@@ -1943,7 +2444,13 @@ def test_gate_stale_resume_fails_before_publication(
     artifacts = prepared_artifacts(out_root, replicas=3)
     save_gate_plan(
         artifacts.run.dir,
-        GatePlan(schema_version=1, lane_ids=["lane-a"], replicas=3, chunk_count=1),
+        GatePlan(
+            schema_version=1,
+            lane_ids=["lane-a"],
+            replicas=3,
+            adjudicate_replicas=3,
+            chunk_count=1,
+        ),
     )
     monkeypatch.setattr(
         cli_module,

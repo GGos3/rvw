@@ -152,13 +152,19 @@ def invoke_review(
 
 
 @pytest.mark.parametrize(
-    ("extra", "expected_replicas", "expected_concurrency"),
-    [([], 1, 8), (["--replicas", "3", "--concurrency", "4"], 3, 4)],
+    ("extra", "expected_discover", "expected_adjudicate", "expected_concurrency"),
+    [
+        ([], 1, 3, 8),
+        (["--replicas", "2"], 2, 3, 8),
+        (["--adjudicate-replicas", "1"], 1, 1, 8),
+        (["--replicas", "3", "--concurrency", "4"], 3, 3, 4),
+    ],
 )
-def test_review_runtime_defaults_and_explicit_overrides(
+def test_review_split_replica_defaults_and_explicit_overrides(
     monkeypatch: pytest.MonkeyPatch,
     extra: list[str],
-    expected_replicas: int,
+    expected_discover: int,
+    expected_adjudicate: int,
     expected_concurrency: int,
 ) -> None:
     calls: list[dict[str, object]] = []
@@ -171,7 +177,8 @@ def test_review_runtime_defaults_and_explicit_overrides(
     result = runner.invoke(cli_module.app, ["review", "--target", "HEAD", *extra])
 
     assert result.exit_code == 0, result.stdout
-    assert calls[0]["replicas"] == expected_replicas
+    assert calls[0]["discover_replicas"] == expected_discover
+    assert calls[0]["adjudicate_replicas"] == expected_adjudicate
     assert calls[0]["concurrency"] == expected_concurrency
 
 
@@ -194,24 +201,31 @@ def test_review_rejects_zero_concurrency_before_execution(
     assert calls == []
 
 
-async def test_shared_pipeline_propagates_concurrency_to_discovery_and_adjudication(
+async def test_shared_pipeline_propagates_split_replicas_and_concurrency(
     tmp_path: Path,
     registry_root: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    concurrency_calls: list[tuple[str, int]] = []
+    """Each stage must receive ITS OWN replica count: distinct values prove
+    execute_pipeline cannot forward one count to both stages."""
+
+    stage_calls: list[tuple[str, int, int]] = []
 
     async def fake_discover(**kwargs: object) -> DiscoverResult:
+        replicas = kwargs["replicas"]
         concurrency = kwargs["concurrency"]
+        assert isinstance(replicas, int)
         assert isinstance(concurrency, int)
-        concurrency_calls.append(("discover", concurrency))
+        stage_calls.append(("discover", replicas, concurrency))
         return DiscoverResult(lane_results={}, findings=[], coverage=[])
 
     async def fake_adjudicate(merged: MergeResult, **kwargs: object) -> AdjudicationOutcome:
         del merged
+        replicas = kwargs["replicas"]
         concurrency = kwargs["concurrency"]
+        assert isinstance(replicas, int)
         assert isinstance(concurrency, int)
-        concurrency_calls.append(("adjudicate", concurrency))
+        stage_calls.append(("adjudicate", replicas, concurrency))
         return AdjudicationOutcome(
             verdicts={},
             reasons={},
@@ -234,14 +248,15 @@ async def test_shared_pipeline_propagates_concurrency_to_discovery_and_adjudicat
         runtime=cast(Runtime, FakeRuntime()),
         adjudicator=fake_adjudicate,
         repo_dir=checkout,
-        replicas=1,
+        discover_replicas=2,
+        adjudicate_replicas=5,
         concurrency=3,
         out_root=tmp_path / "runs",
         pause=False,
         dynamic_brief=None,
     )
 
-    assert concurrency_calls == [("discover", 3), ("adjudicate", 3)]
+    assert stage_calls == [("discover", 2, 3), ("adjudicate", 5, 3)]
 
 
 def test_review_end_to_end_writes_all_stages_and_json_shape(
