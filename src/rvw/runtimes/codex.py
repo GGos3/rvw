@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
+import signal
+import sys
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, BinaryIO, cast
 
 from pydantic import BaseModel, ValidationError
 
@@ -18,6 +23,58 @@ from rvw.schema import RuntimeLaneOutput
 
 _REPLICA_DIRECTORY = re.compile(r"r([1-9][0-9]*)")
 _COMPLETION_MARKER = "tokens used"
+_PROCESS_TERMINATION_TIMEOUT_SECONDS = 5
+_SETPRIV = shutil.which("setpriv") if sys.platform.startswith("linux") else None
+
+
+async def _terminate_and_reap(process: asyncio.subprocess.Process, log_file: BinaryIO) -> None:
+    """Terminate a started subprocess, escalating to SIGKILL after a bounded wait."""
+
+    if process.returncode is not None:
+        return
+    pgid: int | None = None
+    with suppress(ProcessLookupError):
+        pgid = os.getpgid(process.pid)
+    if pgid is None:
+        with suppress(ProcessLookupError):
+            process.terminate()
+    else:
+        with suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(
+            process.wait(),
+            timeout=_PROCESS_TERMINATION_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        if pgid is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+            signal_target = f"pid {process.pid}"
+        else:
+            with suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            signal_target = f"pgid {pgid}"
+        await process.wait()
+        marker = (
+            "rvw: graceful termination timed out after "
+            f"{_PROCESS_TERMINATION_TIMEOUT_SECONDS}s; escalated to SIGKILL "
+            f"({signal_target})\n"
+        )
+        log_file.write(marker.encode("utf-8"))
+        log_file.flush()
+
+
+async def _cleanup_before_unwind(process: asyncio.subprocess.Process, log_file: BinaryIO) -> None:
+    """Finish subprocess cleanup even if the awaiting task is cancelled again."""
+
+    cleanup = asyncio.create_task(_terminate_and_reap(process, log_file))
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            continue
+    cleanup.result()
 
 
 async def _spawn(
@@ -25,15 +82,25 @@ async def _spawn(
 ) -> int:
     """Run a command without a shell and combine its output in one log."""
 
+    spawn_command = cmd
+    if sys.platform.startswith("linux"):
+        if _SETPRIV is None:
+            raise RuntimeError("setpriv is required for Linux runtime parent-death coupling")
+        spawn_command = [_SETPRIV, "--pdeathsig", "SIGTERM", *cmd]
     with log_path.open("wb") as log_file:
         process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *spawn_command,
             stdin=asyncio.subprocess.PIPE,
             stdout=log_file,
             stderr=asyncio.subprocess.STDOUT,
             cwd=cwd,
+            start_new_session=True,
         )
-        await process.communicate(stdin_text.encode("utf-8"))
+        try:
+            await process.communicate(stdin_text.encode("utf-8"))
+        except BaseException:
+            await _cleanup_before_unwind(process, log_file)
+            raise
     if process.returncode is None:
         raise RuntimeError("subprocess completed without a return code")
     return process.returncode

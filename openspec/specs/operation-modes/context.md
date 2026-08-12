@@ -8,6 +8,10 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 
 - Owner decisions (2026-07-30 and 2026-08-12): ordinary `review`, `gate`, and `auto` runs keep one discovery replica because lanes x replicas x concurrent rvw instances overloaded `codex-lb`; four concurrent runs were observed demanding up to 64 sessions. Adjudication now defaults independently to three replicas because production reviews dispatched a median of one adjudication run versus eight discovery runs, so majority evidence adds token cost without increasing peak executor sessions.
 - Owner decision (2026-08-06): runtime wave concurrency defaults to eight after concurrent rvw runs saturated the shared `codex-lb` account pool, triggering local `account_stream_cap` overload, 30-second retry sleeps, and lane INVALIDs. Operators can set a positive `--concurrency` value on every command capable of runtime execution.
+- 2026-08-12: Per-process semaphores do not bound a shared host: six processes at the default capacity of 8 implied 48 theoretical runtime streams. Runtime commands therefore share a host-local flock gate capped at 12 by default; the effective bound is the smaller of the process and host caps, while `RVW_HOST_CONCURRENCY=0` disables the host gate.
+- 2026-08-12: On Linux, spawned runtime wrappers use the exec-side `setpriv --pdeathsig SIGTERM` command prefix. This avoids thread-unsafe `preexec_fn` work and normally prevents a SIGKILLed rvw process from releasing its flock while an orphaned timeout/codex execution continues consuming a gateway stream. Linux fails closed if `setpriv` is unavailable; other platforms do not guarantee this coupling. The tiny pre-`setpriv` orphan race is accepted.
+- The ambient `XDG_RUNTIME_DIR` is validated without mutating its permission contract. Rvw-owned `rvw-slots` and `c{cap}` directories are normalized and descriptor-verified at 0700, `O_NOFOLLOW` is mandatory, and slot files are opened relative to a held validated directory descriptor.
+- Contention uses nonblocking randomized scans separated by cancellable, jittered async sleeps capped at 0.25 seconds. This avoids stranded executor threads at the accepted cost of no kernel FIFO fairness. Each spawned runtime wrapper leads a dedicated process group; cancellation or other exceptional unwind signals the whole group, escalates to `SIGKILL` after five seconds when needed, records that escalation in the run log, and reaps the wrapper before releasing the host slot.
 - ADR-009 keeps one stage implementation while providing `review` and `auto` command surfaces. Policy handles reproducible inclusion/severity decisions after model-based factual adjudication.
 - The implemented pause point is after MERGE. This supersedes ADR-009 D2's original wording that pause occurred after ADJUDICATE.
 - Approval is not expressible. Policy allows only `comment` or `none`; `--allow-approve` prints a placeholder warning and does not change publication event type.
@@ -33,6 +37,9 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 - Stack members run sequentially and do not inherit auto policy or gate
   dispositions; presence adjudication is a separate claim-status pass after
   each ordinary member review.
+- The host cap is configured only through `RVW_HOST_CONCURRENCY`; it is local to one host and does not change `--concurrency` semantics.
+- Cap-sharded `c{cap}` directories intentionally avoid cross-cap deadlock. Operators changing `RVW_HOST_CONCURRENCY` while processes are active temporarily run disjoint pools without one shared bound; the host bound converges when configurations converge.
+- Contending acquisition polls all slots and does not promise FIFO fairness; a newly freed slot can take up to the capped polling interval to be observed.
 
 ## Failure modes
 
