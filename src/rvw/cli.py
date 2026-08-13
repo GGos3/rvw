@@ -1219,6 +1219,7 @@ async def _gate_pipeline(
                 summary_text = (
                     f"; inheritance source={inheritance_summary.source_run_id} "
                     f"carried={inheritance_summary.carried} "
+                    f"sticky={inheritance_summary.sticky} "
                     f"prefilled={inheritance_summary.prefilled} "
                     f"blank={inheritance_summary.blank}"
                     + (f" reasons={reasons}" if reasons else "")

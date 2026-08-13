@@ -15,6 +15,7 @@ from rvw.gate import (
     ACTIONABLE_DISPOSITIONS_PAUSE,
     DispositionDecision,
     DispositionDocument,
+    DispositionInheritance,
     DispositionRecord,
     GateAnchor,
     GateFinding,
@@ -38,6 +39,7 @@ from rvw.gate import (
     render_gate_verdict,
     save_gate_plan,
     save_gate_verdict,
+    summarize_inheritance,
     validate_coverage,
     verify_pull_request,
     write_disposition_template,
@@ -462,7 +464,7 @@ def _multi_body_merge(bodies: list[str]) -> tuple[MergeResult, AdjudicationOutco
     return merged, outcome
 
 
-def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None:
+def test_inheritance_matcher_exact_id_carries_and_unique_pair_becomes_sticky() -> None:
     merged, outcome = _one_finding_merge()
     group = merged.groups[0]
 
@@ -498,11 +500,37 @@ def test_inheritance_matcher_exact_id_carries_and_unique_pair_prefills() -> None
         outcome,
         inherited_run_id="run-prior",
     )[group.key]
-    assert moved.tier is InheritanceTier.UNIQUE_PAIR
-    assert moved.decision is DispositionDecision.MUST_FIX
+    assert moved.tier is InheritanceTier.UNIQUE_PAIR_STICKY
+    assert moved.decision is DispositionDecision.ACCEPTED
     assert moved.reason == "prior owner judgment"
     assert moved.inherited_from == "run-prior"
     assert moved.blank_reason == "finding_id_changed"
+
+
+def test_unique_blocker_accepted_pair_remains_reason_only_prefilled() -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+    merged.groups[0] = group.model_copy(update={"severity": Severity.BLOCKER})
+
+    matched = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id="different-id",
+                rule_id=group.rule_id,
+                file=group.file,
+                severity=Severity.BLOCKER,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+    )[group.key]
+
+    assert matched.decision is DispositionDecision.MUST_FIX
+    assert matched.tier is InheritanceTier.UNIQUE_PAIR
+    assert matched.reason == "prior owner judgment"
+    assert matched.inherited_from == "run-prior"
+    assert matched.blank_reason is InheritanceBlankReason.FINDING_ID_CHANGED
 
 
 def test_inheritance_matcher_rejects_exact_id_with_different_identity_pair() -> None:
@@ -535,7 +563,7 @@ def test_inheritance_matcher_rejects_exact_id_with_different_identity_pair() -> 
 def test_inheritance_matcher_demotes_exact_id_when_severity_changes() -> None:
     merged, outcome = _one_finding_merge()
     group = merged.groups[0]
-    merged.groups[0] = group.model_copy(update={"severity": Severity.BLOCKER})
+    merged.groups[0] = group.model_copy(update={"severity": Severity.SUGGESTION})
 
     matched = match_inherited_dispositions(
         [
@@ -572,6 +600,34 @@ def test_inheritance_matcher_rejects_orphan_outcome_keys() -> None:
         )
 
 
+def test_inheritance_matcher_records_severity_change_on_moved_pair() -> None:
+    merged, outcome = _one_finding_merge()
+    group = merged.groups[0]
+    merged.groups[0] = group.model_copy(update={"severity": Severity.SUGGESTION})
+
+    matched = match_inherited_dispositions(
+        [
+            _inherited_finding(
+                finding_id="different-finding-id",
+                rule_id=group.rule_id,
+                file=group.file,
+                hunk_sha256="1" * 64,
+                body_sha256=BODY_SHA256,
+            )
+        ],
+        merged,
+        outcome,
+        inherited_run_id="run-prior",
+        current_hunk_sha256={group.key: "1" * 64},
+    )[group.key]
+
+    assert matched.tier is InheritanceTier.UNIQUE_PAIR
+    assert matched.decision is DispositionDecision.MUST_FIX
+    assert matched.reason == "prior owner judgment"
+    assert matched.inherited_from == "run-prior"
+    assert matched.blank_reason is InheritanceBlankReason.SEVERITY_CHANGED
+
+
 @pytest.mark.parametrize(
     ("source_digest", "current_digest", "blank_reason"),
     [
@@ -604,8 +660,8 @@ def test_inheritance_matcher_demotes_exact_id_without_equal_known_hunk_digest(
         current_hunk_sha256={group.key: current_digest},
     )[group.key]
 
-    assert result.tier is InheritanceTier.UNIQUE_PAIR
-    assert result.decision is DispositionDecision.MUST_FIX
+    assert result.tier is InheritanceTier.UNIQUE_PAIR_STICKY
+    assert result.decision is DispositionDecision.ACCEPTED
     assert result.reason == "prior owner judgment"
     assert result.inherited_from == "run-prior"
     assert result.blank_reason == blank_reason
@@ -641,8 +697,8 @@ def test_inheritance_matcher_requires_equal_known_body_digest_for_exact_carry(
         current_hunk_sha256={group.key: "1" * 64},
     )[group.key]
 
-    assert result.tier is InheritanceTier.UNIQUE_PAIR
-    assert result.decision is DispositionDecision.MUST_FIX
+    assert result.tier is InheritanceTier.UNIQUE_PAIR_STICKY
+    assert result.decision is DispositionDecision.ACCEPTED
     assert result.blank_reason == blank_reason
 
 
@@ -674,7 +730,8 @@ def test_inheritance_body_digest_binds_all_bodies_and_is_order_insensitive() -> 
         current_hunk_sha256={reordered.groups[0].key: "1" * 64},
     )[reordered.groups[0].key]
 
-    assert changed_match.tier is InheritanceTier.UNIQUE_PAIR
+    assert changed_match.tier is InheritanceTier.UNIQUE_PAIR_STICKY
+    assert changed_match.decision is DispositionDecision.ACCEPTED
     assert changed_match.blank_reason is InheritanceBlankReason.DIAGNOSIS_CHANGED
     assert reordered_match.tier is InheritanceTier.EXACT_ID
     assert reordered_match.decision is DispositionDecision.ACCEPTED
@@ -709,7 +766,8 @@ def test_legacy_delimited_body_digest_demotes_after_digest_migration() -> None:
         current_hunk_sha256={group.key: "1" * 64},
     )[group.key]
 
-    assert matched.tier is InheritanceTier.UNIQUE_PAIR
+    assert matched.tier is InheritanceTier.UNIQUE_PAIR_STICKY
+    assert matched.decision is DispositionDecision.ACCEPTED
     assert matched.blank_reason == "diagnosis_changed"
 
 
@@ -905,7 +963,10 @@ def test_gate_artifacts_are_reconstructable_and_template_uses_public_ids(
     assert {item["finding_id"] for item in payload["findings"]} == {
         record.finding_id for record in document.dispositions
     }
-    assert "| Finding ID | Severity | Verdict | Disposition | Inherited from | Reason |" in markdown
+    assert (
+        "| Finding ID | Severity | Verdict | Disposition | Inherited from | "
+        "Inheritance tier | Demotion reason | Reason |"
+    ) in markdown
     assert md_path.read_text(encoding="utf-8") == markdown
     template = yaml.safe_load(template_path.read_text(encoding="utf-8"))
     assert {item["finding_id"] for item in template["dispositions"]} == {
@@ -982,7 +1043,7 @@ def test_gate_verdict_persists_per_finding_inheritance_outcome() -> None:
         inheritance=matches,
     )
 
-    assert verdict.findings[0].inheritance_tier is InheritanceTier.UNIQUE_PAIR
+    assert verdict.findings[0].inheritance_tier is InheritanceTier.UNIQUE_PAIR_STICKY
     assert verdict.findings[0].inheritance_blank_reason == "finding_id_changed"
 
 
@@ -1006,6 +1067,70 @@ def test_inheritance_summary_reason_keys_use_closed_vocabulary() -> None:
                 "reasons": {"invented_reason": 1},
             }
         )
+
+
+def test_inheritance_summary_defaults_sticky_for_legacy_persisted_data() -> None:
+    summary = InheritanceSummary.model_validate(
+        {
+            "source_run_id": "run-prior",
+            "carried": 1,
+            "prefilled": 2,
+            "blank": 3,
+            "reasons": {},
+        }
+    )
+
+    assert summary.sticky == 0
+    assert summary.model_dump(mode="json")["sticky"] == 0
+
+
+def test_inheritance_summary_and_markdown_distinguish_sticky() -> None:
+    inheritance = {
+        "exact": DispositionInheritance(
+            finding_id="exact",
+            decision=DispositionDecision.ACCEPTED,
+            reason="exact",
+            inherited_from="run-prior",
+            tier=InheritanceTier.EXACT_ID,
+        ),
+        "sticky": DispositionInheritance(
+            finding_id="sticky",
+            decision=DispositionDecision.ACCEPTED,
+            reason="sticky",
+            inherited_from="run-prior",
+            tier=InheritanceTier.UNIQUE_PAIR_STICKY,
+            blank_reason=InheritanceBlankReason.CONTENT_CHANGED,
+        ),
+        "prefilled": DispositionInheritance(
+            finding_id="prefilled",
+            reason="reason only",
+            inherited_from="run-prior",
+            tier=InheritanceTier.UNIQUE_PAIR,
+            blank_reason=InheritanceBlankReason.SEVERITY_CHANGED,
+        ),
+        "blank": DispositionInheritance(
+            finding_id="blank",
+            blank_reason=InheritanceBlankReason.UNMATCHED,
+        ),
+    }
+    summary = summarize_inheritance(inheritance, source_run_id="run-prior")
+    verdict = GateVerdict(
+        run_id="run-current",
+        repo="owner/repo",
+        pr_number=42,
+        anchor=GateAnchor(base_sha="a" * 40, head_sha="b" * 40),
+        counts={"CONFIRMED": 0, "REJECTED": 0, "UNCERTAIN": 0},
+        coverage=[],
+        findings=[],
+        verdict="BLOCK",
+        inheritance_summary=summary,
+    )
+
+    assert summary.carried == 1
+    assert summary.sticky == 1
+    assert summary.prefilled == 1
+    assert summary.blank == 1
+    assert "Carried: 1; sticky: 1; prefilled: 1; blank: 1" in render_gate_verdict(verdict)
 
 
 def test_disposition_template_does_not_include_rejected_findings(tmp_path: Path) -> None:
@@ -1068,7 +1193,7 @@ def test_disposition_template_renders_carried_prefilled_and_blank_entries(
     }
     assert records[by_rule["rule/uncertain"].key] == {
         "finding_id": by_rule["rule/uncertain"].key,
-        "decision": "must_fix",
+        "decision": "accepted",
         "reason": "moved acceptance",
         "inherited_from": "run-prior",
     }
@@ -1077,7 +1202,10 @@ def test_disposition_template_renders_carried_prefilled_and_blank_entries(
         "decision": "must_fix",
         "reason": "",
     }
-    assert "# blank_reason: unmatched" in template_path.read_text(encoding="utf-8")
+    rendered = template_path.read_text(encoding="utf-8")
+    assert "# inheritance_tier: unique_pair_sticky" in rendered
+    assert "# blank_reason: finding_id_changed" in rendered
+    assert "# blank_reason: unmatched" in rendered
 
 
 def test_provision_checkout_clones_detaches_and_verifies_head_and_clean(tmp_path: Path) -> None:

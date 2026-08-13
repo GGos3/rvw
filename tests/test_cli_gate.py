@@ -64,6 +64,7 @@ def prepared_artifacts(
     out_root: Path,
     *,
     actionable: bool = False,
+    extra_actionable: bool = False,
     replicas: int = 1,
     valid: int | None = None,
     blocker: bool = False,
@@ -86,6 +87,8 @@ def prepared_artifacts(
                 replica=1,
             )
         )
+        if extra_actionable:
+            findings.append(findings[0].model_copy(update={"rule_id": "rule/actionable-extra"}))
     discovered = DiscoverResult(
         lane_results={},
         findings=findings,
@@ -2057,7 +2060,7 @@ def test_gate_full_tier_one_inheritance_persists_document_and_auto_proceeds(
     assert (current.run.dir / "publish-payload.json").is_file()
 
 
-def test_gate_partial_inheritance_writes_prefilled_template_and_pauses(
+def test_gate_sticky_only_inheritance_writes_template_and_pauses(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     out_root = tmp_path / "runs"
@@ -2083,18 +2086,63 @@ def test_gate_partial_inheritance_writes_prefilled_template_and_pauses(
     assert len(calls) == 1
     assert "--inherit source-run" in result.stdout
     template = (current.run.dir / "gate-dispositions.yaml").read_text(encoding="utf-8")
-    assert "decision: must_fix" in template
+    assert "decision: accepted" in template
     assert "reason: accepted in prior run" in template
     assert "inherited_from: source-run" in template
-    assert "inheritance source=source-run carried=0 prefilled=1 blank=0" in result.stdout
+    assert "# inheritance_tier: unique_pair_sticky" in template
+    assert "# blank_reason: finding_id_changed" in template
+    assert "inheritance source=source-run carried=0 sticky=1 prefilled=0 blank=0" in result.stdout
     verdict = json.loads((current.run.dir / "gate-verdict.json").read_text(encoding="utf-8"))
     assert verdict["inheritance_summary"] == {
         "source_run_id": "source-run",
         "carried": 0,
-        "prefilled": 1,
+        "sticky": 1,
+        "prefilled": 0,
         "blank": 0,
         "reasons": {"finding_id_changed": 1},
     }
+    assert not (current.run.dir / "publish-payload.json").exists()
+
+
+def test_gate_mixed_exact_and_sticky_inheritance_writes_template_and_pauses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out_root = tmp_path / "runs"
+    current = prepared_artifacts(out_root, actionable=True, extra_actionable=True)
+    source = inherited_source(out_root, current)
+    source_verdict = source.load_gate_verdict()
+    exact_group = current.merged.groups[1]
+    source_verdict.findings.append(
+        source_verdict.findings[0].model_copy(
+            update={
+                "finding_id": exact_group.key,
+                "rule_id": exact_group.rule_id,
+                "body_sha256": BODY_SHA256,
+            }
+        )
+    )
+    save_gate_verdict(source.dir, source_verdict)
+    update_source_finding(source, finding_id="moved-finding-id")
+    patch_target_dependencies(monkeypatch, current)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "gate",
+            "--target",
+            "42",
+            "--inherit",
+            source.run_id,
+            "--out",
+            str(out_root),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "carried=1 sticky=1 prefilled=0 blank=0" in result.stdout
+    template = (current.run.dir / "gate-dispositions.yaml").read_text(encoding="utf-8")
+    assert template.count("decision: accepted") == 2
+    assert template.count("# inheritance_tier: unique_pair_sticky") == 1
     assert not (current.run.dir / "publish-payload.json").exists()
 
 
@@ -2122,10 +2170,13 @@ def test_gate_exact_id_with_changed_hunk_digest_pauses_with_diagnostic(
 
     assert result.exit_code == 1
     template = (current.run.dir / "gate-dispositions.yaml").read_text(encoding="utf-8")
-    assert "decision: must_fix" in template
+    assert "decision: accepted" in template
     assert "reason: accepted in prior run" in template
+    assert "# inheritance_tier: unique_pair_sticky" in template
     assert "# blank_reason: content_changed" in template
     verdict = json.loads((current.run.dir / "gate-verdict.json").read_text(encoding="utf-8"))
+    assert verdict["inheritance_summary"]["sticky"] == 1
+    assert verdict["inheritance_summary"]["prefilled"] == 0
     assert verdict["inheritance_summary"]["reasons"] == {"content_changed": 1}
     assert not (current.run.dir / "publish-payload.json").exists()
 
