@@ -116,6 +116,7 @@ class DispositionDocument(BaseModel):
 class InheritanceTier(StrEnum):
     EXACT_ID = "exact_id"
     UNIQUE_PAIR = "unique_pair"
+    UNIQUE_PAIR_STICKY = "unique_pair_sticky"
 
 
 class InheritanceBlankReason(StrEnum):
@@ -180,6 +181,7 @@ class InheritanceSummary(BaseModel):
 
     source_run_id: str
     carried: int = Field(ge=0)
+    sticky: int = Field(default=0, ge=0)
     prefilled: int = Field(ge=0)
     blank: int = Field(ge=0)
     reasons: dict[InheritanceBlankReason, int] = Field(default_factory=dict)
@@ -464,12 +466,15 @@ def match_inherited_dispositions(
                 blank_reason=blank_reason,
             )
             continue
+        if inherited.severity is not group.severity:
+            demotion_reason = InheritanceBlankReason.SEVERITY_CHANGED
+        sticky = inherited.severity is group.severity and group.severity is not Severity.BLOCKER
         results[group.key] = DispositionInheritance(
             finding_id=group.key,
-            decision=DispositionDecision.MUST_FIX,
+            decision=(DispositionDecision.ACCEPTED if sticky else DispositionDecision.MUST_FIX),
             reason=inherited.reason,
             inherited_from=inherited_run_id,
-            tier=InheritanceTier.UNIQUE_PAIR,
+            tier=(InheritanceTier.UNIQUE_PAIR_STICKY if sticky else InheritanceTier.UNIQUE_PAIR),
             blank_reason=demotion_reason or InheritanceBlankReason.FINDING_ID_CHANGED,
         )
     return results
@@ -481,12 +486,15 @@ def summarize_inheritance(
     source_run_id: str,
 ) -> InheritanceSummary:
     carried = 0
+    sticky = 0
     prefilled = 0
     blank = 0
     reasons: Counter[InheritanceBlankReason] = Counter()
     for result in inheritance.values():
         if result.tier is InheritanceTier.EXACT_ID:
             carried += 1
+        elif result.tier is InheritanceTier.UNIQUE_PAIR_STICKY:
+            sticky += 1
         elif result.reason:
             prefilled += 1
         else:
@@ -496,6 +504,7 @@ def summarize_inheritance(
     return InheritanceSummary(
         source_run_id=source_run_id,
         carried=carried,
+        sticky=sticky,
         prefilled=prefilled,
         blank=blank,
         reasons=dict(sorted(reasons.items(), key=lambda item: item[0].value)),
@@ -631,7 +640,7 @@ def write_disposition_template(
     *,
     inheritance: Mapping[str, DispositionInheritance] | None = None,
 ) -> Path:
-    records: list[tuple[dict[str, str], InheritanceBlankReason | None]] = []
+    records: list[tuple[dict[str, str], InheritanceTier | None, InheritanceBlankReason | None]] = []
     for group, _ in _actionable(merged, outcome):
         matched = inheritance.get(group.key) if inheritance is not None else None
         record = {
@@ -645,11 +654,19 @@ def write_disposition_template(
         }
         if matched is not None and matched.inherited_from is not None:
             record["inherited_from"] = matched.inherited_from
-        records.append((record, matched.blank_reason if matched is not None else None))
+        records.append(
+            (
+                record,
+                matched.tier if matched is not None else None,
+                matched.blank_reason if matched is not None else None,
+            )
+        )
     lines = ["schema_version: 1", "dispositions:" if records else "dispositions: []"]
-    for record, blank_reason in records:
+    for record, tier, blank_reason in records:
         dumped = yaml.safe_dump([record], sort_keys=False, allow_unicode=True).rstrip("\n")
         lines.extend(dumped.splitlines())
+        if tier is InheritanceTier.UNIQUE_PAIR_STICKY:
+            lines.append(f"  # inheritance_tier: {tier.value}")
         if blank_reason is not None:
             lines.append(f"  # blank_reason: {blank_reason.value}")
     path = run_dir / "gate-dispositions.yaml"
@@ -693,8 +710,11 @@ def render_gate_verdict(verdict: GateVerdict) -> str:
             "",
             "## Gate findings",
             "",
-            "| Finding ID | Severity | Verdict | Disposition | Inherited from | Reason |",
-            "| --- | --- | --- | --- | --- | --- |",
+            (
+                "| Finding ID | Severity | Verdict | Disposition | Inherited from | "
+                "Inheritance tier | Demotion reason | Reason |"
+            ),
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     lines.extend(
@@ -702,12 +722,14 @@ def render_gate_verdict(verdict: GateVerdict) -> str:
             f"| `{item.finding_id}` | {item.severity.value} | {item.verdict.value} | "
             f"{item.disposition.value} | "
             f"{f'`{_cell(item.inherited_from)}`' if item.inherited_from else '—'} | "
+            f"{item.inheritance_tier.value if item.inheritance_tier else '—'} | "
+            f"{item.inheritance_blank_reason.value if item.inheritance_blank_reason else '—'} | "
             f"{_cell(item.reason)} |"
         )
         for item in verdict.findings
     )
     if not verdict.findings:
-        lines.append("| — | — | — | — | — | No actionable findings |")
+        lines.append("| — | — | — | — | — | — | — | No actionable findings |")
     if verdict.actor is not None:
         lines.extend(["", f"Verified blocker-acceptance actor: `{verdict.actor}`"])
     if verdict.inheritance_summary is not None:
@@ -722,7 +744,8 @@ def render_gate_verdict(verdict: GateVerdict) -> str:
                 "",
                 f"Source run: `{summary.source_run_id}`",
                 (
-                    f"Carried: {summary.carried}; prefilled: {summary.prefilled}; "
+                    f"Carried: {summary.carried}; sticky: {summary.sticky}; "
+                    f"prefilled: {summary.prefilled}; "
                     f"blank: {summary.blank}; reasons: {reasons}"
                 ),
             ]
