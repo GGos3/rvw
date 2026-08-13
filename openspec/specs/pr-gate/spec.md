@@ -287,7 +287,7 @@ Every non-carried match result MUST expose a machine-readable `blank_reason` tha
 #### Scenario: Prior must-fix finding recurs
 
 - **WHEN** the inherited verdict marked a finding `must_fix` and the new run re-detects the same finding ID
-- **THEN** the generated record is a blank `must_fix` template entry without a carried reason
+- **THEN** the generated record is a blank `must_fix` template entry without a carried reason and without sticky inheritance
 
 #### Scenario: Same rule moved to a different hunk
 
@@ -307,7 +307,7 @@ Every non-carried match result MUST expose a machine-readable `blank_reason` tha
 #### Scenario: Rule fires twice in one file
 
 - **WHEN** either run contains two findings with the same `(file, rule_id)` pair, including a mixed accepted and must-fix pair in the inherited verdict
-- **THEN** no disposition carries for that pair and the entries remain blank even if one or more public IDs and both digests match exactly
+- **THEN** no disposition carries or becomes sticky for that pair and the entries remain blank even if one or more public IDs and both digests match exactly
 
 ### Requirement: Fully inherited runs proceed without pausing
 

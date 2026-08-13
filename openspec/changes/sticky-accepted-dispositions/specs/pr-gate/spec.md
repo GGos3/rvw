@@ -23,11 +23,6 @@ When the unique pair is a blocker or its severity changed, gate MUST keep decisi
 - **WHEN** every current actionable finding is covered by a sticky acceptance but none qualifies for exact carry
 - **THEN** gate persists a generated disposition template and exits for operator completion rather than creating a completed verdict
 
-#### Scenario: Exact finding recurs unchanged
-
-- **WHEN** a previously accepted finding has equal public ID, `(file, rule_id)`, severity, and known hunk and body-set digests
-- **THEN** gate retains the exact-ID carried acceptance and its eligibility for automatic continuation
-
 #### Scenario: Unique blocker recurs after content changes
 
 - **WHEN** a previously accepted blocker uniquely matches the current blocker by `(file, rule_id)` but does not qualify for exact carry
@@ -40,13 +35,13 @@ When the unique pair is a blocker or its severity changed, gate MUST keep decisi
 
 #### Scenario: Rule fires twice in one file
 
-- **WHEN** either run contains two findings with the same `(file, rule_id)` pair
-- **THEN** no disposition carries or becomes sticky for that pair and the entries remain blank
+- **WHEN** either run contains two findings with the same `(file, rule_id)` pair, including a mixed accepted and must-fix pair in the inherited verdict
+- **THEN** no disposition carries or becomes sticky for that pair and the entries remain blank even if one or more public IDs and both digests match exactly
 
 #### Scenario: Prior must-fix finding recurs
 
-- **WHEN** the inherited verdict marked a finding `must_fix` and the new run re-detects it
-- **THEN** the generated record remains `must_fix` without sticky inheritance
+- **WHEN** the inherited verdict marked a finding `must_fix` and the new run re-detects the same finding ID
+- **THEN** the generated record is a blank `must_fix` template entry without a carried reason and without sticky inheritance
 
 #### Scenario: Exact finding recurs after an unrelated push
 
@@ -61,7 +56,7 @@ When the unique pair is a blocker or its severity changed, gate MUST keep decisi
 #### Scenario: Exact finding ID has changed hunk content
 
 - **WHEN** a public finding ID equals an accepted inherited finding but the known hunk digests differ
-- **THEN** gate keeps `must_fix`, prefills under tier-two uniqueness rules, records `blank_reason: content_changed`, and does not auto-proceed
+- **THEN** gate applies tier-two rules, records `blank_reason: content_changed`, and does not auto-proceed
 
 #### Scenario: Prior verdict has no hunk digest
 
@@ -101,16 +96,11 @@ When the unique pair is a blocker or its severity changed, gate MUST keep decisi
 #### Scenario: Same rule moved to a different hunk
 
 - **WHEN** an accepted finding's `(file, rule_id)` pair matches exactly one finding in each run but the finding IDs differ
-- **THEN** the generated record keeps decision `must_fix`, prefills the prior reason, and stamps the inherited run ID
+- **THEN** an equal-severity non-blocker record becomes `accepted` at tier `unique_pair_sticky`, prefills the prior reason, stamps the inherited run ID, and records `finding_id_changed`
 
 ### Requirement: Fully inherited runs proceed without pausing
 
 When every actionable finding of the current run is covered by a hunk-and-body-digest-verified exact-ID carried acceptance, gate MUST persist the generated disposition document and continue into disposition validation and verdict construction in the same invocation. Sticky accepted entries MUST count as requiring operator completion even though their generated decisions are `accepted`. A partial-inheritance pause MUST report and persist the source run ID plus exact-carried, sticky, reason-only prefilled, and blank counts grouped by machine-readable reason.
-
-#### Scenario: Every actionable finding is exact-carried
-
-- **WHEN** all actionable findings receive exact-ID carried acceptances from the inherited verdict
-- **THEN** gate validates the persisted generated document and reports a verdict in the same invocation
 
 #### Scenario: One finding is sticky
 
