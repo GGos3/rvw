@@ -3,6 +3,7 @@
 ## Purpose
 
 Define interactive review, deterministic auto policy, lane health gates, packaging, and the boundary between rvw execution mechanics and external executor guidance.
+
 ## Requirements
 
 ### Requirement: Runtime executions honor the host-global concurrency contract
@@ -202,7 +203,22 @@ Neither review nor auto mode SHALL emit an approving review, and `--allow-approv
 
 ### Requirement: Sampling compares enum and free variants
 
-The sampling gate MUST pass its fixture diff through the shared exclusion and chunk planner, MUST execute closed-enum and free-rule-ID variants with equal replica counts for every chunk in one bounded wave, MUST report sorted free-variant rule IDs absent from the lane's closed enum as `novel_rule_ids`, and MUST report in-enum enum-only and free-only `(file, line)` sites separately as site variance. It MUST retain the `PASS` and `REVIEW` verdict values, MUST report `REVIEW` and exit 1 only when `novel_rule_ids` is nonempty, and MUST otherwise report `PASS` and exit 0 even when site variance exists.
+The sampling gate MUST accept both unified-diff fixtures and ordinary source-file fixtures, MUST pass a fixture that starts with a `diff --git ` or `--- ` file header to the shared exclusion and chunk planner without wrapping it in another diff, and MUST convert an ordinary source-file fixture to a `/dev/null` unified diff before planning. It MUST fail before runtime dispatch with a machine-readable `empty-review-diff` user error containing every excluded file's reason when budgeting retains zero review characters. Otherwise, it MUST execute closed-enum and free-rule-ID variants with equal replica counts for every chunk in one bounded wave, MUST report sorted free-variant rule IDs absent from the lane's closed enum as `novel_rule_ids`, and MUST report in-enum enum-only and free-only `(file, line)` sites separately as site variance. It MUST retain the `PASS` and `REVIEW` verdict values, MUST report `REVIEW` and exit 1 only when `novel_rule_ids` is nonempty, and MUST otherwise report `PASS` and exit 0 even when site variance exists.
+
+#### Scenario: Unified diff fixture is sampled directly
+
+- **WHEN** a fixture starts with a supported unified-diff file header and contains multiple file segments
+- **THEN** sampling budgets and chunks those original segments without a containing diff-of-diff layer
+
+#### Scenario: Ordinary source file is sampled
+
+- **WHEN** a fixture does not start with a supported unified-diff file header
+- **THEN** sampling reviews the unified diff produced by comparing `/dev/null` with that fixture
+
+#### Scenario: Every fixture segment is excluded
+
+- **WHEN** generated-path and oversized-file exclusions leave zero retained fixture characters
+- **THEN** sampling dispatches no runtime work, cannot report `PASS`, and exits in the user-error class with error code `empty-review-diff` and the `excluded_reason` mapping
 
 #### Scenario: Free variant invents a rule ID
 
@@ -269,3 +285,4 @@ anchor checks, lineage rechecks, and stack-level artifacts.
 - **WHEN** `rvw review` or `rvw auto` is invoked
 - **THEN** its existing stage order, defaults, pause behavior, and artifact
   contract remain unchanged
+
