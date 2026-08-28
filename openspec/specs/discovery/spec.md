@@ -31,7 +31,7 @@ The DISCOVER stage MUST plan one run per active lane per diff chunk by default, 
 #### Scenario: Four lanes activate over two chunks
 
 - **WHEN** discovery uses its default replica count while adjudication uses three replicas
-- **THEN** it submits eight planned runs without waiting for one lane or chunk to finish before submitting another
+- **THEN** discovery submits eight planned runs without waiting for one lane or chunk to finish before submitting another
 
 #### Scenario: Three replicas are explicitly requested
 
@@ -155,3 +155,13 @@ Discovery MUST record each activated lane's aggregate dispatched, valid, and fin
 
 - **WHEN** a two-chunk, three-replica lane has five VALID final results and one INVALID final result
 - **THEN** coverage reports six dispatched, five valid, and six distinct run entries identifying the invalid replica-chunk combination
+
+### Requirement: Discovery requires a reviewable diff
+
+Discovery MUST fail with a machine-readable `empty-review-diff` error containing every excluded file's reason when generated-path and oversized-file exclusions retain zero review characters, and MUST do so before constructing or dispatching runtime work.
+
+#### Scenario: Every changed file is excluded
+
+- **WHEN** all target diff segments match generated paths or exceed the per-file character limit
+- **THEN** discovery dispatches no lane replicas and reports the `excluded_reason` mapping instead of producing zero-finding coverage
+
