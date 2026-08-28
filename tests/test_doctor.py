@@ -53,7 +53,11 @@ def outcome(
 ) -> dict[str, object]:
     return {
         "verdicts": verdicts,
-        "reasons": {},
+        "reasons": {
+            key: "fixture uncertainty reason"
+            for key, verdict in verdicts.items()
+            if verdict == "UNCERTAIN"
+        },
         "evidence": {},
         "replica_votes": {},
         "unresolved": unresolved or [],

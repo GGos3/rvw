@@ -14,7 +14,7 @@ from rvw.hostslots import HostSlotGate
 from rvw.lane import Lane
 from rvw.merge import merge
 from rvw.registry import Registry
-from rvw.runtimes import RunResult, RunStatus, Runtime
+from rvw.runtimes import RunDiagnostic, RunResult, RunStatus, Runtime
 from rvw.schema import RuntimeFinding, RuntimeLaneOutput, Severity, Tier
 from rvw.target import ResolvedTarget
 
@@ -325,6 +325,7 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
                 "findings": 0,
                 "invalid_reason": None,
                 "attempts": [{"attempt": 1, "valid": True, "invalid_reason": None}],
+                "diagnostic": None,
             }
             for replica in (1, 2)
         ],
@@ -349,6 +350,7 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
                     }
                     for attempt in (1, 2)
                 ],
+                "diagnostic": None,
             }
             for replica in (1, 2)
         ],
@@ -426,6 +428,45 @@ def test_run_coverage_rejects_non_sequential_or_finally_mismatched_attempts(
             findings=0,
             invalid_reason=None,
             attempts=attempts,
+        )
+
+
+def test_run_coverage_accepts_attempts_and_final_diagnostic_together() -> None:
+    diagnostic = RunDiagnostic(
+        exit_code=124,
+        log_path="/tmp/lane/r1/run.log",
+        log_bytes=17,
+        output_path="/tmp/lane/r1/out.json",
+        output_bytes=0,
+    )
+
+    coverage = RunCoverage(
+        replica=1,
+        chunk=1,
+        valid=False,
+        findings=0,
+        invalid_reason="empty",
+        attempts=[
+            {"attempt": 1, "valid": False, "invalid_reason": "exit_nonzero:124"},
+            {"attempt": 2, "valid": False, "invalid_reason": "empty"},
+        ],
+        diagnostic=diagnostic,
+    )
+
+    assert coverage.attempts[0].invalid_reason == "exit_nonzero:124"
+    assert coverage.diagnostic == diagnostic
+
+
+def test_run_coverage_rejects_valid_run_with_diagnostic() -> None:
+    with pytest.raises(ValueError, match=r"valid.*diagnostic"):
+        RunCoverage(
+            replica=1,
+            chunk=1,
+            valid=True,
+            findings=0,
+            invalid_reason=None,
+            attempts=[{"attempt": 1, "valid": True, "invalid_reason": None}],
+            diagnostic=RunDiagnostic(exit_code=0),
         )
 
 

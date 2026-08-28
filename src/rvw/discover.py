@@ -20,7 +20,7 @@ from rvw.hunks import hunk_for_line, is_anchorable, parse_hunks
 from rvw.lane import load_lane
 from rvw.prompts import build_chunk_context, build_lane_prompt
 from rvw.registry import Registry
-from rvw.runtimes import RunResult, RunStatus, Runtime
+from rvw.runtimes import RunDiagnostic, RunResult, RunStatus, Runtime
 from rvw.schema import Finding, Tier
 from rvw.target import ResolvedTarget
 
@@ -63,6 +63,7 @@ class RunCoverage(BaseModel):
     findings: int = Field(ge=0)
     invalid_reason: str | None
     attempts: list[RunAttempt] = Field(default_factory=list)
+    diagnostic: RunDiagnostic | None = None
 
     @model_validator(mode="after")
     def _validity_must_match_reason(self) -> RunCoverage:
@@ -72,6 +73,8 @@ class RunCoverage(BaseModel):
             raise ValueError("invalid coverage runs require an invalid_reason")
         if not self.valid and self.findings:
             raise ValueError("invalid coverage runs cannot have findings")
+        if self.valid and self.diagnostic is not None:
+            raise ValueError("valid coverage runs cannot have a diagnostic")
         if self.attempts:
             attempt_numbers = [attempt.attempt for attempt in self.attempts]
             if attempt_numbers != list(range(1, len(self.attempts) + 1)):
@@ -277,6 +280,7 @@ async def discover(
                 findings=finding_counts.get((result.lane_id, result.replica, result.chunk), 0),
                 invalid_reason=result.invalid_reason,
                 attempts=_coverage_attempts(result, dispatched.initial_by_key),
+                diagnostic=result.diagnostic,
             )
             for result in results
         ]

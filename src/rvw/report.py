@@ -12,6 +12,7 @@ from rvw.diffbudget import DiffBudgetReport
 from rvw.discover import LaneCoverage
 from rvw.merge import CollapseGroup, MergeResult, PatternFold, RegionFold
 from rvw.schema import Verdict
+from rvw.summary import ReviewStatus, RunSummary
 from rvw.target import ResolvedTarget
 
 _SYNTHESIS_PLACEHOLDER = "_(종합은 오케스트레이터가 작성합니다 — rvw report --synthesis 로 주입)_"
@@ -288,6 +289,37 @@ def _coverage_section(
     return "\n".join(lines)
 
 
+def _status_section(summary: RunSummary | None) -> str:
+    if summary is None:
+        return ""
+    if summary.status is ReviewStatus.DEGRADED:
+        label = "partial review — one or more lane executions failed"
+    elif summary.status is ReviewStatus.FAILED:
+        label = "failed review — results are incomplete"
+    elif summary.status is ReviewStatus.COMPLETE:
+        label = "complete review"
+    else:
+        label = "review still running"
+    lines = ["## 실행 상태", "", f"status: `{summary.status.value}` — {label}"]
+    if summary.failed_lanes:
+        lines.extend(["", "failed lanes:"])
+        for lane in summary.failed_lanes:
+            details = ", ".join(
+                f"`{failure.reason}` (replica {failure.replica}, chunk {failure.chunk})"
+                for failure in lane.failures
+            )
+            lines.append(f"- `{lane.lane_id}`: {details}")
+    if summary.error is not None:
+        lines.extend(
+            [
+                "",
+                f"run error: `{summary.error.stage}/{summary.error.reason}` — "
+                f"{summary.error.message}",
+            ]
+        )
+    return "\n".join(lines)
+
+
 def render_report(
     *,
     target: ResolvedTarget,
@@ -296,6 +328,7 @@ def render_report(
     coverage: Sequence[LaneCoverage],
     budget: DiffBudgetReport | None,
     synthesis: str | None = None,
+    summary: RunSummary | None = None,
 ) -> str:
     """Render one report without reading or writing external state."""
 
@@ -303,9 +336,11 @@ def render_report(
     parts = [
         f"# rvw 리뷰 — {target.repo} {_target_label(target)}",
         f"head: `{target.head_sha}`  \nUTC timestamp: {timestamp}",
-        "## 종합",
-        synthesis if synthesis is not None else _SYNTHESIS_PLACEHOLDER,
     ]
+    status_section = _status_section(summary)
+    if status_section:
+        parts.append(status_section)
+    parts.extend(["## 종합", synthesis if synthesis is not None else _SYNTHESIS_PLACEHOLDER])
 
     if outcome is None:
         items = _unadjudicated_items(merged)
