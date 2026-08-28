@@ -13,6 +13,7 @@ import pytest
 
 import rvw.adjudicate as adjudicate_module
 from rvw.adjudicate import (
+    AdjudicationInfrastructureError,
     AdjudicationOutcome,
     adjudicate,
     adjudication_schema,
@@ -332,22 +333,51 @@ async def test_all_invalid_retries_once_before_voting(tmp_path: Path) -> None:
     assert all("initial-retry" in cast(Path, call["run_dir"]).parts for call in runtime.calls[3:])
 
 
-async def test_all_invalid_after_retry_becomes_uncertain_and_expands(tmp_path: Path) -> None:
+async def test_all_invalid_after_retry_is_infrastructure_failure(tmp_path: Path) -> None:
     group = make_group("all-invalid")
     invalid = [None, None, None]
-    split = [
-        RuntimeAdjudication(items=[item(group.key, Verdict.CONFIRMED)]),
-        RuntimeAdjudication(items=[item(group.key, Verdict.REJECTED, evidence="safe")]),
-        RuntimeAdjudication(items=[item(group.key, Verdict.UNCERTAIN, evidence="")]),
-    ]
+    runtime = FakeRuntime([invalid, invalid])
 
-    outcome, runtime = await run_fake(tmp_path, [group], [invalid, invalid, split])
+    with pytest.raises(
+        AdjudicationInfrastructureError, match="no valid adjudication output"
+    ) as raised:
+        await adjudicate(
+            make_merged(group),
+            target=make_target(),
+            runtime=runtime,
+            repo_dir=tmp_path,
+            out_root=tmp_path / "out",
+            replicas=3,
+            deadline_seconds=30,
+        )
 
-    assert outcome.verdicts[group.key] is Verdict.UNCERTAIN
-    assert outcome.unresolved == [group.key]
-    assert len(runtime.calls) == 9
-    assert all("initial-retry" in cast(Path, call["run_dir"]).parts for call in runtime.calls[3:6])
-    assert all("expanded" in cast(Path, call["run_dir"]).parts for call in runtime.calls[6:])
+    assert len(runtime.calls) == 6
+    assert raised.value.pass_name == "initial"
+    assert len(raised.value.attempts) == 6
+    assert {attempt.reason for attempt in raised.value.attempts} == {"scripted-invalid"}
+    assert raised.value.outcome is None
+
+
+def test_uncertain_runtime_item_requires_non_empty_reason() -> None:
+    with pytest.raises(ValueError, match=r"UNCERTAIN.*reason"):
+        RuntimeAdjudicationItem(
+            group_key="group",
+            verdict=Verdict.UNCERTAIN,
+            reason="   ",
+            evidence="",
+        )
+
+
+def test_uncertain_outcome_requires_non_empty_reason() -> None:
+    with pytest.raises(ValueError, match=r"UNCERTAIN.*reason"):
+        AdjudicationOutcome(
+            verdicts={"group": Verdict.UNCERTAIN},
+            reasons={"group": ""},
+            evidence={"group": ""},
+            replica_votes={"group": [Verdict.UNCERTAIN]},
+            unresolved=["group"],
+            coerced_rejections=0,
+        )
 
 
 def test_adjudication_schema_is_strict_and_closes_group_keys() -> None:

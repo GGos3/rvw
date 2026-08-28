@@ -18,6 +18,7 @@ DISCOVER resolves active lanes into bounded runtime work, supplies each lane the
 - On 2026-07-28, three `apifuse-provider-tabelog` worktree reviews retained 734,985 characters and `codex-lb` PR #1520 retained 464,425 characters. Both were legitimate source review units, so the 400,000-character aggregate limit now bounds one prompt and expands work into ordered whole-file chunks instead of rejecting the review.
 - 2026-08-21: adjudication and stack presence recheck were found re-embedding the unfiltered target diff, returning excluded generated and oversized segments to prompts. The exclusion policy therefore also exposes an unpartitioned reviewed-diff projection so post-discovery stages share one owner for that policy instead of re-implementing it.
 - 2026-08-21: the all-invalid replacement wave was found re-sending a byte-identical prompt, so it now carries that lane-chunk's prior invalid reasons in the same form stack presence recheck already used.
+- Final planned execution loss is evaluated separately from retry history. Ordered attempts remain the audit trail, while the final diagnostic and normalized reason drive strict coverage status: mixed valid/invalid execution is degraded and all-invalid planned execution is failed.
 
 ## Constraints
 
@@ -35,6 +36,7 @@ DISCOVER resolves active lanes into bounded runtime work, supplies each lane the
 - A generated file not matched by the default globs may create extra chunks and model work.
 - The exclusion header is rendered once by a shared helper. Rebuilding the unpartitioned reviewed diff by joining chunk text would restate that header once per chunk, and only the intersection of a nonempty exclusion set with a multi-chunk retained diff exposes it; a test covering either condition alone passes.
 - If all replicas remain invalid after the replacement wave, the lane contributes no findings but remains visible with zero valid coverage.
+- Successful lane findings survive a degraded run, but the run summary, CLI JSON, and report label them as partial and identify every failed lane execution.
 - Missing, duplicated, unexpected, or invalid lane-replica-chunk coverage remains a fail-closed gate condition.
 - A PR body can be wrong or adversarial; it is intent provenance, not correctness evidence.
 - Empty or malformed diffs can fail file segmentation instead of reaching a runtime.

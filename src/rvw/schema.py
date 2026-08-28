@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 SCHEMA_VERSION = 1
 
@@ -59,6 +59,12 @@ class RuntimeAdjudicationItem(BaseModel):
     verdict: Verdict
     reason: str
     evidence: str
+
+    @model_validator(mode="after")
+    def _uncertain_requires_reason(self) -> RuntimeAdjudicationItem:
+        if self.verdict is Verdict.UNCERTAIN and not self.reason.strip():
+            raise ValueError("UNCERTAIN adjudication items require a non-empty reason")
+        return self
 
 
 class RuntimeAdjudication(BaseModel):

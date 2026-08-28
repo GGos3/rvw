@@ -7,6 +7,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,7 +17,7 @@ from rvw.adjudicate import AdjudicationOutcome
 from rvw.diffbudget import DiffBudgetReport
 from rvw.discover import DiscoverResult, EnrichedFinding, LaneCoverage
 from rvw.merge import MergeResult
-from rvw.schema import Verdict
+from rvw.summary import RunSummary, running_summary
 from rvw.target import ResolvedTarget
 
 if TYPE_CHECKING:
@@ -84,14 +85,25 @@ class StageMissing(FileNotFoundError):
     def __init__(self, stage: str, run_dir: Path) -> None:
         self.stage = stage
         self.run_dir = run_dir
-        super().__init__(f"{stage.upper()} stage is missing from {run_dir}")
+        suffix = ".md" if stage == "report" else ".json"
+        super().__init__(
+            f"{stage.upper()} stage is missing required artifact {stage}{suffix} from {run_dir}"
+        )
 
 
 def _write_json(path: Path, value: object) -> None:
-    path.write_text(
-        f"{json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)}\n",
-        encoding="utf-8",
-    )
+    text = f"{json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)}\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as artifact:
+            artifact.write(text)
+            artifact.flush()
+            os.fsync(artifact.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _load_json(path: Path, stage: str) -> Any:
@@ -193,6 +205,12 @@ class RunHandle:
     def load_target(self) -> ResolvedTarget:
         return ResolvedTarget.model_validate(self._load_contained_json("target.json", "target"))
 
+    def save_summary(self, summary: RunSummary) -> None:
+        _write_json(self.dir / "run.json", summary.model_dump(mode="json"))
+
+    def load_summary(self) -> RunSummary:
+        return RunSummary.model_validate(self._load_contained_json("run.json", "run"))
+
     def save_discover(self, discovered: DiscoverResult) -> None:
         _write_json(
             self.dir / "discover.json",
@@ -226,37 +244,24 @@ class RunHandle:
         return MergeResult.model_validate(_load_json(self.dir / "merge.json", "merge"))
 
     def save_outcome(self, outcome: AdjudicationOutcome) -> None:
-        _write_json(
-            self.dir / "outcome.json",
-            {
-                "verdicts": {key: verdict.value for key, verdict in outcome.verdicts.items()},
-                "reasons": outcome.reasons,
-                "evidence": outcome.evidence,
-                "replica_votes": {
-                    key: [verdict.value for verdict in votes]
-                    for key, votes in outcome.replica_votes.items()
-                },
-                "unresolved": outcome.unresolved,
-                "coerced_rejections": outcome.coerced_rejections,
-            },
-        )
+        _write_json(self.dir / "outcome.json", outcome.model_dump(mode="json"))
 
     def load_outcome(self) -> AdjudicationOutcome:
         raw = _load_json(self.dir / "outcome.json", "outcome")
-        return AdjudicationOutcome(
-            verdicts={key: Verdict(value) for key, value in raw["verdicts"].items()},
-            reasons=raw["reasons"],
-            evidence=raw["evidence"],
-            replica_votes={
-                key: [Verdict(value) for value in votes]
-                for key, votes in raw["replica_votes"].items()
-            },
-            unresolved=raw["unresolved"],
-            coerced_rejections=raw["coerced_rejections"],
-        )
+        return AdjudicationOutcome.model_validate(raw)
 
     def save_report(self, report: str) -> None:
-        (self.dir / "report.md").write_text(report, encoding="utf-8")
+        path = self.dir / "report.md"
+        fd, temporary_name = tempfile.mkstemp(prefix=".report.md.", dir=self.dir)
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as artifact:
+                artifact.write(report)
+                artifact.flush()
+                os.fsync(artifact.fileno())
+            os.replace(temporary_path, path)
+        finally:
+            temporary_path.unlink(missing_ok=True)
 
     def load_report(self) -> str:
         path = self.dir / "report.md"
@@ -301,11 +306,15 @@ class RunStore:
                     if timestamp != previous_timestamp:
                         break
                 continue
-            return RunHandle(run_id=run_id, dir=run_dir)
+            run = RunHandle(run_id=run_id, dir=run_dir)
+            run.save_summary(running_summary(run_id))
+            return run
         run_id = f"rvw-{timestamp}-{kind}-{short}"
         run_dir = self.root / run_id
         run_dir.mkdir(parents=True, exist_ok=False)
-        return RunHandle(run_id=run_id, dir=run_dir)
+        run = RunHandle(run_id=run_id, dir=run_dir)
+        run.save_summary(running_summary(run_id))
+        return run
 
     def open(self, run_id: str) -> RunHandle:
         if not _SAFE_RUN_ID.fullmatch(run_id) or run_id in {".", ".."}:

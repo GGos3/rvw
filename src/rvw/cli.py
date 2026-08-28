@@ -20,7 +20,11 @@ from rich.console import Console
 from rich.table import Table
 
 from rvw import __version__
-from rvw.adjudicate import AdjudicationOutcome, adjudicate
+from rvw.adjudicate import (
+    AdjudicationInfrastructureError,
+    AdjudicationOutcome,
+    adjudicate,
+)
 from rvw.diffbudget import EmptyReviewDiffError, apply_diff_budget
 from rvw.discover import DiscoverResult, resolve_lane_path
 from rvw.dispatch import (
@@ -64,6 +68,7 @@ from rvw.hunks import hunk_sha256_by_id
 from rvw.lane import Lane, load_lane
 from rvw.pipeline import (
     PipelineArtifacts,
+    PipelineInfrastructureError,
     coverage_totals,
     execute_pipeline,
     load_pipeline_artifacts,
@@ -102,6 +107,7 @@ from rvw.store import (
     StageMissing,
     parse_pr_run_id,
 )
+from rvw.summary import ReviewStatus, RunError, RunSummary, summarize_run
 from rvw.target import ResolvedTarget, TargetResolutionError, resolve_target
 
 EXIT_OK = 0
@@ -530,6 +536,23 @@ def _verdict_counts(outcome: AdjudicationOutcome | None) -> dict[str, int]:
     return verdict_counts(outcome)
 
 
+def _artifact_summary(artifacts: PipelineArtifacts) -> RunSummary:
+    return artifacts.summary or summarize_run(artifacts.run.run_id, artifacts.discovered)
+
+
+def _review_payload(artifacts: PipelineArtifacts) -> dict[str, object]:
+    summary = _artifact_summary(artifacts)
+    return {
+        "run_id": artifacts.run.run_id,
+        "report_path": str(artifacts.report_path),
+        "status": summary.status.value,
+        "failed_lanes": [lane.model_dump(mode="json") for lane in summary.failed_lanes],
+        "verdict_counts": _verdict_counts(artifacts.outcome),
+        "coverage_totals": summary.coverage_totals.model_dump(mode="json"),
+        "error": summary.error.model_dump(mode="json") if summary.error is not None else None,
+    }
+
+
 async def _review_pipeline(
     *,
     target_spec: str,
@@ -552,22 +575,40 @@ async def _review_pipeline(
         if resolved_target.kind != "pr":
             _error_console.print("--publish requires a PR target", markup=False)
             raise typer.Exit(EXIT_USER_ERROR)
-    artifacts = await _execute_pipeline(
-        target_spec=target_spec,
-        repo_dir=repo_dir,
-        registry_root=registry_root,
-        discover_replicas=discover_replicas,
-        adjudicate_replicas=adjudicate_replicas,
-        concurrency=concurrency,
-        deadline_seconds=deadline_seconds,
-        out_root=out_root,
-        pause=pause,
-        dynamic_brief=dynamic_brief,
-        resolved_target=resolved_target,
-        host_gate=host_gate,
-    )
+    try:
+        artifacts = await _execute_pipeline(
+            target_spec=target_spec,
+            repo_dir=repo_dir,
+            registry_root=registry_root,
+            discover_replicas=discover_replicas,
+            adjudicate_replicas=adjudicate_replicas,
+            concurrency=concurrency,
+            deadline_seconds=deadline_seconds,
+            out_root=out_root,
+            pause=pause,
+            dynamic_brief=dynamic_brief,
+            resolved_target=resolved_target,
+            host_gate=host_gate,
+        )
+    except PipelineInfrastructureError as exc:
+        artifacts = exc.artifacts
+        if json_output:
+            _write_json(_review_payload(artifacts))
+        else:
+            _error_console.print(str(exc), markup=False)
+            _error_console.print(f"partial report: {artifacts.report_path}", markup=False)
+        raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
     if artifacts is None:
         return
+
+    summary = _artifact_summary(artifacts)
+    if summary.status is ReviewStatus.FAILED:
+        if json_output:
+            _write_json(_review_payload(artifacts))
+        else:
+            _error_console.print("review failed: no valid planned lane execution", markup=False)
+            _error_console.print(f"partial report: {artifacts.report_path}", markup=False)
+        raise typer.Exit(EXIT_SYSTEM_ERROR)
 
     publication_url: str | None = None
     payload_path: Path | None = None
@@ -586,17 +627,11 @@ async def _review_pipeline(
             payload_path = artifacts.run.dir / "publish-payload.json"
 
     if json_output:
-        _write_json(
-            {
-                "run_id": artifacts.run.run_id,
-                "report_path": str(artifacts.report_path),
-                "verdict_counts": _verdict_counts(artifacts.outcome),
-                "coverage_totals": _coverage_totals(artifacts.discovered),
-            }
-        )
+        _write_json(_review_payload(artifacts))
         return
 
     _console.print(f"run id: {artifacts.run.run_id}", markup=False, soft_wrap=True)
+    _console.print(f"status: {summary.status.value}", markup=False)
     _console.print(f"report: {artifacts.report_path}", markup=False, soft_wrap=True)
     if payload_path is not None:
         _console.print(f"dry-run payload: {payload_path}", markup=False, soft_wrap=True)
@@ -1618,8 +1653,100 @@ def run(run_id: Annotated[str | None, Option("--run")] = None) -> None:
 
 
 @app.command("adjudicate")
-def adjudicate_command(run_id: Annotated[str | None, Option("--run")] = None) -> None:
-    _stub(3)
+def adjudicate_command(
+    run_id: Annotated[str, Option("--run")],
+    repo_dir: Annotated[
+        Path,
+        Option("--repo-dir", help="Provisioned checkout used for source-grounded adjudication."),
+    ],
+    out_root: Annotated[Path, Option("--out")] = DEFAULT_RUN_ROOT,
+    replicas: Annotated[int, Option("--replicas", min=1)] = 3,
+    concurrency: Annotated[int, Option("--concurrency", min=1)] = DEFAULT_CONCURRENCY,
+    deadline: Annotated[
+        int, Option("--deadline", min=1, max=MAX_DEADLINE_SECONDS)
+    ] = DEFAULT_DEADLINE_SECONDS,
+) -> None:
+    host_gate = _command_host_gate()
+    try:
+        report_path = asyncio.run(
+            _adjudicate_existing_run(
+                run_id=run_id,
+                repo_dir=repo_dir,
+                out_root=out_root,
+                replicas=replicas,
+                concurrency=concurrency,
+                deadline_seconds=deadline,
+                host_gate=host_gate,
+            )
+        )
+    except InvalidRunId as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_USER_ERROR) from exc
+    except (RunNotFound, StageMissing) as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_NOT_FOUND) from exc
+    except ValueError as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_USER_ERROR) from exc
+    except AdjudicationInfrastructureError as exc:
+        _error_console.print(str(exc), markup=False)
+        raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+    _console.print(str(report_path), markup=False, soft_wrap=True)
+
+
+async def _adjudicate_existing_run(
+    *,
+    run_id: str,
+    repo_dir: Path,
+    out_root: Path,
+    replicas: int,
+    concurrency: int,
+    deadline_seconds: int,
+    host_gate: HostSlotGate | None,
+) -> Path:
+    if not repo_dir.is_dir():
+        raise ValueError(f"adjudication checkout is not a directory: {repo_dir}")
+    run = RunStore(out_root).open(run_id)
+    target = run.load_target()
+    discovered = run.load_discover()
+    merged = run.load_merge()
+    attempt_id = datetime.now(UTC).strftime("readjudicate-%Y%m%d-%H%M%S-%f")
+    try:
+        outcome = await adjudicate(
+            merged,
+            target=target,
+            runtime=CodexRuntime(),
+            repo_dir=repo_dir,
+            out_root=run.dir / "adjudicate-runtime" / attempt_id,
+            replicas=replicas,
+            concurrency=concurrency,
+            deadline_seconds=deadline_seconds,
+            host_gate=host_gate,
+        )
+    except AdjudicationInfrastructureError as exc:
+        error = RunError(
+            stage="adjudication",
+            reason="no-valid-output",
+            message=str(exc),
+            attempts=exc.attempts,
+        )
+        run.save_summary(summarize_run(run.run_id, discovered, error=error))
+        raise
+
+    summary = summarize_run(run.run_id, discovered)
+    report_md = render_report(
+        target=target,
+        merged=merged,
+        outcome=outcome,
+        coverage=discovered.coverage,
+        budget=discovered.budget,
+        synthesis=None,
+        summary=summary,
+    )
+    run.save_outcome(outcome)
+    run.save_report(report_md)
+    run.save_summary(summary)
+    return run.dir / "report.md"
 
 
 @app.command("report")
@@ -1641,6 +1768,10 @@ def report_command(
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_NOT_FOUND) from exc
 
+    try:
+        summary = run.load_summary()
+    except StageMissing:
+        summary = summarize_run(run.run_id, discovered)
     synthesis_text = synthesis.read_text(encoding="utf-8") if synthesis is not None else None
     report_md = render_report(
         target=target,
@@ -1649,6 +1780,7 @@ def report_command(
         coverage=discovered.coverage,
         budget=discovered.budget,
         synthesis=synthesis_text,
+        summary=summary,
     )
     run.save_report(report_md)
     _console.print(str(run.dir / "report.md"), markup=False, soft_wrap=True)
