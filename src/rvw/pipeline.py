@@ -96,6 +96,8 @@ async def execute_pipeline(
     out_root: Path,
     pause: bool,
     dynamic_brief: Path | None,
+    adjudication_runtime: Runtime | None = None,
+    expanded_adjudication_runtime: Runtime | None = None,
     host_gate: HostSlotGate | None = None,
     on_pause: MessageSink | None = None,
     on_warning: MessageSink | None = None,
@@ -106,6 +108,7 @@ async def execute_pipeline(
         raise ValueError("discover_replicas must be at least 1")
     if adjudicate_replicas < 1:
         raise ValueError("adjudicate_replicas must be at least 1")
+    adjudication_runtime = adjudication_runtime or runtime
     run = RunStore(out_root).create(target)
     if on_warning is not None and (warning := stale_install_warning()) is not None:
         on_warning(warning)
@@ -146,17 +149,21 @@ async def execute_pipeline(
                 "Checkout provisioning is the operator's job in Phase 4."
             )
     else:
+        expanded_runtime_kwargs: dict[str, Runtime] = {}
+        if expanded_adjudication_runtime is not None:
+            expanded_runtime_kwargs["expanded_runtime"] = expanded_adjudication_runtime
         try:
             outcome = await adjudicator(
                 merged,
                 target=target,
-                runtime=runtime,
+                runtime=adjudication_runtime,
                 repo_dir=repo_dir,
                 out_root=run.dir / "adjudicate-runtime",
                 replicas=adjudicate_replicas,
                 concurrency=concurrency,
                 deadline_seconds=deadline_seconds,
                 host_gate=host_gate,
+                **expanded_runtime_kwargs,
             )
         except AdjudicationInfrastructureError as exc:
             error = RunError(
