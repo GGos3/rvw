@@ -14,13 +14,15 @@ Adjudication is a machine stage that checks merged claims against the target che
 - The reviewed diff an adjudication replica receives is the budget-filtered projection shared with discovery, not the raw target diff. A measured fixture with two excluded files and one kept file previously produced an adjudication prompt 37.2 times larger than discovery's retained content, because generated and oversized segments returned through the raw diff. Reusing one projection keeps the adjudicator from reasoning over content no lane was allowed to review.
 - Adjudication prompts stay unchunked. A candidate may need any kept file to be verified, so partitioning would change which evidence a verdict can rest on rather than remove waste.
 - The all-invalid retry carries each prior replica's machine-readable invalid reason, matching the presence-recheck retry contract. A byte-identical replacement prompt gives a schema-shaped failure no reason to resolve differently.
+- If the retry also produces no valid output, the pass is an infrastructure failure rather than a source of empty votes. Diagnostics retain every initial and retry attempt so operators can distinguish model uncertainty from executor loss.
+- Runtime and persisted UNCERTAIN verdicts require explanations. Omitted candidates, unsupported rejections, and strict-majority ties receive stable synthesized reasons when no valid model reason is available.
 
 ## Constraints
 
 - The current runtime may be the same Codex model used for discovery, so shared blind spots remain possible.
 - The expanded prompt authorizes broad exploration of definitions, callers, and tests; it is not programmatically limited to a computed symbol set.
 - The evidence coercion checks only that text is non-empty. It does not mechanically prove the text is a verbatim source quote.
-- Invalid replicas do not cast votes; a pass with no valid outputs yields UNCERTAIN with an empty vote list.
+- Invalid replicas do not cast votes; a pass with no valid outputs after its retry raises an adjudication infrastructure error and produces no outcome map.
 
 ## Failure modes
 

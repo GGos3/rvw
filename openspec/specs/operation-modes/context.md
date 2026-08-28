@@ -27,10 +27,12 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 - Stack member discovery uses the discovery replica count, while ordinary
   member adjudication and descendant presence checks use the independent
   adjudication replica count.
+- Re-adjudication opens an existing run and invokes only the shared adjudication stage against an explicit checkout. It writes a timestamped runtime-attempt directory and replaces the outcome and report only after a valid outcome exists, so an infrastructure failure cannot erase a prior successful result.
 
 ## Constraints
 
 - `review` does not itself apply the auto YAML policy; `auto` calls the shared pipeline and then evaluates policy.
+- `adjudicate --run` requires persisted target, discovery, and merge inputs and never repeats discovery. A failed attempt may update `run.json` with its error while retaining the previous outcome and report.
 - Without `--repo-dir`, the common pipeline skips adjudication and renders unadjudicated findings; a confirmed-only auto policy therefore cannot block those groups.
 - The `auto` command uses the default external registry and default run root rather than exposing all review command overrides.
 - Sample gap detection compares rule-ID sets against the lane enum. `(file, line)` differences remain a separate variance signal and body text is not semantically compared.

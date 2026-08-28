@@ -11,6 +11,7 @@ This capability defines the machine boundary between rvw and a model runtime. It
 - The enum-versus-free fixture produced five findings in each condition with near-identical text. Both missed the same deep defects, so rule scope—not the ID enum—was the suppressing factor; ADR-005 added sweep coverage rather than weakening IDs.
 - OpenAI strict output rejects object schemas whose `required` array omits defaulted properties. The implementation rewrites both root and item schemas so every property is required.
 - The four-part validity contract prevents a zero exit or parseable partial artifact from being silently treated as PASS. On the PR #1119 smoke, all 39 discovery runs were valid; the complete discovery/adjudication walls were about 410s and 197s.
+- Output loss is normalized as `missing`, `empty`, `unparseable`, or `schema-invalid`, distinct from process exits, spawn failures, and missing completion markers. Invalid results retain exit/spawn detail and artifact paths and sizes for persisted coverage and adjudication diagnostics.
 
 ## Constraints
 
