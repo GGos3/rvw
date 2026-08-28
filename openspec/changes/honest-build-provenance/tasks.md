@@ -21,5 +21,5 @@
   all task checkboxes as behavior is verified.
 - [x] 3.2 Run every required bare lint/type/test/OpenSpec gate and the
   delta-parity script for each touched capability.
-- [ ] 3.3 Inspect the complete diff, write `/tmp/provenance-report.md`, and
+- [x] 3.3 Inspect the complete diff, write `/tmp/provenance-report.md`, and
   create local conventional commits without pushing or archiving.
