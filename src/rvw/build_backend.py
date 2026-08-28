@@ -91,6 +91,9 @@ def _generated_provenance() -> str:
 @contextmanager
 def _embedded_provenance() -> Iterator[None]:
     generated = _generated_provenance()
+    if generated is None:
+        yield
+        return
     original = _PROVENANCE_MODULE.read_bytes()
     _PROVENANCE_MODULE.write_text(generated, encoding="utf-8")
     try:
