@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rvw.adjudicate import AdjudicationAttempt
 from rvw.discover import DiscoverResult
+from rvw.provenance import BuildProvenance, current_build_provenance
 from rvw.runtimes import RunDiagnostic
 
 
@@ -66,6 +67,7 @@ class RunSummary(BaseModel):
     failed_lanes: list[FailedLane]
     coverage_totals: CoverageTotals
     error: RunError | None
+    build: BuildProvenance = Field(default_factory=current_build_provenance)
 
 
 def coverage_totals(discovered: DiscoverResult) -> CoverageTotals:
@@ -99,6 +101,7 @@ def summarize_run(
     discovered: DiscoverResult,
     *,
     error: RunError | None = None,
+    build: BuildProvenance | None = None,
 ) -> RunSummary:
     totals = coverage_totals(discovered)
     failures = failed_lanes(discovered)
@@ -114,6 +117,7 @@ def summarize_run(
         failed_lanes=failures,
         coverage_totals=totals,
         error=error,
+        build=build or current_build_provenance(),
     )
 
 
@@ -124,6 +128,7 @@ def running_summary(run_id: str) -> RunSummary:
         failed_lanes=[],
         coverage_totals=CoverageTotals(dispatched=0, valid=0, findings=0),
         error=None,
+        build=current_build_provenance(),
     )
 
 

@@ -28,6 +28,7 @@ This capability defines how operators and CI enter the common pipeline, how YAML
   member adjudication and descendant presence checks use the independent
   adjudication replica count.
 - Re-adjudication opens an existing run and invokes only the shared adjudication stage against an explicit checkout. It writes a timestamped runtime-attempt directory and replaces the outcome and report only after a valid outcome exists, so an infrastructure failure cannot erase a prior successful result.
+- Build identity is captured by the PEP 517 wrapper or a deterministic package-byte fallback. Runtime commands expose that identity without consulting mutable Git state; a stale-install warning is emitted only when a local source checkout is proven to be a descendant of an embedded clean commit.
 
 ## Constraints
 

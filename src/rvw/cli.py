@@ -76,6 +76,7 @@ from rvw.pipeline import (
     verdict_counts,
 )
 from rvw.policy import evaluate, load_policy
+from rvw.provenance import current_build_provenance, version_label
 from rvw.publish import PublishError, publish_body_review, publish_review
 from rvw.registry import Registry, load_registry
 from rvw.report import render_report
@@ -417,7 +418,7 @@ def _print_plan(payload: dict[str, Any]) -> None:
 
 def _version_callback(value: bool) -> bool:
     if value:
-        _console.print(f"rvw {__version__}")
+        _console.print(version_label(), markup=False, soft_wrap=True)
         raise typer.Exit(EXIT_OK)
     return value
 
@@ -550,6 +551,7 @@ def _review_payload(artifacts: PipelineArtifacts) -> dict[str, object]:
         "verdict_counts": _verdict_counts(artifacts.outcome),
         "coverage_totals": summary.coverage_totals.model_dump(mode="json"),
         "error": summary.error.model_dump(mode="json") if summary.error is not None else None,
+        "build": summary.build.model_dump(mode="json"),
     }
 
 
@@ -1710,6 +1712,10 @@ async def _adjudicate_existing_run(
     target = run.load_target()
     discovered = run.load_discover()
     merged = run.load_merge()
+    try:
+        build = run.load_summary().build
+    except StageMissing:
+        build = current_build_provenance()
     attempt_id = datetime.now(UTC).strftime("readjudicate-%Y%m%d-%H%M%S-%f")
     try:
         outcome = await adjudicate(
@@ -1730,10 +1736,10 @@ async def _adjudicate_existing_run(
             message=str(exc),
             attempts=exc.attempts,
         )
-        run.save_summary(summarize_run(run.run_id, discovered, error=error))
+        run.save_summary(summarize_run(run.run_id, discovered, error=error, build=build))
         raise
 
-    summary = summarize_run(run.run_id, discovered)
+    summary = summarize_run(run.run_id, discovered, build=build)
     report_md = render_report(
         target=target,
         merged=merged,
