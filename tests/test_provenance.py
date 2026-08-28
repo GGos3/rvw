@@ -96,6 +96,7 @@ def test_generated_provenance_contains_digest_and_build_facts(monkeypatch) -> No
 
 def test_generated_provenance_still_embeds_digest_without_git(monkeypatch) -> None:
     monkeypatch.setattr(build_backend, "_git", lambda _args: None)
+    monkeypatch.setattr(build_backend, "_embedded_commit", lambda: None)
     monkeypatch.setattr(
         build_backend,
         "_git_status_dirty",
@@ -104,9 +105,56 @@ def test_generated_provenance_still_embeds_digest_without_git(monkeypatch) -> No
 
     generated = build_backend._generated_provenance()
 
+    assert generated is not None
     assert "BUILD_ID: str | None = 'sha256:" in generated
     assert "SOURCE_COMMIT: str | None = None" in generated
     assert "SOURCE_DIRTY: bool | None = None" in generated
+
+
+def test_sdist_stamped_commit_survives_wheel_build_without_git(monkeypatch) -> None:
+    """`uv build` makes an sdist, then builds the wheel from it.
+
+    That unpacked sdist has no .git, so regenerating provenance there would
+    replace an already proven commit with None. Measured on release v0.6.0:
+    the published wheel carried SOURCE_COMMIT = None while a --wheel build of
+    the same tree carried the real commit.
+    """
+
+    monkeypatch.setattr(build_backend, "_git", lambda _args: None)
+    monkeypatch.setattr(build_backend, "_embedded_commit", lambda: "a" * 40)
+    monkeypatch.setattr(
+        build_backend,
+        "_git_status_dirty",
+        lambda: (_ for _ in ()).throw(AssertionError("dirty state is unverifiable")),
+    )
+
+    assert build_backend._generated_provenance() is None
+
+
+def test_embedded_commit_reads_a_stamped_module(monkeypatch, tmp_path: Path) -> None:
+    stamped = tmp_path / "_build_provenance.py"
+    stamped.write_text(
+        "BUILD_ID: str | None = 'sha256:abc'\n"
+        f"SOURCE_COMMIT: str | None = {'c' * 40!r}\n"
+        "SOURCE_DIRTY: bool | None = False\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(build_backend, "_PROVENANCE_MODULE", stamped)
+    assert build_backend._embedded_commit() == "c" * 40
+
+    stamped.write_text("SOURCE_COMMIT: str | None = None\n", encoding="utf-8")
+    assert build_backend._embedded_commit() is None
+
+
+def test_embedded_provenance_is_a_noop_when_generation_declines(monkeypatch) -> None:
+    path = Path(build_backend._PROVENANCE_MODULE)
+    before = path.read_bytes()
+    monkeypatch.setattr(build_backend, "_generated_provenance", lambda: None)
+
+    with build_backend._embedded_provenance():
+        assert path.read_bytes() == before
+
+    assert path.read_bytes() == before
 
 
 def test_backend_rewrites_provenance_during_wheel_build(monkeypatch, tmp_path: Path) -> None:
