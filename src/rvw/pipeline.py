@@ -13,6 +13,7 @@ from rvw.dispatch import DEFAULT_DEADLINE_SECONDS
 from rvw.hostslots import HostSlotGate
 from rvw.lane import Lane
 from rvw.merge import MergeResult, merge
+from rvw.provenance import stale_install_warning
 from rvw.registry import Registry
 from rvw.report import render_report
 from rvw.runtimes import Runtime
@@ -106,6 +107,8 @@ async def execute_pipeline(
     if adjudicate_replicas < 1:
         raise ValueError("adjudicate_replicas must be at least 1")
     run = RunStore(out_root).create(target)
+    if on_warning is not None and (warning := stale_install_warning()) is not None:
+        on_warning(warning)
     run.save_target(target)
     brief = dynamic_brief.read_text(encoding="utf-8") if dynamic_brief is not None else None
     discovered = await discover(
@@ -122,7 +125,8 @@ async def execute_pipeline(
         host_gate=host_gate,
     )
     run.save_discover(discovered)
-    summary = summarize_run(run.run_id, discovered)
+    build = run.load_summary().build
+    summary = summarize_run(run.run_id, discovered, build=build)
 
     lane_tiers = {lane.id: lane.tier for lane in active_lanes}
     merged = merge(discovered.findings, lane_tiers=lane_tiers)
@@ -161,7 +165,7 @@ async def execute_pipeline(
                 message=str(exc),
                 attempts=exc.attempts,
             )
-            failed_summary = summarize_run(run.run_id, discovered, error=error)
+            failed_summary = summarize_run(run.run_id, discovered, error=error, build=build)
             report_md = render_report(
                 target=target,
                 merged=merged,

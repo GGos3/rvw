@@ -10,7 +10,7 @@ This capability makes the review inspectable before any network action and trans
 - 2026-08-12: Same-target starts within one second reproduced `FileExistsError`, motivating microsecond run IDs with bounded collision regeneration.
 - The coverage table makes a zero-finding valid lane distinguishable from an all-INVALID lane and from a lane that never activated.
 - Persisted coverage keeps exact replica-chunk entries for fail-closed validation, while the report derives readable per-lane dispatched and valid totals. Diff-budget output also exposes the number and file placement of prompt chunks.
-- `run.json` is the shared strict status contract for persistence, CLI JSON, and Markdown. It records running, complete, degraded, or failed state, structured failed-lane executions, exact coverage totals, and an optional run-level infrastructure error without carrying build identity.
+- `run.json` is the shared strict status contract for persistence, CLI JSON, and Markdown. It records running, complete, degraded, or failed state, structured failed-lane executions, exact coverage totals, an optional run-level infrastructure error, and the immutable build identity that produced the run.
 - Only `## 종합` is author-written. Finding identity, votes, evidence, folds, coverage, and diff-budget accounting remain machine-generated.
 - PR #1119 supplied concrete scale: 39/39 discovery runs produced 21 findings, merge produced 13 groups, and folds rendered five review items. DISCOVER took about 410s and ADJUDICATE about 197s.
 - That run excluded 2,846,073 generated characters (about 2.84 MB) and reviewed 26,195 source characters, making the exclusion accounting a material report fact rather than a hidden prompt optimization.

@@ -11,6 +11,7 @@ def test_version() -> None:
     r = runner.invoke(app, ["--version"])
     assert r.exit_code == 0
     assert "rvw" in r.stdout
+    assert "build sha256:" in r.stdout
 
 
 def test_schema_is_valid_json() -> None:

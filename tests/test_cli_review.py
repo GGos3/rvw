@@ -350,6 +350,7 @@ def test_review_end_to_end_writes_all_stages_and_json_shape(
         "verdict_counts",
         "coverage_totals",
         "error",
+        "build",
     }
     run_dir = out_root / str(payload["run_id"])
     assert {path.name for path in run_dir.iterdir()} >= {
@@ -378,7 +379,10 @@ def test_review_end_to_end_writes_all_stages_and_json_shape(
         "failed_lanes",
         "coverage_totals",
         "error",
+        "build",
     }
+    assert payload["build"] == summary["build"]
+    assert str(summary["build"]["build_id"]) in (run_dir / "report.md").read_text()
     assert "## 확정 발견 (CONFIRMED)" in (run_dir / "report.md").read_text()
 
 
@@ -615,6 +619,31 @@ def test_without_repo_dir_skips_adjudication_and_renders_unadjudicated(
     assert "## 발견 (미판정)" in (run_dir / "report.md").read_text(encoding="utf-8")
 
 
+def test_new_run_emits_stale_install_warning_once(
+    tmp_path: Path,
+    registry_root: Path,
+    patched_pipeline: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    del patched_pipeline
+    calls = 0
+
+    def warning() -> str:
+        nonlocal calls
+        calls += 1
+        return "warning: reinstall fixture"
+
+    monkeypatch.setattr(pipeline_module, "stale_install_warning", warning)
+    repo_dir = tmp_path / "checkout"
+    repo_dir.mkdir()
+
+    result, _ = invoke_review(tmp_path / "runs", registry_root, "--repo-dir", str(repo_dir))
+
+    assert result.exit_code == 0, result.stdout
+    assert calls == 1
+    assert result.stderr.count("warning: reinstall fixture") == 1
+
+
 def test_adjudicate_run_reuses_persisted_artifacts_and_rewrites_outcome_report(
     tmp_path: Path,
     registry_root: Path,
@@ -628,6 +657,7 @@ def test_adjudicate_run_reuses_persisted_artifacts_and_rewrites_outcome_report(
     run_dir = out_root / str(payload["run_id"])
     discover_before = (run_dir / "discover.json").read_bytes()
     report_before = (run_dir / "report.md").read_bytes()
+    build_before = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["build"]
     calls: list[dict[str, object]] = []
     gate = HostSlotGate(1, base_dir=tmp_path / "host-slots")
 
@@ -678,6 +708,7 @@ def test_adjudicate_run_reuses_persisted_artifacts_and_rewrites_outcome_report(
     assert (run_dir / "outcome.json").is_file()
     assert (run_dir / "report.md").read_bytes() != report_before
     assert "## 확정 발견 (CONFIRMED)" in (run_dir / "report.md").read_text(encoding="utf-8")
+    assert json.loads((run_dir / "run.json").read_text(encoding="utf-8"))["build"] == build_before
 
 
 def test_adjudicate_run_names_missing_merge_without_runtime_call(
