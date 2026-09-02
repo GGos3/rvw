@@ -6,6 +6,7 @@ This capability defines the machine boundary between rvw and a model runtime. It
 
 ## Key decisions and measured basis
 
+- 2026-09-01: Lane output adds a required `covered` receipt list. Discovery uses plain structured `codex exec` in the verified checkout; `codex exec review` remains unsuitable because it does not preserve the custom prompt/schema contract.
 - ADR-004 replaced prose parsing with strict JSON and stable hunk enrichment. A prompt that explicitly requested an outside rule still obeyed the API-level enum schema, demonstrating that structured-output enforcement dominates prompt wording.
 - Chunked discovery keeps `r<replica>` as the leaf directory required by the adapter. Multi-chunk runs add an inspectable `c<chunk>` parent, while one-chunk discovery and sampling retain their previous artifact paths.
 - The enum-versus-free fixture produced five findings in each condition with near-identical text. Both missed the same deep defects, so rule scope—not the ID enum—was the suppressing factor; ADR-005 added sweep coverage rather than weakening IDs.
@@ -49,7 +50,8 @@ This capability defines the machine boundary between rvw and a model runtime. It
 - Tool-less mode uses stable Codex CLI feature controls to disable shell and
   interactive tools, rules, and persisted sessions while retaining the explicit
   Sol/max model policy. A direct strict-JSON spike completed without a shell
-  event; agentic mode remains only for expanded source adjudication.
+  event; agentic mode is used only where source exploration is required:
+  checkout-backed discovery and expanded source adjudication.
 - Runtime wire findings require an integer line; only enriched findings can later carry `line: null` in persisted models.
 - The namespace for `/other` comes from the first rule's prefix, so mixed-prefix lane rules are poorly defined.
 - Read-only sandboxing controls Codex filesystem writes but the adapter itself writes runtime artifacts.

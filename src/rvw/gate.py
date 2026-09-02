@@ -17,6 +17,7 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rvw.adjudicate import AdjudicationOutcome
+from rvw.checkout import provision_checkout
 from rvw.discover import LaneCoverage
 from rvw.hunks import hunk_sha256_by_id
 from rvw.merge import CollapseGroup, MergeResult
@@ -60,6 +61,7 @@ class GatePlan(BaseModel):
     replicas: int = Field(ge=1)
     adjudicate_replicas: int = Field(ge=1)
     chunk_count: int = Field(ge=1)
+    discovery_mode: Literal["agentic", "inline"] = "inline"
 
     @model_validator(mode="before")
     @classmethod
@@ -698,13 +700,20 @@ def render_gate_verdict(verdict: GateVerdict) -> str:
         "",
         "## Lane validity",
         "",
-        "| Lane | Dispatched | Valid | Findings |",
-        "| --- | ---: | ---: | ---: |",
+        "| Lane | Dispatched | Valid | Findings | Uncovered |",
+        "| --- | ---: | ---: | ---: | ---: |",
     ]
     lines.extend(
-        f"| {_cell(item.lane_id)} | {item.dispatched} | {item.valid} | {item.findings} |"
+        f"| {_cell(item.lane_id)} | {item.dispatched} | {item.valid} | {item.findings} | "
+        f"{len(item.uncovered)} |"
         for item in verdict.coverage
     )
+    uncovered = [item for item in verdict.coverage if item.uncovered]
+    if uncovered:
+        lines.extend(["", "Uncovered hunks:"])
+        for item in uncovered:
+            hunk_ids = ", ".join(f"`{_cell(hunk_id)}`" for hunk_id in item.uncovered)
+            lines.append(f"- `{_cell(item.lane_id)}`: {hunk_ids}")
     lines.extend(
         [
             "",
@@ -899,40 +908,6 @@ def github_actor_permission(
             detail="GitHub returned an empty repository permission",
         )
     return actor, permission
-
-
-def provision_checkout(
-    *,
-    repo: str,
-    pr_number: int,
-    head_sha: str,
-    destination: Path,
-    run: Callable[[list[str]], str] = _run,
-) -> Path:
-    run(["gh", "repo", "clone", repo, str(destination), "--", "--no-checkout"])
-    run(
-        [
-            "git",
-            "-C",
-            str(destination),
-            "fetch",
-            "--no-tags",
-            "origin",
-            f"refs/pull/{pr_number}/head",
-        ]
-    )
-    run(["git", "-C", str(destination), "checkout", "--detach", head_sha])
-    actual_head = run(["git", "-C", str(destination), "rev-parse", "HEAD"]).strip()
-    if actual_head != head_sha:
-        raise GateInvariantError(
-            f"checkout HEAD {actual_head or '<empty>'} does not match captured head {head_sha}"
-        )
-    status = run(
-        ["git", "-C", str(destination), "status", "--porcelain=v1", "--untracked-files=all"]
-    ).strip()
-    if status:
-        raise GateInvariantError("disposable checkout must be clean")
-    return destination
 
 
 __all__ = [

@@ -79,6 +79,25 @@ The `review` and `auto` commands MUST use the same target-resolution, DISCOVER, 
 - **WHEN** `rvw auto` is invoked for a target
 - **THEN** it executes the common pipeline and then evaluates the persisted merged groups with an auto policy
 
+### Requirement: Discovery mode is selectable and agentic by default
+
+Runtime-executing review, auto, gate, stack-review, and plan paths MUST select `agentic` discovery by default and MUST accept `inline` as an explicit fallback. The selected mode MUST propagate unchanged through planning and discovery. Sampling MUST continue to use the inline fixture path.
+
+#### Scenario: Operator uses the default
+
+- **WHEN** an ordinary review command omits discovery mode
+- **THEN** it provisions or verifies a checkout and runs agentic discovery
+
+#### Scenario: Operator selects legacy fallback
+
+- **WHEN** an ordinary review command selects `inline`
+- **THEN** the existing embedded-diff, exclusion, budget, and chunk behavior is used without requiring an agentic checkout
+
+#### Scenario: Uncommitted review uses inline mode
+
+- **WHEN** an operator selects inline discovery for an uncommitted target
+- **THEN** the existing in-memory target diff remains reviewable
+
 ### Requirement: Routine review modes default to one replica
 
 The `rvw review` and `rvw auto` commands MUST default to one discovery replica and three adjudication replicas. Commands that expose `--replicas` MUST use it only as the positive discovery replica count, MUST expose an independently positive `--adjudicate-replicas` count, and MUST preserve explicit values for each stage. `rvw plan` MUST report the discovery count as `replicas`, MUST report the adjudication count as `adjudicate_replicas`, and MUST calculate discovery run totals from the discovery count only.

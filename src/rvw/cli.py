@@ -25,8 +25,13 @@ from rvw.adjudicate import (
     AdjudicationOutcome,
     adjudicate,
 )
+from rvw.checkout import (
+    CheckoutVerificationError,
+    provision_checkout,
+    provision_local_checkout,
+)
 from rvw.diffbudget import EmptyReviewDiffError, apply_diff_budget
-from rvw.discover import DiscoverResult, resolve_lane_path
+from rvw.discover import DiscoverResult, DiscoveryMode, resolve_lane_path
 from rvw.dispatch import (
     DEFAULT_CONCURRENCY,
     DEFAULT_DEADLINE_SECONDS,
@@ -52,7 +57,6 @@ from rvw.gate import (
     load_dispositions,
     load_gate_plan,
     match_inherited_dispositions,
-    provision_checkout,
     query_pull_request,
     render_gate_verdict,
     requires_owner_authorization,
@@ -65,7 +69,7 @@ from rvw.gate import (
 )
 from rvw.hostslots import HostSlotGate, host_slot_gate_from_env
 from rvw.hunks import hunk_sha256_by_id
-from rvw.lane import Lane, load_lane
+from rvw.lane import Lane, load_lane, load_new_lane
 from rvw.pipeline import (
     PipelineArtifacts,
     PipelineInfrastructureError,
@@ -78,7 +82,13 @@ from rvw.pipeline import (
 from rvw.policy import evaluate, load_policy
 from rvw.provenance import current_build_provenance, version_label
 from rvw.publish import PublishError, publish_body_review, publish_review
-from rvw.registry import Registry, load_registry
+from rvw.registry import (
+    EffectiveRegistry,
+    Registry,
+    load_effective_registry,
+    load_registry,
+    load_repo_policy,
+)
 from rvw.report import render_report
 from rvw.runtimes.codex import CodexRuntime, CodexRuntimeMode
 from rvw.sample import SampleReport, sample_lane
@@ -189,6 +199,14 @@ def _empty_review_failure(exc: EmptyReviewDiffError, *, json_output: bool) -> Ne
     raise typer.Exit(EXIT_USER_ERROR) from exc
 
 
+def _checkout_failure(exc: CheckoutVerificationError, *, json_output: bool) -> Never:
+    if json_output:
+        _write_json(exc.as_payload())
+    else:
+        _error_console.print(str(exc), markup=False)
+    raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
+
+
 def _schema_payload() -> dict[str, Any]:
     return {
         "cli_version": __version__,
@@ -224,6 +242,23 @@ def _registered_lane_owners(registry: Registry) -> list[tuple[str, Tier]]:
                 owners.append((lane_id, layer.tier))
                 seen.add(lane_id)
     return owners
+
+
+def _catalog_registry(root: Path) -> tuple[EffectiveRegistry, Path]:
+    # A synthetic target is sufficient for cataloging packaged and legacy lanes;
+    # repository lanes are intentionally target-scoped and omitted here.
+    target = ResolvedTarget(
+        kind="commit",
+        repo="",
+        base_sha=None,
+        head_sha="HEAD",
+        changed_paths=[],
+        diff="",
+    )
+    return (
+        load_effective_registry(target, cwd=Path.cwd(), external_root=root, activate_legacy=False),
+        Path("."),
+    )
 
 
 def _resolve_cli_target(spec: str) -> ResolvedTarget:
@@ -281,13 +316,18 @@ def _resolve_local_commit(spec: str, cwd: Path) -> ResolvedTarget:
     )
 
 
-def _load_active_lanes(registry: Registry, lanes_root: Path, target: ResolvedTarget) -> list[Lane]:
+def _load_active_lanes(
+    registry: Registry | EffectiveRegistry, lanes_root: Path, target: ResolvedTarget
+) -> list[Lane]:
     lanes: list[Lane] = []
     seen: set[str] = set()
     for layer in registry.activate(target.repo, target.changed_paths):
         for lane_id in layer.lanes:
             if lane_id not in seen:
-                lanes.append(load_lane(resolve_lane_path(lanes_root, lane_id, layer.tier)))
+                if isinstance(registry, EffectiveRegistry):
+                    lanes.append(registry.load_lane(lane_id))
+                else:
+                    lanes.append(load_lane(resolve_lane_path(lanes_root, lane_id, layer.tier)))
                 seen.add(lane_id)
     return lanes
 
@@ -297,17 +337,22 @@ def _gate_plan(
     target: ResolvedTarget,
     replicas: int,
     adjudicate_replicas: int,
+    discovery_mode: DiscoveryMode,
 ) -> GatePlan:
     registry, lanes_root = _load_registry_root(registry_root)
     lane_ids = [lane.id for lane in _load_active_lanes(registry, lanes_root, target)]
     if not lane_ids:
         raise GateInvariantError("activated gate plan must contain at least one lane")
-    chunks, _budget = apply_diff_budget(target.diff)
+    chunk_count = 1
+    if discovery_mode is DiscoveryMode.INLINE:
+        chunks, _budget = apply_diff_budget(target.diff)
+        chunk_count = len(chunks)
     return GatePlan(
         lane_ids=lane_ids,
         replicas=replicas,
         adjudicate_replicas=adjudicate_replicas,
-        chunk_count=len(chunks),
+        chunk_count=chunk_count,
+        discovery_mode=discovery_mode.value,
     )
 
 
@@ -320,26 +365,29 @@ def _brief_source(target: ResolvedTarget, dynamic_brief: Path | None) -> str | N
 
 
 def _plan_payload(
-    registry: Registry,
+    registry: Registry | EffectiveRegistry,
     lanes_root: Path,
     target: ResolvedTarget,
     dynamic_brief: Path | None,
     replicas: int,
     adjudicate_replicas: int,
+    discovery_mode: DiscoveryMode = DiscoveryMode.AGENTIC,
 ) -> dict[str, Any]:
     active_layers = registry.activate(target.repo, target.changed_paths)
     lanes = _load_active_lanes(registry, lanes_root, target)
-    chunks, _budget = apply_diff_budget(target.diff)
+    chunk_count = (
+        len(apply_diff_budget(target.diff)[0]) if discovery_mode is DiscoveryMode.INLINE else 1
+    )
     runs = [
         PlannedRun(
             lane=lane,
             prompt="",
             replica=replica,
-            chunk=chunk.index,
-            chunk_count=len(chunks),
+            chunk=chunk,
+            chunk_count=chunk_count,
         )
         for lane in lanes
-        for chunk in chunks
+        for chunk in range(1, chunk_count + 1)
         for replica in range(1, replicas + 1)
     ]
     ordered_runs = sorted(runs, key=lambda run: lpt_sort_key(run.lane.cost))
@@ -373,7 +421,8 @@ def _plan_payload(
         "dispatch_order": [run.lane.id for run in ordered_runs],
         "replicas": replicas,
         "adjudicate_replicas": adjudicate_replicas,
-        "chunk_count": len(chunks),
+        "discovery_mode": discovery_mode.value,
+        "chunk_count": chunk_count,
         "total_runs": len(runs),
         "brief_source": _brief_source(target, dynamic_brief),
     }
@@ -412,6 +461,7 @@ def _print_plan(payload: dict[str, Any]) -> None:
         )
     _console.print(table)
     _console.print(f"Adjudication replicas: {payload['adjudicate_replicas']}")
+    _console.print(f"Discovery mode: {payload['discovery_mode']}")
     _console.print(f"Chunks: {payload['chunk_count']}")
     _console.print(f"Total runs: {payload['total_runs']}")
 
@@ -501,6 +551,11 @@ def review(
     pause: Annotated[bool, Option("--pause")] = False,
     publish: Annotated[bool, Option("--publish")] = False,
     dynamic_brief: Annotated[Path | None, Option("--dynamic-brief")] = None,
+    allow_worktree_rules: Annotated[
+        bool,
+        Option("--allow-worktree-rules", help="Read .rvw rules from the working tree (non-SoT)."),
+    ] = False,
+    discovery_mode: Annotated[DiscoveryMode, Option("--discovery-mode")] = DiscoveryMode.AGENTIC,
 ) -> None:
     host_gate = _command_host_gate()
     try:
@@ -518,11 +573,15 @@ def review(
                 pause=pause,
                 publish=publish,
                 dynamic_brief=dynamic_brief,
+                allow_worktree_rules=allow_worktree_rules,
                 host_gate=host_gate,
+                discovery_mode=discovery_mode,
             )
         )
     except EmptyReviewDiffError as exc:
         _empty_review_failure(exc, json_output=json_output)
+    except CheckoutVerificationError as exc:
+        _checkout_failure(exc, json_output=json_output)
 
 
 def _optional_outcome(run: RunHandle) -> AdjudicationOutcome | None:
@@ -569,7 +628,9 @@ async def _review_pipeline(
     pause: bool,
     publish: bool,
     dynamic_brief: Path | None,
+    allow_worktree_rules: bool = False,
     host_gate: HostSlotGate | None = None,
+    discovery_mode: DiscoveryMode = DiscoveryMode.AGENTIC,
 ) -> None:
     resolved_target: ResolvedTarget | None = None
     if publish:
@@ -591,6 +652,8 @@ async def _review_pipeline(
             dynamic_brief=dynamic_brief,
             resolved_target=resolved_target,
             host_gate=host_gate,
+            allow_worktree_rules=allow_worktree_rules,
+            discovery_mode=discovery_mode,
         )
     except PipelineInfrastructureError as exc:
         artifacts = exc.artifacts
@@ -655,33 +718,83 @@ async def _execute_pipeline(
     dynamic_brief: Path | None,
     resolved_target: ResolvedTarget | None = None,
     host_gate: HostSlotGate | None = None,
+    allow_worktree_rules: bool = False,
+    discovery_mode: DiscoveryMode = DiscoveryMode.AGENTIC,
 ) -> _PipelineArtifacts | None:
     """Execute and persist common review stages without publishing or rendering CLI output."""
-
-    registry, lanes_root = _load_registry_root(registry_root)
     target = resolved_target or _resolve_cli_target(target_spec)
+    if registry_root.expanduser() == DEFAULT_REGISTRY_ROOT:
+        registry = load_effective_registry(
+            target,
+            cwd=Path.cwd(),
+            external_root=registry_root,
+            allow_worktree_rules=allow_worktree_rules,
+        )
+        lanes_root = Path(".")
+    else:
+        registry, lanes_root = _load_registry_root(registry_root)
     active_lanes = _load_active_lanes(registry, lanes_root, target)
-    return await execute_pipeline(
-        registry=registry,
-        lanes_root=lanes_root,
-        target=target,
-        runtime=CodexRuntime(mode=CodexRuntimeMode.TOOL_LESS),
-        adjudication_runtime=CodexRuntime(mode=CodexRuntimeMode.TOOL_LESS),
-        expanded_adjudication_runtime=CodexRuntime(mode=CodexRuntimeMode.AGENTIC),
-        adjudicator=adjudicate,
-        active_lanes=active_lanes,
-        repo_dir=repo_dir,
-        discover_replicas=discover_replicas,
-        adjudicate_replicas=adjudicate_replicas,
-        concurrency=concurrency,
-        deadline_seconds=deadline_seconds,
-        out_root=out_root,
-        pause=pause,
-        dynamic_brief=dynamic_brief,
-        on_pause=lambda message: _console.print(message, markup=False),
-        on_warning=lambda message: _error_console.print(message, markup=False),
-        host_gate=host_gate,
-    )
+
+    async def execute_with_checkout(checkout: Path | None) -> _PipelineArtifacts | None:
+        return await execute_pipeline(
+            registry=registry,
+            lanes_root=lanes_root,
+            target=target,
+            runtime=CodexRuntime(
+                mode=(
+                    CodexRuntimeMode.AGENTIC
+                    if discovery_mode is DiscoveryMode.AGENTIC
+                    else CodexRuntimeMode.TOOL_LESS
+                )
+            ),
+            adjudication_runtime=CodexRuntime(mode=CodexRuntimeMode.TOOL_LESS),
+            expanded_adjudication_runtime=CodexRuntime(mode=CodexRuntimeMode.AGENTIC),
+            adjudicator=adjudicate,
+            active_lanes=active_lanes,
+            repo_dir=checkout,
+            discover_replicas=discover_replicas,
+            adjudicate_replicas=adjudicate_replicas,
+            concurrency=concurrency,
+            deadline_seconds=deadline_seconds,
+            out_root=out_root,
+            pause=pause,
+            dynamic_brief=dynamic_brief,
+            on_pause=lambda message: _console.print(message, markup=False),
+            on_warning=lambda message: _error_console.print(message, markup=False),
+            host_gate=host_gate,
+            rule_source_warning=(
+                "WARNING: .rvw rules loaded from the working tree via "
+                "--allow-worktree-rules; this run is non-SoT."
+                if allow_worktree_rules
+                else None
+            ),
+            discovery_mode=discovery_mode,
+        )
+
+    if discovery_mode is DiscoveryMode.INLINE or repo_dir is not None:
+        return await execute_with_checkout(repo_dir)
+    if target.base_sha is None:
+        raise CheckoutVerificationError(
+            "missing-base", "agentic discovery requires a target base SHA"
+        )
+    with tempfile.TemporaryDirectory(prefix="rvw-review-") as temporary_root:
+        destination = Path(temporary_root) / "checkout"
+        if target.kind == "pr" and target.pr_number is not None:
+            checkout = provision_checkout(
+                repo=target.repo,
+                pr_number=target.pr_number,
+                base_sha=target.base_sha,
+                head_sha=target.head_sha,
+                destination=destination,
+            )
+        else:
+            checkout = provision_local_checkout(
+                source=Path(_git_output(["rev-parse", "--show-toplevel"], Path.cwd()).strip()),
+                base_sha=target.base_sha,
+                head_sha=target.head_sha,
+                destination=destination,
+            )
+        return await execute_with_checkout(checkout)
 
 
 def _load_gate_artifacts(run_id: str, out_root: Path) -> _PipelineArtifacts:
@@ -952,6 +1065,7 @@ def gate(
     out_root: Annotated[Path, Option("--out")] = DEFAULT_RUN_ROOT,
     execute: Annotated[bool, Option("--execute")] = False,
     json_output: Annotated[bool, Option("--json")] = False,
+    discovery_mode: Annotated[DiscoveryMode, Option("--discovery-mode")] = DiscoveryMode.AGENTIC,
 ) -> None:
     """Run or resume a fail-closed, artifact-backed pull-request gate."""
 
@@ -987,6 +1101,7 @@ def gate(
             execute=execute,
             json_output=json_output,
             host_gate=host_gate,
+            discovery_mode=discovery_mode,
         )
     )
 
@@ -1007,6 +1122,7 @@ async def _gate_pipeline(
     execute: bool,
     json_output: bool,
     host_gate: HostSlotGate | None = None,
+    discovery_mode: DiscoveryMode = DiscoveryMode.AGENTIC,
 ) -> None:
     artifacts: _PipelineArtifacts
     plan: GatePlan
@@ -1037,11 +1153,13 @@ async def _gate_pipeline(
                 resolved,
                 discover_replicas,
                 adjudicate_replicas,
+                discovery_mode,
             )
             with tempfile.TemporaryDirectory(prefix="rvw-gate-") as temporary_root:
                 checkout = provision_checkout(
                     repo=resolved.repo,
                     pr_number=resolved.pr_number,
+                    base_sha=resolved.base_sha,
                     head_sha=resolved.head_sha,
                     destination=Path(temporary_root) / "checkout",
                 )
@@ -1058,6 +1176,7 @@ async def _gate_pipeline(
                     dynamic_brief=None,
                     resolved_target=resolved,
                     host_gate=host_gate,
+                    discovery_mode=discovery_mode,
                 )
             if executed is None:
                 raise RuntimeError("gate review stopped before report generation")
@@ -1094,6 +1213,8 @@ async def _gate_pipeline(
             raise
         except EmptyReviewDiffError as exc:
             _empty_review_failure(exc, json_output=json_output)
+        except CheckoutVerificationError as exc:
+            _checkout_failure(exc, json_output=json_output)
         except GateInvariantError as exc:
             _error_console.print(str(exc), markup=False)
             raise typer.Exit(EXIT_NOT_FOUND) from exc
@@ -1518,7 +1639,10 @@ def auto(
     target: Annotated[str, Option("--target")],
     repo_dir: Annotated[
         Path | None,
-        Option("--repo-dir", help="Provisioned checkout used for adjudication."),
+        Option(
+            "--repo-dir",
+            help="Verified checkout used for agentic discovery and adjudication.",
+        ),
     ] = None,
     policy_path: Annotated[Path, Option("--policy")] = DEFAULT_AUTO_POLICY,
     concurrency: Annotated[int, Option("--concurrency", min=1)] = DEFAULT_CONCURRENCY,
@@ -1532,6 +1656,7 @@ def auto(
     adjudicate_replicas: Annotated[
         int, Option("--adjudicate-replicas", min=1)
     ] = _PLAN_ADJUDICATE_REPLICAS,
+    discovery_mode: Annotated[DiscoveryMode, Option("--discovery-mode")] = DiscoveryMode.AGENTIC,
 ) -> None:
     if allow_approve:
         _error_console.print(
@@ -1552,10 +1677,13 @@ def auto(
                 discover_replicas=replicas,
                 adjudicate_replicas=adjudicate_replicas,
                 host_gate=host_gate,
+                discovery_mode=discovery_mode,
             )
         )
     except EmptyReviewDiffError as exc:
         _empty_review_failure(exc, json_output=json_output)
+    except CheckoutVerificationError as exc:
+        _checkout_failure(exc, json_output=json_output)
 
 
 async def _auto_pipeline(
@@ -1570,8 +1698,14 @@ async def _auto_pipeline(
     discover_replicas: int,
     adjudicate_replicas: int,
     host_gate: HostSlotGate | None = None,
+    discovery_mode: DiscoveryMode = DiscoveryMode.AGENTIC,
 ) -> None:
-    policy = load_policy(policy_path)
+    resolved_target: ResolvedTarget | None = None
+    policy: Any | None = None
+    if policy_path.expanduser() == DEFAULT_AUTO_POLICY:
+        resolved_target = _resolve_cli_target(target_spec)
+        policy = load_repo_policy(resolved_target, cwd=Path.cwd())
+    policy = policy or load_policy(policy_path)
     artifacts = await _execute_pipeline(
         target_spec=target_spec,
         repo_dir=repo_dir,
@@ -1584,6 +1718,8 @@ async def _auto_pipeline(
         pause=False,
         dynamic_brief=None,
         host_gate=host_gate,
+        resolved_target=resolved_target,
+        discovery_mode=discovery_mode,
     )
     if artifacts is None:
         raise RuntimeError("auto pipeline stopped before report generation")
@@ -1633,10 +1769,24 @@ def plan(
     adjudicate_replicas: Annotated[
         int, Option("--adjudicate-replicas", min=1)
     ] = _PLAN_ADJUDICATE_REPLICAS,
+    allow_worktree_rules: Annotated[
+        bool,
+        Option("--allow-worktree-rules", help="Read .rvw rules from the working tree (non-SoT)."),
+    ] = False,
+    discovery_mode: Annotated[DiscoveryMode, Option("--discovery-mode")] = DiscoveryMode.AGENTIC,
 ) -> None:
     del pause
-    registry, lanes_root = _load_registry_root(registry_root)
     resolved_target = _resolve_cli_target(target)
+    if registry_root.expanduser() == DEFAULT_REGISTRY_ROOT:
+        registry = load_effective_registry(
+            resolved_target,
+            cwd=Path.cwd(),
+            external_root=registry_root,
+            allow_worktree_rules=allow_worktree_rules,
+        )
+        lanes_root = Path(".")
+    else:
+        registry, lanes_root = _load_registry_root(registry_root)
     payload = _plan_payload(
         registry,
         lanes_root,
@@ -1644,6 +1794,7 @@ def plan(
         dynamic_brief,
         replicas,
         adjudicate_replicas,
+        discovery_mode,
     )
     if json_output:
         _write_json(payload)
@@ -1898,6 +2049,7 @@ def stack_review(
     ] = DEFAULT_DEADLINE_SECONDS,
     out_root: Annotated[Path, Option("--out")] = DEFAULT_RUN_ROOT,
     json_output: Annotated[bool, Option("--json")] = False,
+    discovery_mode: Annotated[DiscoveryMode, Option("--discovery-mode")] = DiscoveryMode.AGENTIC,
 ) -> None:
     """Review every member and recheck earlier claims at descendant heads."""
 
@@ -1914,10 +2066,13 @@ def stack_review(
                 out_root=out_root,
                 json_output=json_output,
                 host_gate=host_gate,
+                discovery_mode=discovery_mode,
             )
         )
     except EmptyReviewDiffError as exc:
         _empty_review_failure(exc, json_output=json_output)
+    except CheckoutVerificationError as exc:
+        _checkout_failure(exc, json_output=json_output)
     except StackResolutionError as exc:
         _error_console.print(str(exc), markup=False)
         raise typer.Exit(EXIT_SYSTEM_ERROR) from exc
@@ -1940,6 +2095,7 @@ async def _stack_review_pipeline(
     out_root: Path,
     json_output: bool,
     host_gate: HostSlotGate | None = None,
+    discovery_mode: DiscoveryMode = DiscoveryMode.AGENTIC,
 ) -> None:
     numbers = parse_pr_numbers(prs)
     members = resolve_stack(numbers, cwd=Path.cwd())
@@ -1963,6 +2119,7 @@ async def _stack_review_pipeline(
             checkout = provision_checkout(
                 repo=member.repo,
                 pr_number=member.number,
+                base_sha=member.base_sha,
                 head_sha=member.head_sha,
                 destination=Path(temp_root) / "checkout",
             )
@@ -1980,6 +2137,7 @@ async def _stack_review_pipeline(
                 dynamic_brief=None,
                 resolved_target=target,
                 host_gate=host_gate,
+                discovery_mode=discovery_mode,
             )
             if artifacts is None or artifacts.outcome is None:
                 raise RuntimeError(
@@ -2125,15 +2283,45 @@ def lanes_list(
         Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")
     ] = DEFAULT_REGISTRY_ROOT,
 ) -> None:
-    registry, lanes_root = _load_registry_root(registry_root)
+    effective = registry_root.expanduser() == DEFAULT_REGISTRY_ROOT
+    if effective:
+        try:
+            registry, lanes_root = _catalog_registry(registry_root)
+        except (OSError, subprocess.CalledProcessError):
+            registry, lanes_root = (
+                load_effective_registry(
+                    ResolvedTarget(
+                        kind="commit",
+                        repo="",
+                        base_sha=None,
+                        head_sha="HEAD",
+                        changed_paths=[],
+                        diff="",
+                    ),
+                    cwd=Path.cwd(),
+                    external_root=registry_root,
+                    allow_worktree_rules=True,
+                ),
+                Path("."),
+            )
+    else:
+        registry, lanes_root = _load_registry_root(registry_root)
     table = Table(title="Registered review lanes")
     table.add_column("Lane")
     table.add_column("Tier")
     table.add_column("Cost")
     table.add_column("Rules", justify="right")
     table.add_column("Validation")
-    for lane_id, tier_value in _registered_lane_owners(registry):
-        lane = load_lane(resolve_lane_path(lanes_root, lane_id, tier_value))
+    if isinstance(registry, EffectiveRegistry):
+        owners = [(item.lane.id, item.lane.tier) for item in registry.sources]
+    else:
+        owners = _registered_lane_owners(registry)
+    for lane_id, tier_value in owners:
+        lane = (
+            registry.load_lane(lane_id)
+            if isinstance(registry, EffectiveRegistry)
+            else load_lane(resolve_lane_path(lanes_root, lane_id, tier_value))
+        )
         table.add_row(
             lane.id,
             lane.tier.value,
@@ -2151,11 +2339,19 @@ def lanes_show(
         Path, Option("--registry", help="Registry root containing layers.yaml and lanes/.")
     ] = DEFAULT_REGISTRY_ROOT,
 ) -> None:
-    registry, lanes_root = _load_registry_root(registry_root)
+    if registry_root.expanduser() == DEFAULT_REGISTRY_ROOT:
+        registry, lanes_root = _catalog_registry(registry_root)
+    else:
+        registry, lanes_root = _load_registry_root(registry_root)
+    catalog_owners = (
+        [(item.lane.id, item.lane.tier) for item in registry.sources]
+        if isinstance(registry, EffectiveRegistry)
+        else _registered_lane_owners(registry)
+    )
     owner = next(
         (
             (registered_id, tier)
-            for registered_id, tier in _registered_lane_owners(registry)
+            for registered_id, tier in catalog_owners
             if registered_id == lane_id
         ),
         None,
@@ -2163,9 +2359,75 @@ def lanes_show(
     if owner is None:
         _error_console.print(f"unknown lane: {lane_id}")
         raise typer.Exit(EXIT_NOT_FOUND)
-    path = resolve_lane_path(lanes_root, owner[0], owner[1])
+    path = (
+        registry.path_for(owner[0])
+        if isinstance(registry, EffectiveRegistry)
+        else resolve_lane_path(lanes_root, owner[0], owner[1])
+    )
     _console.print(f"Path: {path}", soft_wrap=True)
     _console.print(path.read_text(encoding="utf-8"), markup=False, highlight=False, soft_wrap=True)
+
+
+@lanes_app.command("lint")
+def lanes_lint(
+    path: Annotated[Path | None, Argument(help="Lane file or directory to validate.")] = None,
+    json_output: Annotated[bool, Option("--json")] = False,
+) -> None:
+    """Validate new-format lane documents and report stable reason codes."""
+
+    paths = (
+        sorted(path.rglob("*.md"))
+        if path is not None and path.is_dir()
+        else [path]
+        if path is not None
+        else sorted(Path(__file__).parent.joinpath("lanes").rglob("*.md"))
+        + sorted((Path.cwd() / ".rvw" / "lanes").rglob("*.md"))
+    )
+    errors: list[dict[str, str]] = []
+    lane_ids: dict[str, Path] = {}
+    for lane_path in paths:
+        if lane_path is None:
+            continue
+        try:
+            lane = load_new_lane(lane_path)
+        except Exception as exc:
+            reason = "malformed-frontmatter"
+            message = str(exc)
+            for marker, code in (
+                ("stale-rules", "stale-rules"),
+                ("duplicate-rule-id", "duplicate-rule-id"),
+                ("empty-rule-body", "empty-rule-body"),
+                ("unknown", "unknown-frontmatter-key"),
+                ("extra_forbidden", "unknown-frontmatter-key"),
+            ):
+                if marker in message:
+                    reason = code
+                    break
+            errors.append({"reason": reason, "path": str(lane_path), "message": message})
+            continue
+        if lane.id in lane_ids:
+            errors.append(
+                {
+                    "reason": "duplicate-lane-id",
+                    "path": str(lane_path),
+                    "message": f"duplicate lane id {lane.id}; first: {lane_ids[lane.id]}",
+                }
+            )
+        else:
+            lane_ids[lane.id] = lane_path
+    payload = {"ok": not errors, "errors": errors, "lanes": sorted(lane_ids)}
+    if json_output:
+        _write_json(payload)
+    elif errors:
+        for error in errors:
+            _error_console.print(
+                f"{error['reason']}: {error['path']}: {error['message']}", markup=False
+            )
+        raise typer.Exit(EXIT_NOT_FOUND)
+    else:
+        _console.print(f"validated {len(lane_ids)} lane(s)")
+    if errors:
+        raise typer.Exit(EXIT_NOT_FOUND)
 
 
 def _print_doctor(report: DoctorReport) -> None:
@@ -2303,19 +2565,34 @@ def sample(
     json_output: Annotated[bool, Option("--json")] = False,
 ) -> None:
     host_gate = _command_host_gate()
-    registry, lanes_root = _load_registry_root(registry_root)
-    owner = next(
-        (
-            (registered_id, tier)
-            for registered_id, tier in _registered_lane_owners(registry)
-            if registered_id == lane_id
-        ),
-        None,
-    )
+    if registry_root.expanduser() == DEFAULT_REGISTRY_ROOT:
+        registry, lanes_root = _catalog_registry(registry_root)
+        owner = next(
+            (
+                (item.lane.id, item.lane.tier)
+                for item in registry.sources
+                if item.lane.id == lane_id
+            ),
+            None,
+        )
+    else:
+        registry, lanes_root = _load_registry_root(registry_root)
+        owner = next(
+            (
+                (registered_id, tier)
+                for registered_id, tier in _registered_lane_owners(registry)
+                if registered_id == lane_id
+            ),
+            None,
+        )
     if owner is None:
         _error_console.print(f"unknown lane: {lane_id}", markup=False)
         raise typer.Exit(EXIT_NOT_FOUND)
-    lane = load_lane(resolve_lane_path(lanes_root, owner[0], owner[1]))
+    lane = (
+        registry.load_lane(owner[0])
+        if isinstance(registry, EffectiveRegistry)
+        else load_lane(resolve_lane_path(lanes_root, owner[0], owner[1]))
+    )
     try:
         fixture_diff = _fixture_diff(fixture)
     except ValueError as exc:

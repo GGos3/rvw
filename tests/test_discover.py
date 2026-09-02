@@ -8,7 +8,13 @@ import pytest
 
 import rvw.discover as discover_module
 from rvw.diffbudget import EmptyReviewDiffError
-from rvw.discover import RunCoverage, discover, resolve_lane_path
+from rvw.discover import (
+    DiscoveryMode,
+    RunCoverage,
+    covered_hunk_ids,
+    discover,
+    resolve_lane_path,
+)
 from rvw.dispatch import DEFAULT_DEADLINE_SECONDS, DispatchOutcome, PlannedRun
 from rvw.hostslots import HostSlotGate
 from rvw.lane import Lane
@@ -75,11 +81,13 @@ class FakeRuntime(Runtime):
         invalid_lanes: set[str] | None = None,
         statuses: dict[str, Sequence[RunStatus]] | None = None,
         invalid_reasons: dict[str, Sequence[str]] | None = None,
+        covered: dict[str, Sequence[list[str]]] | None = None,
     ) -> None:
         self.findings = findings or {}
         self.invalid_lanes = invalid_lanes or set()
         self.statuses = statuses or {}
         self.invalid_reasons = invalid_reasons or {}
+        self.covered = covered or {}
         self.prompts: list[tuple[str, str]] = []
         self.calls: list[tuple[str, int]] = []
         self.run_dirs: list[Path] = []
@@ -91,8 +99,9 @@ class FakeRuntime(Runtime):
         prompt: str,
         run_dir: Path,
         deadline_seconds: int,
+        workdir: Path | None = None,
     ) -> RunResult:
-        del deadline_seconds
+        del deadline_seconds, workdir
         replica = int(run_dir.name.removeprefix("r"))
         self.prompts.append((lane.id, prompt))
         self.calls.append((lane.id, replica))
@@ -124,7 +133,15 @@ class FakeRuntime(Runtime):
             lane_id=lane.id,
             replica=replica,
             status=RunStatus.VALID,
-            output=RuntimeLaneOutput(verdict="PASS", findings=self.findings.get(lane.id, [])),
+            output=RuntimeLaneOutput(
+                verdict="PASS",
+                covered=(
+                    self.covered[lane.id][call_index]
+                    if lane.id in self.covered and call_index < len(self.covered[lane.id])
+                    else ["src/a.py"]
+                ),
+                findings=self.findings.get(lane.id, []),
+            ),
             invalid_reason=None,
             wall_seconds=0,
             artifact_dir=run_dir,
@@ -144,6 +161,106 @@ def registry(*lane_entries: tuple[str, Tier]) -> Registry:
             ]
         }
     )
+
+
+def two_file_target() -> ResolvedTarget:
+    first = target().diff
+    second = (
+        "diff --git a/src/b.py b/src/b.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/src/b.py\n"
+        "@@ -0,0 +10,2 @@\n"
+        "+three = 3\n"
+        "+four = 4\n"
+    )
+    return target().model_copy(
+        update={"changed_paths": ["src/a.py", "src/b.py"], "diff": first + second}
+    )
+
+
+def test_covered_hunk_ids_accepts_exact_paths_and_intersecting_ranges() -> None:
+    hunks = discover_module.parse_hunks(two_file_target().diff)
+
+    assert covered_hunk_ids(hunks, ["src/a.py"]) == {hunks[0].hunk_id}
+    assert covered_hunk_ids(hunks, ["src/b.py:10-10"]) == {hunks[1].hunk_id}
+    assert covered_hunk_ids(hunks, ["src/b.py:99-100", "malformed:range"]) == set()
+
+
+async def test_agentic_coverage_redispatches_incomplete_lane_once(tmp_path: Path) -> None:
+    lanes_root = tmp_path / "lanes"
+    write_lane(lanes_root, "base-review", Tier.BASE)
+    runtime = FakeRuntime(
+        covered={"base-review": [["src/a.py"], ["src/b.py:10-11"]]},
+    )
+
+    result = await discover(
+        registry=registry(("base-review", Tier.BASE)),
+        lanes_root=lanes_root,
+        target=two_file_target(),
+        runtime=runtime,
+        out_root=tmp_path / "out",
+        repo_dir=tmp_path,
+    )
+
+    assert len(runtime.calls) == 2
+    assert runtime.run_dirs[-1] == tmp_path / "out" / "coverage-redispatch" / "base-review" / "r1"
+    assert result.budget is None
+    assert result.coverage[0].coverage_redispatched is True
+    assert result.coverage[0].uncovered == []
+
+
+async def test_agentic_coverage_surfaces_residual_without_third_wave(tmp_path: Path) -> None:
+    lanes_root = tmp_path / "lanes"
+    write_lane(lanes_root, "base-review", Tier.BASE)
+    runtime = FakeRuntime(covered={"base-review": [[], []]})
+    expected = [hunk.hunk_id for hunk in discover_module.parse_hunks(two_file_target().diff)]
+
+    result = await discover(
+        registry=registry(("base-review", Tier.BASE)),
+        lanes_root=lanes_root,
+        target=two_file_target(),
+        runtime=runtime,
+        out_root=tmp_path / "out",
+        repo_dir=tmp_path,
+    )
+
+    assert len(runtime.calls) == 2
+    assert result.coverage[0].uncovered == expected
+
+
+async def test_valid_coverage_wave_enriches_findings_after_invalid_runtime_retries(
+    tmp_path: Path,
+) -> None:
+    lanes_root = tmp_path / "lanes"
+    write_lane(lanes_root, "base-review", Tier.BASE)
+    finding = RuntimeFinding(
+        rule_id="base-review/rule",
+        file="src/a.py",
+        line=1,
+        severity=Severity.WARNING,
+        body="Recovered during coverage wave",
+    )
+    runtime = FakeRuntime(
+        findings={"base-review": [finding]},
+        statuses={"base-review": [RunStatus.INVALID, RunStatus.INVALID, RunStatus.VALID]},
+        covered={"base-review": [[], [], ["src/a.py", "src/b.py"]]},
+    )
+
+    result = await discover(
+        registry=registry(("base-review", Tier.BASE)),
+        lanes_root=lanes_root,
+        target=two_file_target(),
+        runtime=runtime,
+        out_root=tmp_path / "out",
+        repo_dir=tmp_path,
+    )
+
+    assert len(runtime.calls) == 3
+    assert len(result.findings) == 1
+    assert result.coverage[0].findings == 1
+    assert result.coverage[0].runs[0].findings == 0
+    assert result.coverage[0].uncovered == []
 
 
 def test_resolve_lane_path_uses_owning_tier_for_all_shapes(tmp_path: Path) -> None:
@@ -212,6 +329,7 @@ async def test_lane_filter_and_dispatch_are_applied_in_one_call(
         replicas=2,
         concurrency=3,
         lane_filter=["slop-hygiene"],
+        mode=DiscoveryMode.INLINE,
     )
 
     assert dispatch_calls == 1
@@ -233,6 +351,7 @@ async def test_pr_brief_fallback_and_operator_brief_wins(tmp_path: Path) -> None
         runtime=fallback_runtime,
         out_root=tmp_path / "fallback",
         replicas=1,
+        mode=DiscoveryMode.INLINE,
     )
     fallback_prompt = fallback_runtime.prompts[0][1]
     assert "Add a thing\n\nIt should stay correct." in fallback_prompt
@@ -248,6 +367,7 @@ async def test_pr_brief_fallback_and_operator_brief_wins(tmp_path: Path) -> None
         brief="Operator-authored intent",
         brief_source="pr_body",
         replicas=1,
+        mode=DiscoveryMode.INLINE,
     )
     operator_prompt = operator_runtime.prompts[0][1]
     assert "Operator-authored intent" in operator_prompt
@@ -283,6 +403,7 @@ async def test_enrichment_computes_hunks_anchors_and_off_diff_fallback(tmp_path:
         runtime=runtime,
         out_root=tmp_path / "out",
         replicas=1,
+        mode=DiscoveryMode.INLINE,
     )
 
     anchored, off_diff = result.findings
@@ -309,6 +430,7 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
         runtime=runtime,
         out_root=tmp_path / "out",
         replicas=2,
+        mode=DiscoveryMode.INLINE,
     )
 
     coverage = {entry.lane_id: entry for entry in result.coverage}
@@ -329,6 +451,8 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
             }
             for replica in (1, 2)
         ],
+        "coverage_redispatched": False,
+        "uncovered": [],
     }
     assert coverage["bad"].model_dump() == {
         "lane_id": "bad",
@@ -354,6 +478,8 @@ async def test_coverage_keeps_all_invalid_lane(tmp_path: Path) -> None:
             }
             for replica in (1, 2)
         ],
+        "coverage_redispatched": False,
+        "uncovered": [],
     }
     assert len(runtime.calls) == 6  # two good + two initial bad + two retry bad
 
@@ -374,6 +500,7 @@ async def test_retried_coverage_preserves_ordered_attempt_status_and_reason(
         target=target(),
         runtime=runtime,
         out_root=tmp_path / "out",
+        mode=DiscoveryMode.INLINE,
     )
 
     run = result.coverage[0].runs[0]
@@ -395,6 +522,7 @@ async def test_non_retried_coverage_has_one_attempt_mirroring_row(tmp_path: Path
         target=target(),
         runtime=FakeRuntime(),
         out_root=tmp_path / "out",
+        mode=DiscoveryMode.INLINE,
     )
 
     run = result.coverage[0].runs[0]
@@ -515,6 +643,7 @@ async def test_diff_budget_filters_prompt_but_keeps_full_changed_paths(tmp_path:
         runtime=runtime,
         out_root=tmp_path / "out",
         replicas=1,
+        mode=DiscoveryMode.INLINE,
     )
 
     prompt = runtime.prompts[0][1]
@@ -557,6 +686,7 @@ async def test_all_excluded_diff_fails_before_discovery_dispatch(tmp_path: Path)
             runtime=runtime,
             out_root=tmp_path / "out",
             replicas=1,
+            mode=DiscoveryMode.INLINE,
         )
 
     assert caught.value.error_code == "empty-review-diff"
@@ -593,6 +723,7 @@ async def test_chunk_prompts_fan_out_with_file_plan_and_artifact_axis(tmp_path: 
         runtime=runtime,
         out_root=tmp_path / "out",
         replicas=1,
+        mode=DiscoveryMode.INLINE,
     )
 
     assert result.budget is not None
@@ -649,6 +780,7 @@ async def test_stable_finding_id_does_not_depend_on_chunk_plan(tmp_path: Path) -
         runtime=FakeRuntime(findings={"base-review": [finding]}),
         out_root=tmp_path / "one",
         replicas=1,
+        mode=DiscoveryMode.INLINE,
     )
     many = await discover(
         registry=registry(("base-review", Tier.BASE)),
@@ -657,6 +789,7 @@ async def test_stable_finding_id_does_not_depend_on_chunk_plan(tmp_path: Path) -
         runtime=FakeRuntime(findings={"base-review": [finding]}),
         out_root=tmp_path / "many",
         replicas=1,
+        mode=DiscoveryMode.INLINE,
     )
 
     one_group = merge(one.findings, lane_tiers={"base-review": Tier.BASE}).groups[0]

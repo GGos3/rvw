@@ -10,6 +10,7 @@ import yaml
 from pydantic import ValidationError
 
 from rvw.adjudicate import AdjudicationOutcome
+from rvw.checkout import CheckoutVerificationError
 from rvw.discover import EnrichedFinding, LaneCoverage, RunCoverage
 from rvw.gate import (
     ACTIONABLE_DISPOSITIONS_PAUSE,
@@ -977,6 +978,27 @@ def test_gate_artifacts_are_reconstructable_and_template_uses_public_ids(
         load_dispositions(template_path)
 
 
+def test_gate_verdict_renders_uncovered_hunk_evidence() -> None:
+    merged, outcome = merged_outcome()
+    coverage = complete_coverage()
+    coverage[0] = coverage[0].model_copy(update={"uncovered": ["src/a.py@@-1,1+1,2@@"]})
+    verdict = build_gate_verdict(
+        run_id="run-1",
+        target=target(),
+        coverage=coverage,
+        merged=merged,
+        outcome=outcome,
+        dispositions=dispositions(merged),
+        actor="repo-owner",
+        actor_permission="admin",
+    )
+
+    markdown = render_gate_verdict(verdict)
+
+    assert "| Lane | Dispatched | Valid | Findings | Uncovered |" in markdown
+    assert "`src/a.py@@-1,1+1,2@@`" in markdown
+
+
 def test_gate_verdict_persists_hunk_content_digest_without_changing_finding_id() -> None:
     merged, outcome = _one_finding_merge(hunk_id="src/a.py@@-1,1+1,1@@")
     group = merged.groups[0]
@@ -1220,6 +1242,7 @@ def test_provision_checkout_clones_detaches_and_verifies_head_and_clean(tmp_path
     checkout = provision_checkout(
         repo="owner/repo",
         pr_number=42,
+        base_sha="a" * 40,
         head_sha="b" * 40,
         destination=tmp_path / "checkout",
         run=fake_run,
@@ -1237,9 +1260,21 @@ def test_provision_checkout_clones_detaches_and_verifies_head_and_clean(tmp_path
             "origin",
             "refs/pull/42/head",
         ],
+        ["git", "-C", str(checkout), "fetch", "--no-tags", "origin", "a" * 40],
         ["git", "-C", str(checkout), "checkout", "--detach", "b" * 40],
         ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        ["git", "-C", str(checkout), "cat-file", "-e", f"{'a' * 40}^{{commit}}"],
+        ["git", "-C", str(checkout), "cat-file", "-e", f"{'b' * 40}^{{commit}}"],
         ["git", "-C", str(checkout), "status", "--porcelain=v1", "--untracked-files=all"],
+        [
+            "git",
+            "-C",
+            str(checkout),
+            "diff",
+            "--no-ext-diff",
+            f"{'a' * 40}...{'b' * 40}",
+            "--",
+        ],
     ]
 
 
@@ -1256,10 +1291,11 @@ def test_provision_checkout_fails_on_wrong_head_or_dirty_tree(
             return status
         return ""
 
-    with pytest.raises(GateInvariantError, match=match):
+    with pytest.raises(CheckoutVerificationError, match=match):
         provision_checkout(
             repo="owner/repo",
             pr_number=42,
+            base_sha="a" * 40,
             head_sha="b" * 40,
             destination=tmp_path / "checkout",
             run=fake_run,

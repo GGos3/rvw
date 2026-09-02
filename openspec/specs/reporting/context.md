@@ -6,6 +6,7 @@ This capability makes the review inspectable before any network action and trans
 
 ## Key decisions and measured basis
 
+- Agentic receipt verification adds uncovered counts and canonical hunk IDs to ordinary and gate coverage evidence. Agentic reports omit the inline-only diff-budget summary.
 - ADR-012 makes the file the artifact of record. JSON stage files allow REPORT and publish to be rerun from a run ID without rerunning model discovery.
 - 2026-08-12: Same-target starts within one second reproduced `FileExistsError`, motivating microsecond run IDs with bounded collision regeneration.
 - The coverage table makes a zero-finding valid lane distinguishable from an all-INVALID lane and from a lane that never activated.

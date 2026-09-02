@@ -124,6 +124,7 @@ class FakeRuntime:
             status=RunStatus.VALID,
             output=RuntimeLaneOutput(
                 verdict="findings",
+                covered=["src/app.py"],
                 findings=[
                     RuntimeFinding(
                         rule_id="test/rule",
@@ -175,6 +176,8 @@ def invoke_review(
             str(registry_root),
             "--out",
             str(out_root),
+            "--discovery-mode",
+            "inline",
             *extra,
         ],
     )
@@ -225,6 +228,7 @@ def test_review_split_replica_defaults_and_explicit_overrides(
     assert calls[0]["adjudicate_replicas"] == expected_adjudicate
     assert calls[0]["concurrency"] == expected_concurrency
     assert calls[0]["deadline_seconds"] == expected_deadline
+    assert calls[0]["discovery_mode"] is cli_module.DiscoveryMode.AGENTIC
 
 
 def test_review_cli_passes_command_host_gate_to_execute_pipeline(
@@ -242,14 +246,22 @@ def test_review_cli_passes_command_host_gate_to_execute_pipeline(
 
     result = runner.invoke(
         cli_module.app,
-        ["review", "--target", "HEAD", "--registry", str(registry_root)],
+        [
+            "review",
+            "--target",
+            "HEAD",
+            "--registry",
+            str(registry_root),
+            "--discovery-mode",
+            "inline",
+        ],
     )
 
     assert result.exit_code == 0, result.stdout
     assert calls[0]["host_gate"] is gate
 
 
-def test_review_uses_tool_less_initial_and_agentic_expanded_runtime(
+def test_review_uses_tool_less_inline_and_initial_and_agentic_expanded_runtime(
     monkeypatch: pytest.MonkeyPatch, registry_root: Path
 ) -> None:
     calls: list[dict[str, object]] = []
@@ -262,7 +274,15 @@ def test_review_uses_tool_less_initial_and_agentic_expanded_runtime(
 
     result = runner.invoke(
         cli_module.app,
-        ["review", "--target", "HEAD", "--registry", str(registry_root)],
+        [
+            "review",
+            "--target",
+            "HEAD",
+            "--registry",
+            str(registry_root),
+            "--discovery-mode",
+            "inline",
+        ],
     )
 
     assert result.exit_code == 0, result.stdout
@@ -272,6 +292,74 @@ def test_review_uses_tool_less_initial_and_agentic_expanded_runtime(
         cast(CodexRuntime, calls[0]["expanded_adjudication_runtime"]).mode
         is CodexRuntimeMode.AGENTIC
     )
+
+
+def test_review_uses_bounded_agentic_runtime_for_agentic_discovery(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, registry_root: Path
+) -> None:
+    calls: list[dict[str, object]] = []
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    async def fake_execute_pipeline(**kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(cli_module, "_resolve_cli_target", lambda _spec: pr_target())
+    monkeypatch.setattr(cli_module, "execute_pipeline", fake_execute_pipeline)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "review",
+            "--target",
+            "HEAD",
+            "--registry",
+            str(registry_root),
+            "--repo-dir",
+            str(checkout),
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    assert cast(CodexRuntime, calls[0]["runtime"]).mode is CodexRuntimeMode.AGENTIC
+    assert cast(CodexRuntime, calls[0]["adjudication_runtime"]).mode is CodexRuntimeMode.TOOL_LESS
+    assert (
+        cast(CodexRuntime, calls[0]["expanded_adjudication_runtime"]).mode
+        is CodexRuntimeMode.AGENTIC
+    )
+    assert calls[0]["deadline_seconds"] == 600
+
+
+def test_review_checkout_verification_failure_is_machine_readable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, registry_root: Path
+) -> None:
+    missing_base = pr_target().model_copy(update={"base_sha": None})
+    monkeypatch.setattr(cli_module, "_resolve_cli_target", lambda _spec: missing_base)
+
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "review",
+            "--target",
+            "42",
+            "--registry",
+            str(registry_root),
+            "--out",
+            str(tmp_path / "runs"),
+            "--json",
+        ],
+    )
+
+    assert result.exit_code == cli_module.EXIT_SYSTEM_ERROR
+    assert json.loads(result.stdout) == {
+        "error": "checkout-verification-failed",
+        "reason": "missing-base",
+        "message": (
+            "checkout-verification-failed: missing-base: "
+            "agentic discovery requires a target base SHA"
+        ),
+    }
+    assert not (tmp_path / "runs").exists()
 
 
 def test_review_rejects_zero_concurrency_before_execution(
@@ -361,6 +449,7 @@ async def test_shared_pipeline_propagates_split_replicas_concurrency_and_deadlin
         out_root=tmp_path / "runs",
         pause=False,
         dynamic_brief=None,
+        discovery_mode=cli_module.DiscoveryMode.INLINE,
         host_gate=gate,
     )
 
@@ -432,6 +521,7 @@ async def test_shared_pipeline_preserves_legacy_adjudicator_signature(
         out_root=tmp_path / "runs",
         pause=False,
         dynamic_brief=None,
+        discovery_mode=cli_module.DiscoveryMode.INLINE,
     )
 
     assert received_runtime is runtime
@@ -620,6 +710,8 @@ def test_review_with_every_lane_invalid_exits_failed(
             "--out",
             str(out_root),
             "--json",
+            "--discovery-mode",
+            "inline",
         ],
     )
 
@@ -673,6 +765,8 @@ def test_review_adjudication_infrastructure_failure_persists_failed_partial_repo
             "--out",
             str(out_root),
             "--json",
+            "--discovery-mode",
+            "inline",
         ],
     )
 

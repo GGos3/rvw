@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -13,6 +14,14 @@ from rvw.schema import RuntimeFinding, RuntimeLaneOutput, Severity, Tier
 _SEVERITY_ORDER = (Severity.SUGGESTION, Severity.WARNING, Severity.BLOCKER)
 
 
+class LaneActivation(BaseModel):
+    """Activation metadata embedded in a new-format lane document."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    paths: list[str] | None = None
+
+
 class Lane(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -20,6 +29,7 @@ class Lane(BaseModel):
     tier: Tier
     cost: Literal["light", "normal", "heavy"] = "normal"
     rules: list[str] = Field(min_length=1)
+    when: LaneActivation | None = None
     severity_cap: Severity = Severity.BLOCKER
     covered_by_others: Literal["inject"] | None = None
     # Lane lifecycle: "pending" = not yet gated by `rvw sample --compare-free`
@@ -59,25 +69,81 @@ class Lane(BaseModel):
         return schema
 
 
-def load_lane(path: Path) -> Lane:
-    """Load a Markdown lane document with YAML frontmatter."""
+_RULE_HEADING = re.compile(r"^##\s+rule:\s*(\S+)\s*$")
 
-    text = path.read_text()
+
+def _parse_frontmatter(path: Path) -> tuple[dict[str, object], list[str], int]:
+    text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
     if not lines or lines[0] != "---":
         raise ValueError(f"missing or malformed frontmatter in {path}")
-
     try:
         closing_index = lines.index("---", 1)
     except ValueError as error:
         raise ValueError(f"missing or malformed frontmatter in {path}") from error
+    loaded: object = yaml.safe_load("\n".join(lines[1:closing_index]))
+    if not isinstance(loaded, dict):
+        raise ValueError(f"frontmatter must be a mapping in {path}")
+    return dict(cast(dict[str, object], loaded)), lines, closing_index
+
+
+def _derived_rules(body_lines: list[str], path: Path) -> list[str]:
+    rules = [match.group(1) for line in body_lines if (match := _RULE_HEADING.match(line))]
+    if len(rules) != len(set(rules)):
+        raise ValueError(f"duplicate rule id in {path}: duplicate-rule-id")
+    if not rules:
+        raise ValueError(f"lane has no rule headings in {path}: missing-rule-heading")
+    for rule_id in rules:
+        heading_index = next(
+            i
+            for i, line in enumerate(body_lines)
+            if (match := _RULE_HEADING.match(line)) and match.group(1) == rule_id
+        )
+        next_heading = next(
+            (
+                i
+                for i in range(heading_index + 1, len(body_lines))
+                if body_lines[i].startswith("## ")
+            ),
+            len(body_lines),
+        )
+        if not any(line.strip() for line in body_lines[heading_index + 1 : next_heading]):
+            raise ValueError(f"empty rule body in {path}: empty-rule-body:{rule_id}")
+    return rules
+
+
+def load_lane(path: Path, *, allow_legacy: bool = True) -> Lane:
+    """Load a Markdown lane document with YAML frontmatter."""
 
     try:
-        loaded: object = yaml.safe_load("\n".join(lines[1:closing_index]))
-        if not isinstance(loaded, dict):
-            raise TypeError("frontmatter must be a mapping")
-        metadata = dict(cast(dict[str, object], loaded))
+        metadata, lines, closing_index = _parse_frontmatter(path)
+        body_lines = lines[closing_index + 1 :]
+        headings = [line for line in body_lines if _RULE_HEADING.match(line)]
+        # Compatibility: old external-registry fixtures have a closed rules list
+        # and predate rule headings.  The new format rejects double declaration
+        # whenever headings are present.
+        if headings:
+            if "rules" in metadata:
+                raise ValueError("stale rules frontmatter: stale-rules")
+            metadata["rules"] = _derived_rules(body_lines, path)
+        elif "rules" not in metadata:
+            raise ValueError(f"lane has no rule headings in {path}: missing-rule-heading")
+        elif not allow_legacy:
+            raise ValueError(f"stale rules frontmatter: stale-rules in {path}")
         metadata["prompt_body"] = "\n".join(lines[closing_index + 1 :]).strip()
-        return Lane.model_validate(metadata)
-    except (TypeError, ValidationError, yaml.YAMLError) as error:
+        lane = Lane.model_validate(metadata)
+        if not all(segment and segment not in {".", ".."} for segment in lane.id.split("/")):
+            raise ValueError(f"invalid lane id: {lane.id!r}")
+        return lane
+    except (TypeError, ValidationError, yaml.YAMLError, ValueError) as error:
+        if isinstance(error, ValueError) and str(error).startswith(
+            ("stale rules", "duplicate rule", "empty rule", "lane has no")
+        ):
+            raise
         raise ValueError(f"missing or malformed frontmatter in {path}: {error}") from error
+
+
+def load_new_lane(path: Path) -> Lane:
+    """Load only the single-file format (used by packaged/repository linting)."""
+
+    return load_lane(path, allow_legacy=False)
