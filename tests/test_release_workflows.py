@@ -16,8 +16,16 @@ NOT reusable. These tests pin that shape.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, cast
+
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _release_workflow() -> dict[str, Any]:
+    workflow_path = ROOT / ".github/workflows/release.yml"
+    return cast(dict[str, Any], yaml.safe_load(workflow_path.read_text(encoding="utf-8")))
 
 
 def test_release_workflow_is_tag_triggered_and_not_reusable() -> None:
@@ -68,3 +76,77 @@ def test_release_assets_handle_preexisting_release() -> None:
     assert 'gh release view "$RELEASE_TAG"' in workflow
     assert 'gh release upload "$RELEASE_TAG" dist/* --clobber' in workflow
     assert 'gh release create "$RELEASE_TAG" dist/*' in workflow
+
+
+def test_release_publishes_traceable_ghcr_image_independently() -> None:
+    workflow = _release_workflow()
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    image_job = jobs["publish-image"]
+    assert isinstance(image_job, dict)
+
+    # The registry rails are siblings after shared gates: neither registry can
+    # suppress the other one's attempt.
+    assert image_job["needs"] == "gates"
+    assert jobs["build"]["needs"] == "gates"
+    assert jobs["publish"]["needs"] == "build"
+
+    assert image_job["permissions"] == {"contents": "read", "packages": "write"}
+    assert image_job["outputs"]["digest"] == "${{ steps.image.outputs.digest }}"
+
+    steps = image_job["steps"]
+    action_revisions = [
+        str(step["uses"]).rsplit("@", maxsplit=1)[1] for step in steps if "uses" in step
+    ]
+    assert action_revisions
+    assert all(len(revision) == 40 for revision in action_revisions)
+    assert all(
+        all(character in "0123456789abcdef" for character in revision)
+        for revision in action_revisions
+    )
+
+    checkout = next(
+        step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")
+    )
+    assert checkout["with"]["persist-credentials"] is False
+    assert checkout["with"]["ref"] == "${{ env.RELEASE_TAG }}"
+
+    version = next(step for step in steps if step.get("id") == "version")
+    version_script = version["run"]
+    assert 'TAG_VERSION="${RELEASE_TAG#v}"' in version_script
+    assert "pyproject.toml" in version_script
+    assert "from rvw._version import __version__" in version_script
+    assert "version=%s\\n" in version_script
+    assert '"$GITHUB_OUTPUT"' in version_script
+
+    login = next(
+        step for step in steps if str(step.get("uses", "")).startswith("docker/login-action@")
+    )
+    assert login["with"] == {
+        "registry": "ghcr.io",
+        "username": "${{ github.actor }}",
+        "password": "${{ github.token }}",
+    }
+
+    image = next(step for step in steps if step.get("id") == "image")
+    assert str(image["uses"]).startswith("docker/build-push-action@")
+    assert image["with"]["context"] == "."
+    assert image["with"]["push"] is True
+    assert image["with"]["tags"].splitlines() == [
+        "ghcr.io/soju06/rvw:${{ env.RELEASE_TAG }}",
+        "ghcr.io/soju06/rvw:latest",
+    ]
+    assert image["with"]["build-args"].splitlines() == [
+        "CODEX_BASE_URL=",
+        "RVW_IMAGE_VERSION=${{ steps.version.outputs.version }}",
+    ]
+
+    summary = next(step for step in steps if step.get("name") == "Record published image")
+    assert "${{ steps.image.outputs.digest }}" in summary["env"].values()
+    assert "ghcr.io/soju06/rvw@${IMAGE_DIGEST}" in summary["run"]
+    assert '"$GITHUB_STEP_SUMMARY"' in summary["run"]
+
+    # The image path receives only the repository token used for GHCR login;
+    # Codex/PyPI secrets and OIDC are not part of this job.
+    assert "secrets." not in str(image_job)
+    assert "id-token" not in image_job["permissions"]

@@ -25,11 +25,14 @@ GitHub Actions entry. Normative behavior is in [spec.md](spec.md).
   valid lanes, zero uncovered hunks, one merged finding, and one CONFIRMED outcome. The
   outer root and repository mounts remained read-only. The persisted Codex home had a
   mode-0600 config and no `auth.json`.
+- Each release tag builds the checked-out source with its normalized version and an
+  empty build-time Codex endpoint, then publishes one GHCR image under the version and
+  `latest` tags. The release summary exposes its digest for immutable caller pins.
 
 ## Constraints
 
-- Image publication and registry selection remain outside this change; callers must pin
-  an explicit versioned reference once one is published.
+- Callers must pin an explicit version or digest. `latest` is published as a mutable
+  convenience reference and is not the reproducible caller surface.
 - The target checkout is untrusted PR content. The base controls workflow/image
   selection and only contents-read/pull-requests-write permissions are granted.
 - Host-installed rvw retains its default read-only Codex sandbox.

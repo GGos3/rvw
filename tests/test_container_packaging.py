@@ -142,11 +142,22 @@ def test_reusable_workflow_pins_base_side_checkout_and_auto_exit_contract() -> N
 
 def test_container_ci_docs_include_exact_base_controlled_caller() -> None:
     docs = (ROOT / "docs/container-ci.md").read_text(encoding="utf-8")
+    normalized_docs = " ".join(docs.split())
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "pull_request_target:" in docs
     assert "Soju06/rvw/.github/workflows/rvw-review.yml@v0.4.1" in docs
     assert "ghcr.io/soju06/rvw:v0.4.1" in docs
+    assert "ghcr.io/soju06/rvw:latest" in docs
+    assert "ghcr.io/soju06/rvw@sha256:" in docs
+    assert "publish-image" in docs
+    assert "RVW_IMAGE_VERSION=0.4.1" in docs
+    assert "CODEX_BASE_URL=" in docs
+    assert "package visibility checklist" in normalized_docs
+    assert "Public" in docs
     assert ".rvw/**" in docs
     assert ".github/workflows/rvw.yml" in docs
     assert "base-side workflow definition" in docs
     assert "not configured as a required check" in docs
+    assert "automatically publishes" in readme
+    assert "version tag or digest" in readme

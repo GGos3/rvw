@@ -6,27 +6,44 @@ This capability governs repository release preparation and publication rather th
 
 ## Key decisions
 
-- Container consumers explicitly pin both the reusable workflow version and image
-  version. This local packaging change does not publish an image or alter the PyPI rail.
+- Container consumers explicitly pin both the reusable workflow version and either the
+  release image version or its immutable digest. Each pushed release tag publishes the
+  matching image plus mutable `latest`; reproducible callers do not consume `latest`.
 - The 2026-07-28 v0.2.0 incident demonstrated that manually updating `src/rvw/_version.py` while leaving `pyproject.toml` stale can rebuild an already-published distribution. release-please now writes every version surface, with `tests/test_version_sync.py` retaining a regression guard.
 - The release-please manifest starts at the already-published `0.2.0`, so automation proposes only later versions.
-- GitHub does not start a new workflow from a tag or release created with the repository `GITHUB_TOKEN`. The release-please job therefore calls `release.yml` as a reusable workflow when `release_created` is true instead of relying on the tag event.
-- `release.yml` remains tag-triggerable for emergency operation. Both entry points resolve one explicit release tag, check out that tag, run the same gates, and compare the tag against package and runtime versions before building.
+- GitHub does not start a new workflow from a tag or release created with the repository
+  `GITHUB_TOKEN`. The required `RELEASE_PLEASE_TOKEN` PAT therefore creates release tags
+  whose push events start `release.yml` directly; there is no reusable-workflow path.
+- `release.yml` has one tag-push entry point for automated and emergency operation. It
+  resolves one explicit release tag, checks out that tag, runs the same gates, and
+  compares the tag against package and runtime versions before each artifact build.
 - PyPI publication remains in the `pypi` GitHub environment and uses OIDC trusted publishing. `skip-existing` makes an identical PAT-triggered duplicate run harmless, but version mismatches still fail before build.
-- release-please creates the GitHub Release before the reusable publication chain runs. The final job uploads artifacts to that release, while the emergency tag path creates the release when it does not exist.
+- release-please creates the GitHub Release before the tag-triggered publication workflow
+  runs. The final job uploads artifacts to that release, while an emergency tag path
+  creates the release when it does not exist.
+- GHCR publication is a sibling of the Python build after shared gates. Only that job
+  receives `packages: write`, logs in with `GITHUB_TOKEN`, pushes version and `latest`
+  tags in one build, and records the registry digest as a job output and step summary.
+- The per-tag concurrency group prevents overlapping runs of the same release tag but
+  does not serialize different tags updating `latest`; version and digest pins remain
+  the stable consumer references.
 
 ## Operational constraints
 
-- `RELEASE_PLEASE_TOKEN` is optional. Without it, release preparation and publishing work using `github.token` plus the direct reusable call. A PAT can cause release-please-authored events, including release PR checks, to trigger normally.
+- `RELEASE_PLEASE_TOKEN` is required so release-please-authored tag pushes trigger the
+  release workflow and release-branch updates retrigger checks.
 - `CHANGELOG.md` is generated and maintained by release-please and must not be manually edited.
 - Required repository labels are administrative GitHub state and are not created by these files.
 - The PyPI trusted publisher must continue to authorize the `pypi` environment and `.github/workflows/release.yml`.
+- After the first push, an owner must make the GHCR package public for anonymous target
+  repository pulls. A pre-existing unlinked package or restrictive organization policy
+  may also require granting this repository Actions package-write access; no new secret
+  or ordinary repository setting is required for a newly linked package.
 
 ## Excluded infrastructure
 
-rvw has a local Docker build and version-pinned reusable caller surface but no image
-registry publication automation. It does not carry Bun, beta-channel, Windows-startup,
-all-contributors, or Codex-review-label automation.
+rvw does not carry image signing, multi-platform manifests, Bun, beta-channel,
+Windows-startup, all-contributors, or Codex-review-label automation.
 
 ## Historical note
 
