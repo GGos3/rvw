@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/Soju06/rvw/compare/v0.7.1...v0.8.0) (2026-09-02)
+
+
+### Features
+
+* Cloudflare GitHub App platform IaC scaffold ([#43](https://github.com/Soju06/rvw/issues/43)) ([d1935de](https://github.com/Soju06/rvw/commit/d1935de3631cbfc0ecdd451026cfa00bb80fface))
+
 ## [0.7.1](https://github.com/Soju06/rvw/compare/v0.7.0...v0.7.1) (2026-09-02)
 
 
