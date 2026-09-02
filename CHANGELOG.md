@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.7.0](https://github.com/Soju06/rvw/compare/v0.6.1...v0.7.0) (2026-09-02)
+
+
+### Features
+
+* **ci:** add containerized rvw review packaging ([#39](https://github.com/Soju06/rvw/issues/39)) ([bb26ff0](https://github.com/Soju06/rvw/commit/bb26ff070cd957e8a70b6b72b9e877984f26a635))
+* **registry+discovery:** single-file lane SoT with in-repo .rvw/ + agentic discovery runtime ([#38](https://github.com/Soju06/rvw/issues/38)) ([d4f2869](https://github.com/Soju06/rvw/commit/d4f2869d85ff011e505bca13ee881ad15934add6))
+* **release:** publish GHCR images from tags ([#40](https://github.com/Soju06/rvw/issues/40)) ([cccccaa](https://github.com/Soju06/rvw/commit/cccccaa292c2bb3b52f4bd756ec4e90e282ed146))
+* **runtime:** bound review execution ([#29](https://github.com/Soju06/rvw/issues/29)) ([3c625a1](https://github.com/Soju06/rvw/commit/3c625a1b7d93556fb7fabe412c60548948bf1eda))
+
 ## [0.6.1](https://github.com/Soju06/rvw/compare/v0.6.0...v0.6.1) (2026-08-28)
 
 
