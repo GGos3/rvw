@@ -39,6 +39,16 @@ _TOOL_LESS_DISABLED_FEATURES = (
     "multi_agent",
     "collaboration_modes",
 )
+_SANDBOX_ENV = "RVW_CODEX_SANDBOX"
+_SANDBOX_VALUES = frozenset({"read-only", "danger-full-access"})
+
+
+def _sandbox_mode() -> str:
+    value = os.environ.get(_SANDBOX_ENV, "read-only")
+    if value not in _SANDBOX_VALUES:
+        allowed = ", ".join(sorted(_SANDBOX_VALUES))
+        raise ValueError(f"{_SANDBOX_ENV} must be one of: {allowed}")
+    return value
 
 
 class CodexRuntimeMode(StrEnum):
@@ -348,7 +358,7 @@ class CodexRuntime:
             "exec",
             *self.policy.command_args(),
             "--sandbox",
-            "read-only",
+            _sandbox_mode(),
             "--color",
             "never",
             *self._mode_command_args(),

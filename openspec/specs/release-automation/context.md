@@ -6,6 +6,8 @@ This capability governs repository release preparation and publication rather th
 
 ## Key decisions
 
+- Container consumers explicitly pin both the reusable workflow version and image
+  version. This local packaging change does not publish an image or alter the PyPI rail.
 - The 2026-07-28 v0.2.0 incident demonstrated that manually updating `src/rvw/_version.py` while leaving `pyproject.toml` stale can rebuild an already-published distribution. release-please now writes every version surface, with `tests/test_version_sync.py` retaining a regression guard.
 - The release-please manifest starts at the already-published `0.2.0`, so automation proposes only later versions.
 - GitHub does not start a new workflow from a tag or release created with the repository `GITHUB_TOKEN`. The release-please job therefore calls `release.yml` as a reusable workflow when `release_created` is true instead of relying on the tag event.
@@ -22,7 +24,9 @@ This capability governs repository release preparation and publication rather th
 
 ## Excluded infrastructure
 
-rvw has no Docker or Bun release surfaces and does not carry beta-channel, Windows-startup, all-contributors, or Codex-review-label automation. Its own `rvw gate` is the required review path.
+rvw has a local Docker build and version-pinned reusable caller surface but no image
+registry publication automation. It does not carry Bun, beta-channel, Windows-startup,
+all-contributors, or Codex-review-label automation.
 
 ## Historical note
 

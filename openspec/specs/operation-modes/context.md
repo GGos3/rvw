@@ -6,6 +6,10 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 
 ## Key decisions and measured basis
 
+- 2026-09-02: The project image packages Python 3.12, Node 24, Codex 0.152.0,
+  rvw and the common lanes behind one argument-preserving entry point. A protected
+  `pull_request_target` caller invokes `rvw auto` against an immutable head checkout;
+  the 0/1 auto status is the job check and COMMENT remains narrative output.
 - 2026-09-01: Review, auto, gate, stack review, and plan select agentic discovery by default and expose `inline` as the compatibility path. Sampling stays inline because it compares schema variants over a fixed diff fixture.
 - Owner decisions (2026-07-30 and 2026-08-12): ordinary `review`, `gate`, and `auto` runs keep one discovery replica because lanes x replicas x concurrent rvw instances overloaded `codex-lb`; four concurrent runs were observed demanding up to 64 sessions. Adjudication now defaults independently to three replicas because production reviews dispatched a median of one adjudication run versus eight discovery runs, so majority evidence adds token cost without increasing peak executor sessions.
 - Owner decision (2026-08-06): runtime wave concurrency defaults to eight after concurrent rvw runs saturated the shared `codex-lb` account pool, triggering local `account_stream_cap` overload, 30-second retry sleeps, and lane INVALIDs. Operators can set a positive `--concurrency` value on every command capable of runtime execution.
@@ -33,6 +37,8 @@ This capability defines how operators and CI enter the common pipeline, how YAML
 
 ## Constraints
 
+- Container CI mounts the target repository read-only at `/workspace`; project `.rvw/`
+  policy and lanes continue to resolve from the immutable base-side contract.
 - `review` does not itself apply the auto YAML policy; `auto` calls the shared pipeline and then evaluates policy.
 - `adjudicate --run` requires persisted target, discovery, and merge inputs and never repeats discovery. A failed attempt may update `run.json` with its error while retaining the previous outcome and report.
 - Without `--repo-dir`, the common pipeline skips adjudication and renders unadjudicated findings; a confirmed-only auto policy therefore cannot block those groups.
