@@ -1,0 +1,16 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "rvw-cloud",
+  "main": "worker/src/index.ts",
+  "compatibility_date": "2026-09-02",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {"RVW_ENV": "dev", "CODEX_PROXY_HOST": "codex.nekos.me", "RVW_VERSION": "0.0.0"},
+  "containers": [{"name": "rvw-sandbox", "class_name": "RvwSandbox", "image": "./Dockerfile", "image_build_context": "..", "instance_type": "lite", "max_instances": 1}],
+  "durable_objects": {"bindings": [{"name": "RVW_SANDBOX", "class_name": "RvwSandbox"}]},
+  "migrations": [{"tag": "rvw-cloud-v1", "new_sqlite_classes": ["RvwSandbox"]}],
+  "observability": {"enabled": true, "logs": {"head_sampling_rate": 1}},
+  "env": {
+    "spike": {"name": "rvw-cloud-spike", "vars": {"RVW_ENV": "spike", "RVW_VERSION": "0.0.0", "CODEX_PROXY_HOST": "codex.nekos.me"}, "containers": [{"name": "rvw-sandbox", "class_name": "RvwSandbox", "image": "./Dockerfile", "image_build_context": "..", "instance_type": "standard-2", "max_instances": 2}], "durable_objects": {"bindings": [{"name": "RVW_SANDBOX", "class_name": "RvwSandbox"}]}},
+    "prod": {"name": "rvw-cloud-prod", "vars": {"RVW_ENV": "prod", "RVW_VERSION": "0.0.0", "CODEX_PROXY_HOST": "codex.nekos.me"}, "containers": [{"name": "rvw-sandbox", "class_name": "RvwSandbox", "image": "./Dockerfile", "image_build_context": "..", "instance_type": "standard-2", "max_instances": 10}], "durable_objects": {"bindings": [{"name": "RVW_SANDBOX", "class_name": "RvwSandbox"}]}}
+  }
+}

@@ -33,3 +33,41 @@ jobs:
 
       - name: Tests (live excluded — needs codex credentials)
         run: uv run pytest -q -m "not live"
+
+  cloud:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+      - name: Install cloud dependencies
+        working-directory: cloud
+        run: npm ci
+      - name: Typecheck Worker
+        working-directory: cloud
+        run: npx tsc --noEmit
+      - name: Wrangler dry-run (spike)
+        working-directory: cloud
+        run: npx wrangler deploy --dry-run --outdir dist --env spike
+      - name: Wrangler dry-run (prod)
+        working-directory: cloud
+        run: npx wrangler deploy --dry-run --outdir dist --env prod
+      - name: Terraform validation
+        working-directory: cloud/infra
+        run: terraform fmt -check && terraform init -backend=false && terraform validate
+      - name: Build cloud image from repository source
+        run: docker build -f cloud/Dockerfile -t rvw-cloud-scaffold-check .
+      - name: Verify Python distributions exclude cloud
+        run: |
+          uv build
+          python - <<'PY'
+          import glob
+          import tarfile
+          import zipfile
+          for path in glob.glob("dist/*"):
+              names = (zipfile.ZipFile(path).namelist() if path.endswith(".whl") else tarfile.open(path).getnames())
+              assert not any(name.startswith("cloud/") or "/cloud/" in name for name in names), path
+          PY
