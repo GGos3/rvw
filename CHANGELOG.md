@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.1](https://github.com/Soju06/rvw/compare/v0.7.0...v0.7.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* **registry:** honor project lane path activation ([#41](https://github.com/Soju06/rvw/issues/41)) ([6ef9aac](https://github.com/Soju06/rvw/commit/6ef9aac7055f3bbe194162c0d2f08d1882376acb))
+
 ## [0.7.0](https://github.com/Soju06/rvw/compare/v0.6.1...v0.7.0) (2026-09-02)
 
 
