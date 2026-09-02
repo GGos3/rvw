@@ -47,6 +47,7 @@ class RuntimeLaneOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     verdict: str
+    covered: list[str]
     findings: list[RuntimeFinding] = Field(default_factory=list)
 
 

@@ -1,7 +1,11 @@
 from pathlib import Path
 from typing import cast
 
+import pytest
+from pydantic import ValidationError
+
 from rvw.lane import load_lane
+from rvw.schema import RuntimeLaneOutput
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lanes"
 FIXTURE = FIXTURES / "slop-hygiene.md"
@@ -35,6 +39,22 @@ def test_runtime_finding_requires_only_runtime_fields() -> None:
     lane = load_lane(FIXTURE)
     finding_schema = lane.output_schema()["properties"]["findings"]["items"]
     assert finding_schema["required"] == ["rule_id", "file", "line", "severity", "body"]
+
+
+def test_lane_output_schema_requires_coverage_receipt() -> None:
+    schema = load_lane(FIXTURE).output_schema()
+
+    assert set(schema["required"]) == {"verdict", "covered", "findings"}
+    assert schema["properties"]["covered"] == {
+        "items": {"type": "string"},
+        "title": "Covered",
+        "type": "array",
+    }
+
+
+def test_runtime_lane_output_rejects_missing_coverage_receipt() -> None:
+    with pytest.raises(ValidationError):
+        RuntimeLaneOutput.model_validate({"verdict": "PASS", "findings": []})
 
 
 def test_output_schema_satisfies_openai_strict_required() -> None:

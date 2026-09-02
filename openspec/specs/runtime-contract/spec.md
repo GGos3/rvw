@@ -35,12 +35,17 @@ Lane and adjudication runtime schemas MUST reject extra object properties and MU
 
 ### Requirement: Runtime findings use the wire shape
 
-A lane runtime output MUST contain a verdict string and a findings list whose items contain exactly `rule_id`, `file`, integer new-side `line`, `severity`, and `body`.
+A lane runtime output MUST contain exactly a verdict string, a `covered` list of path or `path:start-end` receipt strings, and a findings list whose items contain exactly `rule_id`, `file`, integer new-side `line`, `severity`, and `body`.
 
 #### Scenario: Runtime includes enrichment fields
 
 - **WHEN** runtime output includes `hunk_id`, `lane_id`, or `anchorable`
 - **THEN** strict wire validation marks the output invalid because enrichment belongs downstream
+
+#### Scenario: Runtime omits coverage receipt
+
+- **WHEN** a Codex lane output omits `covered`
+- **THEN** its required strict output schema rejects the output
 
 ### Requirement: Validity requires four signals
 
@@ -122,6 +127,15 @@ The runtime protocol MUST provide `execute_raw` with a caller-supplied schema, v
 - **WHEN** adjudication calls `execute_raw` with a provisioned repository directory
 - **THEN** Codex runs read-only with that directory as its process working directory and validates the adjudication-specific output model
 
+### Requirement: Discovery execution uses its verified checkout
+
+The runtime protocol MUST accept a caller-supplied workdir for lane execution, and agentic discovery MUST execute plain `codex exec` with that workdir set to the verified checkout. The checkout MUST remain read-only to Codex and the command MUST NOT use `codex exec review`.
+
+#### Scenario: Agentic lane explores repository context
+
+- **WHEN** discovery dispatches an agentic lane for a verified target checkout
+- **THEN** plain structured `codex exec` runs read-only with that checkout as its process working directory
+
 ### Requirement: Codex execution is read-only and bounded
 
 The Codex adapter SHALL invoke `codex exec` directly and MUST expose distinct
@@ -130,8 +144,9 @@ reasoning policy. Tool-less mode MUST select the read-only sandbox, disable
 shell, browser, computer, app, plugin, image, multi-agent, and collaboration
 tools, disable rule loading and persisted sessions, and use strict structured
 output. Agentic mode SHALL select the read-only sandbox and disable multi-agent
-and collaboration modes while retaining source exploration for explicitly
-expanded adjudication only. The adapter MUST capture its newly created process
+and collaboration modes while retaining source exploration for agentic
+discovery and explicitly expanded adjudication. The adapter SHALL never invoke
+`codex exec review`. The adapter MUST capture its newly created process
 group before awaiting the runtime and enforce each configured deadline by
 cancelling its process-owning task. That task MUST terminate the complete
 captured process group with TERM, wait no more than five seconds for the group
@@ -144,11 +159,23 @@ usage MUST record the selected mode so resume cannot reuse a result from
 another mode. The initial default policy MUST be `gpt-5.6-sol` with `max`
 reasoning effort.
 
-#### Scenario: Tool-less discovery execution
+#### Scenario: Tool-less inline discovery execution
 
-- **WHEN** DISCOVER starts a lane replica
+- **WHEN** inline DISCOVER starts a lane replica
 - **THEN** its Codex command disables shell and other interactive tools, writes
   no persisted Codex session, and records zero tool calls in usage
+
+#### Scenario: Agentic discovery execution
+
+- **WHEN** agentic DISCOVER starts a lane replica in its verified checkout
+- **THEN** its Codex command uses bounded agentic read-only mode and can inspect
+  the provisioned checkout
+
+#### Scenario: Initial adjudication execution
+
+- **WHEN** an initial adjudication pass evaluates candidates from the supplied
+  reviewed diff
+- **THEN** its Codex command uses tool-less read-only mode
 
 #### Scenario: Expanded adjudication execution
 
@@ -187,3 +214,8 @@ reasoning effort.
 - **WHEN** a host config selects another model or reasoning effort
 - **THEN** an RVW Codex invocation still carries `--model gpt-5.6-sol` and an
   explicit `model_reasoning_effort="max"` override
+
+#### Scenario: Discovery uses structured output
+
+- **WHEN** a lane runtime is invoked
+- **THEN** plain `codex exec` receives the lane's closed-enum output schema and custom prompt

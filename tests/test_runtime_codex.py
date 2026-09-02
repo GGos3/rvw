@@ -89,7 +89,7 @@ def _linux_process_is_running(pid: int) -> bool:
 
 
 def valid_payload() -> dict[str, object]:
-    return {"verdict": "PASS", "findings": []}
+    return {"verdict": "PASS", "covered": [], "findings": []}
 
 
 def install_spawn(
@@ -116,12 +116,18 @@ def install_spawn(
     return calls
 
 
-async def execute_fixture(lane: Lane, run_dir: Path, prompt: str = "Review this tiny diff."):
+async def execute_fixture(
+    lane: Lane,
+    run_dir: Path,
+    prompt: str = "Review this tiny diff.",
+    workdir: Path | None = None,
+):
     return await CodexRuntime().execute(
         lane=lane,
         prompt=prompt,
         run_dir=run_dir,
         deadline_seconds=60,
+        workdir=workdir,
     )
 
 
@@ -411,6 +417,7 @@ async def test_out_of_enum_rule_id_is_invalid(
     run_dir = tmp_path / "r1"
     payload = {
         "verdict": "ISSUES",
+        "covered": [],
         "findings": [
             {
                 "rule_id": "invented/not-in-lane",
@@ -477,6 +484,25 @@ async def test_execute_raw_uses_custom_schema_validator_and_workdir(
     assert result.output.answer == "yes"
     assert json.loads((run_dir / "schema.json").read_text(encoding="utf-8")) == schema
     assert calls[0][1] == workdir
+
+
+async def test_lane_execute_forwards_discovery_workdir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "slop-hygiene" / "r1"
+    workdir = tmp_path / "checkout"
+    workdir.mkdir()
+    calls = install_spawn(monkeypatch, run_dir=run_dir, payload=valid_payload())
+
+    result = await execute_fixture(lane, run_dir, workdir=workdir)
+
+    assert result.status is RunStatus.VALID
+    assert calls[0][1] == workdir
+    command = calls[0][0]
+    codex_index = command.index("codex")
+    assert command[codex_index : codex_index + 2] == ["codex", "exec"]
+    assert "review" not in command
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux setpriv requirement")

@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 from rvw.adjudicate import AdjudicationInfrastructureError, AdjudicationOutcome
-from rvw.discover import DiscoverResult, discover
+from rvw.checkout import CheckoutVerificationError, verify_checkout
+from rvw.discover import DiscoverResult, DiscoveryMode, discover
 from rvw.dispatch import DEFAULT_DEADLINE_SECONDS
 from rvw.hostslots import HostSlotGate
 from rvw.lane import Lane
 from rvw.merge import MergeResult, merge
 from rvw.provenance import stale_install_warning
-from rvw.registry import Registry
+from rvw.registry import EffectiveRegistry, Registry
 from rvw.report import render_report
 from rvw.runtimes import Runtime
 from rvw.schema import Verdict
@@ -82,7 +84,7 @@ def verdict_counts(outcome: AdjudicationOutcome | None) -> dict[str, int]:
 
 async def execute_pipeline(
     *,
-    registry: Registry,
+    registry: Registry | EffectiveRegistry,
     lanes_root: Path,
     target: ResolvedTarget,
     active_lanes: Sequence[Lane],
@@ -101,6 +103,8 @@ async def execute_pipeline(
     host_gate: HostSlotGate | None = None,
     on_pause: MessageSink | None = None,
     on_warning: MessageSink | None = None,
+    rule_source_warning: str | None = None,
+    discovery_mode: DiscoveryMode = DiscoveryMode.AGENTIC,
 ) -> PipelineArtifacts | None:
     """Execute and persist DISCOVER, MERGE, ADJUDICATE, and REPORT."""
 
@@ -109,10 +113,25 @@ async def execute_pipeline(
     if adjudicate_replicas < 1:
         raise ValueError("adjudicate_replicas must be at least 1")
     adjudication_runtime = adjudication_runtime or runtime
+    if discovery_mode is DiscoveryMode.AGENTIC:
+        if target.base_sha is None:
+            raise CheckoutVerificationError(
+                "missing-base", "agentic discovery requires a target base SHA"
+            )
+        if repo_dir is None:
+            raise CheckoutVerificationError(
+                "missing-checkout", "agentic discovery requires a provisioned checkout"
+            )
+        verify_checkout(repo_dir, base_sha=target.base_sha, head_sha=target.head_sha)
     run = RunStore(out_root).create(target)
     if on_warning is not None and (warning := stale_install_warning()) is not None:
         on_warning(warning)
     run.save_target(target)
+    if rule_source_warning:
+        (run.dir / "metadata.json").write_text(
+            json.dumps({"rule_source_warning": rule_source_warning}, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
     brief = dynamic_brief.read_text(encoding="utf-8") if dynamic_brief is not None else None
     discovered = await discover(
         registry=registry,
@@ -126,6 +145,8 @@ async def execute_pipeline(
         concurrency=concurrency,
         deadline_seconds=deadline_seconds,
         host_gate=host_gate,
+        mode=discovery_mode,
+        repo_dir=repo_dir,
     )
     run.save_discover(discovered)
     build = run.load_summary().build
@@ -206,6 +227,8 @@ async def execute_pipeline(
         synthesis=None,
         summary=summary,
     )
+    if rule_source_warning:
+        report_md = f"> {rule_source_warning}\n\n{report_md}"
     run.save_report(report_md)
     run.save_summary(summary)
     report_path = run.dir / "report.md"

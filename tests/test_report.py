@@ -112,11 +112,33 @@ def test_real_report_order_folds_regions_coverage_and_empty_sections() -> None:
     assert report.count("- `providers/") >= 4
     assert "공유 식별자: `errorCodes`" in report
     assert "(인접: providers/naver-map/index.ts L1721\N{EN DASH}1733)" in report
-    assert "| 합계 | 6 | 5 | 11 |" in report
+    assert "| 합계 | 6 | 5 | 11 | 0 |" in report
     assert "diff 예산: 12,345자 유지 / 6,789자 제외 (generated.ts, bun.lockb)" in report
     assert "1청크" in report
     assert "## 기각 (REJECTED)" not in report
     assert "## 검증 미확정" not in report
+
+
+def test_agentic_report_surfaces_uncovered_hunks_without_budget() -> None:
+    lane = coverage_fixture("agentic-lane", valid=3, findings=0).model_copy(
+        update={
+            "coverage_redispatched": True,
+            "uncovered": ["src/a.py@@-1,1+1,2@@"],
+        }
+    )
+
+    report = render_report(
+        target=target_fixture(),
+        merged=merge([], lane_tiers={}),
+        outcome=None,
+        coverage=[lane],
+        budget=None,
+    )
+
+    assert "| 레인 | 발사 | 유효 | 발견 | 미커버 |" in report
+    assert "| agentic-lane | 3 | 3 | 0 | 1 |" in report
+    assert "- `agentic-lane`: `src/a.py@@-1,1+1,2@@`" in report
+    assert "diff 예산:" not in report
 
 
 def test_synthesis_placeholder_and_verbatim_injection() -> None:

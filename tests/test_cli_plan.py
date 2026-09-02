@@ -109,6 +109,7 @@ def test_plan_json_shape_tier_zero_predicates_and_lpt_order(
     assert payload["brief_source"] is None
     assert payload["replicas"] == 1
     assert payload["adjudicate_replicas"] == 3
+    assert payload["discovery_mode"] == "agentic"
     assert payload["chunk_count"] == 1
     assert payload["total_runs"] == 3
     assert {lane["lane"] for lane in payload["lanes"]} >= {
@@ -188,13 +189,45 @@ def test_plan_reports_chunk_expanded_total_runs(
 
     result = runner.invoke(
         app,
+        [
+            "plan",
+            "--target",
+            "HEAD",
+            "--json",
+            "--registry",
+            str(registry_root),
+            "--discovery-mode",
+            "inline",
+        ],
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["discovery_mode"] == "inline"
+    assert payload["chunk_count"] == 2
+    assert payload["total_runs"] == 6
+
+
+def test_agentic_plan_does_not_consult_inline_diff_budget(
+    monkeypatch: pytest.MonkeyPatch, registry_root: Path
+) -> None:
+    monkeypatch.setattr(cli_module, "_resolve_cli_target", lambda _spec: large_target())
+
+    def forbidden_budget(_diff: str) -> object:
+        raise AssertionError("agentic plan consulted inline diff budget")
+
+    monkeypatch.setattr(cli_module, "apply_diff_budget", forbidden_budget)
+
+    result = runner.invoke(
+        app,
         ["plan", "--target", "HEAD", "--json", "--registry", str(registry_root)],
     )
 
     assert result.exit_code == 0, result.stdout
     payload = json.loads(result.stdout)
-    assert payload["chunk_count"] == 2
-    assert payload["total_runs"] == 6
+    assert payload["discovery_mode"] == "agentic"
+    assert payload["chunk_count"] == 1
+    assert payload["total_runs"] == 3
 
 
 def test_head_falls_back_to_local_git_when_no_remote(

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from rvw.checkout import CheckoutVerificationError
 from rvw.diffbudget import DiffBudgetReport, apply_diff_budget, require_reviewable_diff
 from rvw.dispatch import (
     DEFAULT_CONCURRENCY,
@@ -16,13 +19,20 @@ from rvw.dispatch import (
     dispatch_outcome,
 )
 from rvw.hostslots import HostSlotGate
-from rvw.hunks import hunk_for_line, is_anchorable, parse_hunks
+from rvw.hunks import Hunk, hunk_for_line, is_anchorable, parse_hunks
 from rvw.lane import load_lane
-from rvw.prompts import build_chunk_context, build_lane_prompt
-from rvw.registry import Registry
+from rvw.prompts import build_agentic_lane_prompt, build_chunk_context, build_lane_prompt
+from rvw.registry import EffectiveRegistry, Registry
 from rvw.runtimes import RunDiagnostic, RunResult, RunStatus, Runtime
 from rvw.schema import Finding, Tier
 from rvw.target import ResolvedTarget
+
+_COVERED_RANGE = re.compile(r"^(?P<file>.+):(?P<start>[1-9][0-9]*)(?:-(?P<end>[1-9][0-9]*))?$")
+
+
+class DiscoveryMode(StrEnum):
+    AGENTIC = "agentic"
+    INLINE = "inline"
 
 
 class EnrichedFinding(Finding):
@@ -98,6 +108,8 @@ class LaneCoverage(BaseModel):
     valid: int = Field(ge=0)
     findings: int = Field(ge=0)
     runs: list[RunCoverage]
+    coverage_redispatched: bool = False
+    uncovered: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _aggregates_must_match_runs(self) -> LaneCoverage:
@@ -108,7 +120,11 @@ class LaneCoverage(BaseModel):
             raise ValueError("dispatched must equal the number of coverage runs")
         if self.valid != sum(run.valid for run in self.runs):
             raise ValueError("valid must equal the number of valid coverage runs")
-        if self.findings != sum(run.findings for run in self.runs):
+        planned_findings = sum(run.findings for run in self.runs)
+        if self.coverage_redispatched:
+            if self.findings < planned_findings:
+                raise ValueError("findings cannot be below the planned run finding total")
+        elif self.findings != planned_findings:
             raise ValueError("findings must equal the coverage run finding total")
         return self
 
@@ -119,6 +135,44 @@ class DiscoverResult:
     findings: list[EnrichedFinding]
     coverage: list[LaneCoverage]
     budget: DiffBudgetReport | None = None
+
+
+def covered_hunk_ids(hunks: Sequence[Hunk], receipts: Sequence[str]) -> set[str]:
+    """Map agent receipts to canonical controller hunk IDs."""
+
+    by_file: dict[str, list[Hunk]] = {}
+    for hunk in hunks:
+        by_file.setdefault(hunk.file, []).append(hunk)
+    covered: set[str] = set()
+    for receipt in receipts:
+        if receipt in by_file:
+            covered.update(hunk.hunk_id for hunk in by_file[receipt])
+            continue
+        match = _COVERED_RANGE.fullmatch(receipt)
+        if match is None:
+            continue
+        start = int(match.group("start"))
+        end = int(match.group("end") or match.group("start"))
+        if end < start:
+            continue
+        for hunk in by_file.get(match.group("file"), []):
+            if hunk.new_count == 0:
+                continue
+            hunk_end = hunk.new_start + hunk.new_count - 1
+            if start <= hunk_end and end >= hunk.new_start:
+                covered.add(hunk.hunk_id)
+    return covered
+
+
+def _uncovered_for_lane(hunks: Sequence[Hunk], results: Sequence[RunResult]) -> list[str]:
+    receipts = [
+        receipt
+        for result in results
+        if result.status is RunStatus.VALID and result.output is not None
+        for receipt in result.output.covered
+    ]
+    covered = covered_hunk_ids(hunks, receipts)
+    return [hunk.hunk_id for hunk in hunks if hunk.hunk_id not in covered]
 
 
 def resolve_lane_path(lanes_root: Path, lane_id: str, tier: Tier) -> Path:
@@ -137,7 +191,7 @@ def resolve_lane_path(lanes_root: Path, lane_id: str, tier: Tier) -> Path:
 
 
 def _active_lane_owners(
-    registry: Registry,
+    registry: Registry | EffectiveRegistry,
     target: ResolvedTarget,
     lane_filter: Sequence[str] | None,
 ) -> list[tuple[str, Tier]]:
@@ -183,7 +237,7 @@ def _coverage_attempts(
 
 async def discover(
     *,
-    registry: Registry,
+    registry: Registry | EffectiveRegistry,
     lanes_root: Path,
     target: ResolvedTarget,
     runtime: Runtime,
@@ -195,6 +249,8 @@ async def discover(
     lane_filter: Sequence[str] | None = None,
     deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
     host_gate: HostSlotGate | None = None,
+    mode: DiscoveryMode = DiscoveryMode.AGENTIC,
+    repo_dir: Path | None = None,
 ) -> DiscoverResult:
     """Run all activated lanes in one dispatch call and enrich valid findings."""
 
@@ -202,35 +258,66 @@ async def discover(
         raise ValueError("replicas must be at least 1")
 
     owners = _active_lane_owners(registry, target, lane_filter)
-    lanes = [load_lane(resolve_lane_path(lanes_root, lane_id, tier)) for lane_id, tier in owners]
-    effective_brief, effective_brief_source = _effective_brief(target, brief, brief_source)
-    chunks, budget = apply_diff_budget(target.diff)
-    require_reviewable_diff(budget, source="target")
+    if isinstance(registry, EffectiveRegistry):
+        lanes = [registry.load_lane(lane_id) for lane_id, _tier in owners]
+    else:
+        lanes = [
+            load_lane(resolve_lane_path(lanes_root, lane_id, tier)) for lane_id, tier in owners
+        ]
     covered_rules = {lane.id: lane.rules for lane in lanes}
-    planned_runs = [
-        PlannedRun(
-            lane=lane,
-            prompt=build_lane_prompt(
-                lane,
-                diff=chunk.text,
-                brief=effective_brief,
-                brief_source=effective_brief_source,
-                covered_rules=covered_rules,
-                chunk_context=build_chunk_context(
-                    chunk=chunk.index,
-                    chunk_count=len(chunks),
-                    chunk_files=chunk.files,
-                    kept_files=budget.kept_files,
+    budget: DiffBudgetReport | None
+    if mode is DiscoveryMode.INLINE:
+        effective_brief, effective_brief_source = _effective_brief(target, brief, brief_source)
+        chunks, budget = apply_diff_budget(target.diff)
+        require_reviewable_diff(budget, source="target")
+        planned_runs = [
+            PlannedRun(
+                lane=lane,
+                prompt=build_lane_prompt(
+                    lane,
+                    diff=chunk.text,
+                    brief=effective_brief,
+                    brief_source=effective_brief_source,
+                    covered_rules=covered_rules,
+                    chunk_context=build_chunk_context(
+                        chunk=chunk.index,
+                        chunk_count=len(chunks),
+                        chunk_files=chunk.files,
+                        kept_files=budget.kept_files,
+                    ),
                 ),
-            ),
-            replica=replica,
-            chunk=chunk.index,
-            chunk_count=len(chunks),
-        )
-        for lane in lanes
-        for chunk in chunks
-        for replica in range(1, replicas + 1)
-    ]
+                replica=replica,
+                chunk=chunk.index,
+                chunk_count=len(chunks),
+            )
+            for lane in lanes
+            for chunk in chunks
+            for replica in range(1, replicas + 1)
+        ]
+    else:
+        if target.base_sha is None:
+            raise CheckoutVerificationError(
+                "missing-base", "agentic discovery requires a target base SHA"
+            )
+        if repo_dir is None:
+            raise CheckoutVerificationError(
+                "missing-checkout", "agentic discovery requires a verified checkout"
+            )
+        budget = None
+        planned_runs = [
+            PlannedRun(
+                lane=lane,
+                prompt=build_agentic_lane_prompt(
+                    lane,
+                    base_sha=target.base_sha,
+                    head_sha=target.head_sha,
+                ),
+                replica=replica,
+                workdir=repo_dir,
+            )
+            for lane in lanes
+            for replica in range(1, replicas + 1)
+        ]
     dispatched = await dispatch_outcome(
         planned_runs,
         runtime,
@@ -241,14 +328,44 @@ async def discover(
     )
     raw_results = dispatched.results
 
+    hunks = parse_hunks(target.diff)
+    coverage_results: list[RunResult] = []
+    redispatched_lanes: set[str] = set()
+    if mode is DiscoveryMode.AGENTIC:
+        for lane in lanes:
+            lane_initial = [result for result in raw_results if result.lane_id == lane.id]
+            if _uncovered_for_lane(hunks, lane_initial):
+                redispatch_runs = [
+                    run for run in planned_runs if run.lane.id == lane.id and run.replica == 1
+                ]
+                if redispatch_runs:
+                    redispatched_lanes.add(lane.id)
+        redispatch_plan = [
+            run for run in planned_runs if run.lane.id in redispatched_lanes and run.replica == 1
+        ]
+        if redispatch_plan:
+            coverage_dispatch = await dispatch_outcome(
+                redispatch_plan,
+                runtime,
+                out_root=out_root / "coverage-redispatch",
+                concurrency=concurrency,
+                deadline_seconds=deadline_seconds,
+                host_gate=host_gate,
+                retry_invalid=False,
+            )
+            coverage_results = coverage_dispatch.results
+
     lane_results: dict[str, list[RunResult]] = {lane.id: [] for lane in lanes}
-    for result in raw_results:
+    for result in [*raw_results, *coverage_results]:
         lane_results[result.lane_id].append(result)
 
-    hunks = parse_hunks(target.diff)
     enriched: list[EnrichedFinding] = []
     finding_counts: dict[tuple[str, int, int], int] = {}
-    for result in raw_results:
+    coverage_finding_counts: dict[str, int] = {}
+    for is_coverage_wave, result in [
+        *((False, result) for result in raw_results),
+        *((True, result) for result in coverage_results),
+    ]:
         if result.status is not RunStatus.VALID or result.output is None:
             continue
         for finding in result.output.findings:
@@ -265,12 +382,17 @@ async def discover(
                     }
                 )
             )
-            key = (result.lane_id, result.replica, result.chunk)
-            finding_counts[key] = finding_counts.get(key, 0) + 1
+            if is_coverage_wave:
+                coverage_finding_counts[result.lane_id] = (
+                    coverage_finding_counts.get(result.lane_id, 0) + 1
+                )
+            else:
+                key = (result.lane_id, result.replica, result.chunk)
+                finding_counts[key] = finding_counts.get(key, 0) + 1
 
     coverage: list[LaneCoverage] = []
     for lane in lanes:
-        results = lane_results[lane.id]
+        results = [result for result in raw_results if result.lane_id == lane.id]
         valid = sum(result.status is RunStatus.VALID for result in results)
         runs = [
             RunCoverage(
@@ -289,8 +411,15 @@ async def discover(
                 lane_id=lane.id,
                 dispatched=len(runs),
                 valid=valid,
-                findings=sum(run.findings for run in runs),
+                findings=sum(run.findings for run in runs)
+                + coverage_finding_counts.get(lane.id, 0),
                 runs=runs,
+                coverage_redispatched=lane.id in redispatched_lanes,
+                uncovered=(
+                    _uncovered_for_lane(hunks, lane_results[lane.id])
+                    if mode is DiscoveryMode.AGENTIC
+                    else []
+                ),
             )
         )
 
@@ -304,10 +433,12 @@ async def discover(
 
 __all__: list[str] = [
     "DiscoverResult",
+    "DiscoveryMode",
     "EnrichedFinding",
     "LaneCoverage",
     "RunAttempt",
     "RunCoverage",
+    "covered_hunk_ids",
     "discover",
     "resolve_lane_path",
 ]

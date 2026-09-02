@@ -57,8 +57,9 @@ class FakeRuntime(Runtime):
         prompt: str,
         run_dir: Path,
         deadline_seconds: int,
+        workdir: Path | None = None,
     ) -> RunResult:
-        del prompt, deadline_seconds
+        del prompt, deadline_seconds, workdir
         replica = int(run_dir.name.removeprefix("r"))
         call_index = self._lane_call_counts.get(lane.id, 0)
         self._lane_call_counts[lane.id] = call_index + 1
@@ -80,7 +81,9 @@ class FakeRuntime(Runtime):
             lane_id=lane.id,
             replica=replica,
             status=status,
-            output=RuntimeLaneOutput(verdict="PASS") if status is RunStatus.VALID else None,
+            output=(
+                RuntimeLaneOutput(verdict="PASS", covered=[]) if status is RunStatus.VALID else None
+            ),
             invalid_reason="scripted_invalid" if status is RunStatus.INVALID else None,
             wall_seconds=self._delays.get(lane.id, 0.001),
             artifact_dir=run_dir,
@@ -98,6 +101,7 @@ class ArtifactRuntime(FakeRuntime):
         prompt: str,
         run_dir: Path,
         deadline_seconds: int,
+        workdir: Path | None = None,
     ) -> RunResult:
         marker = f"wave-{self.calls_for(lane.id) + 1}\n"
         for artifact_name in ("prompt.md", "run.log", "out.json"):
@@ -107,6 +111,7 @@ class ArtifactRuntime(FakeRuntime):
             prompt=prompt,
             run_dir=run_dir,
             deadline_seconds=deadline_seconds,
+            workdir=workdir,
         )
 
 
@@ -185,8 +190,9 @@ async def test_host_cap_bounds_in_flight_below_process_concurrency(tmp_path: Pat
             prompt: str,
             run_dir: Path,
             deadline_seconds: int,
+            workdir: Path | None = None,
         ) -> RunResult:
-            del prompt, deadline_seconds
+            del prompt, deadline_seconds, workdir
             replica = int(run_dir.name.removeprefix("r"))
             self.in_flight += 1
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
@@ -198,7 +204,7 @@ async def test_host_cap_bounds_in_flight_below_process_concurrency(tmp_path: Pat
                 lane_id=lane.id,
                 replica=replica,
                 status=RunStatus.VALID,
-                output=RuntimeLaneOutput(verdict="PASS"),
+                output=RuntimeLaneOutput(verdict="PASS", covered=[]),
                 invalid_reason=None,
                 wall_seconds=0,
                 artifact_dir=run_dir,
@@ -235,8 +241,9 @@ async def test_dispatch_releases_host_slot_after_runtime_exception(tmp_path: Pat
             prompt: str,
             run_dir: Path,
             deadline_seconds: int,
+            workdir: Path | None = None,
         ) -> RunResult:
-            del lane, prompt, run_dir, deadline_seconds
+            del lane, prompt, run_dir, deadline_seconds, workdir
             raise RuntimeError("runtime failed")
 
     with pytest.raises(RuntimeError, match="runtime failed"):
@@ -264,8 +271,9 @@ async def test_dispatch_releases_host_slot_after_runtime_cancellation(tmp_path: 
             prompt: str,
             run_dir: Path,
             deadline_seconds: int,
+            workdir: Path | None = None,
         ) -> RunResult:
-            del lane, prompt, run_dir, deadline_seconds
+            del lane, prompt, run_dir, deadline_seconds, workdir
             entered.set()
             await asyncio.Future()
             raise AssertionError("unreachable")
@@ -473,8 +481,9 @@ async def test_all_invalid_lane_chunk_replacement_prompt_names_prior_invalid_rea
             prompt: str,
             run_dir: Path,
             deadline_seconds: int,
+            workdir: Path | None = None,
         ) -> RunResult:
-            del deadline_seconds
+            del deadline_seconds, workdir
             index = self._calls.get(lane.id, 0)
             self._calls[lane.id] = index + 1
             prompts.append((lane.id, prompt))
@@ -484,7 +493,7 @@ async def test_all_invalid_lane_chunk_replacement_prompt_names_prior_invalid_rea
                 lane_id=lane.id,
                 replica=replica,
                 status=RunStatus.INVALID if invalid else RunStatus.VALID,
-                output=None if invalid else RuntimeLaneOutput(verdict="PASS"),
+                output=None if invalid else RuntimeLaneOutput(verdict="PASS", covered=[]),
                 invalid_reason="schema_invalid" if invalid else None,
                 wall_seconds=0.0,
                 artifact_dir=run_dir,

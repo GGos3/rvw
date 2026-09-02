@@ -15,14 +15,19 @@ The system MUST model a Rule as one atomic check, a Lane as a named rule bundle 
 - **WHEN** a plan activates two lanes with three replicas on one runtime over two chunks
 - **THEN** it represents 12 runs while retaining each lane's owning layer and rule bundle
 
-### Requirement: Plan exposes chunk-expanded execution counts
+### Requirement: Plan exposes mode-expanded execution counts
 
-`rvw plan` MUST apply the shared diff chunk planner, MUST display the resulting chunk count, and MUST report total runs as active lanes multiplied by replicas multiplied by chunks.
+`rvw plan` MUST display the selected discovery mode. In inline mode it MUST apply the shared diff chunk planner and report total runs as active lanes multiplied by replicas multiplied by chunks. In agentic mode it MUST NOT apply that planner, MUST report one logical scope, and MUST report initial total runs as active lanes multiplied by replicas; a possible bounded coverage wave is reactive and MUST NOT be included in the initial total.
 
-#### Scenario: Three lanes span two chunks
+#### Scenario: Three inline lanes span two chunks
 
-- **WHEN** planning uses three replicas for three active lanes and the target diff produces two chunks
-- **THEN** plan displays two chunks and 18 total runs
+- **WHEN** inline planning uses three replicas for three active lanes and the target diff produces two chunks
+- **THEN** plan displays inline mode, two chunks, and 18 initial runs
+
+#### Scenario: Large target uses agentic planning
+
+- **WHEN** agentic planning uses three replicas for three active lanes regardless of target diff size
+- **THEN** plan displays agentic mode, one logical scope, and nine initial runs without consulting the diff budget
 
 ### Requirement: Activation uses four fixed tiers
 

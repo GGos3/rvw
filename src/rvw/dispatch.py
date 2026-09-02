@@ -31,6 +31,7 @@ class PlannedRun:
     replica: int
     chunk: int = 1
     chunk_count: int = 1
+    workdir: Path | None = None
 
     def __post_init__(self) -> None:
         if self.replica < 1:
@@ -58,6 +59,7 @@ async def dispatch_outcome(
     deadline_seconds: int = DEFAULT_DEADLINE_SECONDS,
     on_progress: Callable[[RunResult], None] | None = None,
     host_gate: HostSlotGate | None = None,
+    retry_invalid: bool = True,
 ) -> DispatchOutcome:
     """Dispatch runs and retain initial results shadowed by the retry wave."""
 
@@ -80,15 +82,22 @@ async def dispatch_outcome(
             run_dir.mkdir(parents=True, exist_ok=True)
             prompt = run.prompt if retry_feedback is None else f"{run.prompt}\n\n{retry_feedback}"
             async with host_slot(host_gate):
-                result = replace(
-                    await runtime.execute(
+                if run.workdir is None:
+                    executed = await runtime.execute(
                         lane=run.lane,
                         prompt=prompt,
                         run_dir=run_dir,
                         deadline_seconds=deadline_seconds,
-                    ),
-                    chunk=run.chunk,
-                )
+                    )
+                else:
+                    executed = await runtime.execute(
+                        lane=run.lane,
+                        prompt=prompt,
+                        run_dir=run_dir,
+                        deadline_seconds=deadline_seconds,
+                        workdir=run.workdir,
+                    )
+                result = replace(executed, chunk=run.chunk)
             if on_progress is not None:
                 on_progress(result)
             return result
@@ -119,11 +128,15 @@ async def dispatch_outcome(
     for result in main_results:
         results_by_lane_chunk.setdefault((result.lane_id, result.chunk), []).append(result)
 
-    retry_lane_chunks = {
-        lane_chunk
-        for lane_chunk, lane_results in results_by_lane_chunk.items()
-        if all(result.status is RunStatus.INVALID for result in lane_results)
-    }
+    retry_lane_chunks = (
+        {
+            lane_chunk
+            for lane_chunk, lane_results in results_by_lane_chunk.items()
+            if all(result.status is RunStatus.INVALID for result in lane_results)
+        }
+        if retry_invalid
+        else set()
+    )
     retry_runs = [run for run in runs if (run.lane.id, run.chunk) in retry_lane_chunks]
     retry_feedback_by_lane_chunk = {
         lane_chunk: build_retry_feedback(

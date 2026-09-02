@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from rvw.lane import Lane, load_lane
-from rvw.prompts import build_lane_prompt
+from rvw.prompts import build_agentic_lane_prompt, build_lane_prompt
 
 FIXTURES = Path(__file__).parent / "fixtures" / "lanes"
 
@@ -106,3 +106,30 @@ def test_diff_is_included_verbatim_in_a_fenced_block() -> None:
     assert f"```diff\n{diff}```" in prompt
     assert "use `file` and NEW-file `line` numbers" in prompt
     assert "Do not modify files" in prompt
+
+
+def test_agentic_prompt_is_minimal_and_contains_no_diff_content() -> None:
+    lane = load_lane(FIXTURES / "slop-hygiene.md")
+    base_sha = "a" * 40
+    head_sha = "b" * 40
+    diff = "diff --git a/secret.py b/secret.py\n+do_not_inline = True\n"
+
+    prompt = build_agentic_lane_prompt(lane, base_sha=base_sha, head_sha=head_sha)
+
+    assert prompt == (
+        f"# Lane: {lane.id}\n\n{lane.prompt_body}\n\n"
+        "## Review scope\n\n"
+        f"You are reviewing the changes in range {base_sha}...{head_sha} "
+        "of this repository.\n\n"
+        "## Output instructions\n\n"
+        "Report every finding as structured output. Each `rule_id` must be one of this "
+        f"lane's declared rules: {', '.join(f'`{rule}`' for rule in lane.rules)}. "
+        "The output schema enforces the allowed rule identifiers; use `file` and "
+        "NEW-file `line` numbers from the repository diff. Populate `covered` with "
+        "every changed file or `file:start-end` range actually reviewed. Do not modify files."
+    )
+    assert diff not in prompt
+    assert "Unified diff under review" not in prompt
+    assert "excluded" not in prompt.lower()
+    assert "Already covered by other lanes" not in prompt
+    assert "Review brief" not in prompt

@@ -146,17 +146,20 @@ def patch_target_dependencies(
     monkeypatch.setattr(
         cli_module,
         "_gate_plan",
-        lambda registry_root, resolved, replicas, adjudicate_replicas: GatePlan(
+        lambda registry_root, resolved, replicas, adjudicate_replicas, _discovery_mode: GatePlan(
             schema_version=1,
             lane_ids=["lane-a"],
             replicas=replicas,
             adjudicate_replicas=adjudicate_replicas,
             chunk_count=1,
+            discovery_mode=_discovery_mode.value,
         ),
     )
 
-    def fake_checkout(*, repo: str, pr_number: int, head_sha: str, destination: Path) -> Path:
-        del repo, pr_number, head_sha
+    def fake_checkout(
+        *, repo: str, pr_number: int, base_sha: str, head_sha: str, destination: Path
+    ) -> Path:
+        del repo, pr_number, base_sha, head_sha
         destination.mkdir()
         return destination
 
@@ -633,6 +636,7 @@ def test_gate_target_executes_review_once_and_writes_dry_run_artifacts(
     plan = load_gate_plan(artifacts.run.dir)
     assert plan.replicas == 1
     assert plan.adjudicate_replicas == 3
+    assert plan.discovery_mode == "agentic"
     assert (artifacts.run.dir / "gate-verdict.json").is_file()
     publish_payload = json.loads(
         (artifacts.run.dir / "publish-payload.json").read_text(encoding="utf-8")
@@ -713,12 +717,13 @@ def test_gate_target_invalid_inherit_stops_before_provision_or_review(
     monkeypatch.setattr(
         cli_module,
         "_gate_plan",
-        lambda registry_root, resolved, replicas, adjudicate_replicas: GatePlan(
+        lambda registry_root, resolved, replicas, adjudicate_replicas, _discovery_mode: GatePlan(
             schema_version=1,
             lane_ids=["lane-a"],
             replicas=replicas,
             adjudicate_replicas=adjudicate_replicas,
             chunk_count=1,
+            discovery_mode=_discovery_mode.value,
         ),
     )
 
@@ -1232,12 +1237,13 @@ def test_gate_checkout_failure_is_operational_error(
     monkeypatch.setattr(
         cli_module,
         "_gate_plan",
-        lambda registry_root, resolved, replicas, adjudicate_replicas: GatePlan(
+        lambda registry_root, resolved, replicas, adjudicate_replicas, _discovery_mode: GatePlan(
             schema_version=1,
             lane_ids=["lane-a"],
             replicas=replicas,
             adjudicate_replicas=adjudicate_replicas,
             chunk_count=1,
+            discovery_mode=_discovery_mode.value,
         ),
     )
 

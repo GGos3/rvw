@@ -29,6 +29,7 @@ def lane_fixture() -> Lane:
 def output(*findings: tuple[str, str, int]) -> RuntimeLaneOutput:
     return RuntimeLaneOutput(
         verdict="findings" if findings else "pass",
+        covered=[],
         findings=[
             RuntimeFinding(
                 rule_id=rule_id,

@@ -282,12 +282,14 @@ class CodexRuntime:
         prompt: str,
         run_dir: Path,
         deadline_seconds: int,
+        workdir: Path | None = None,
     ) -> RunResult[RuntimeLaneOutput]:
         result = await self.execute_raw(
             schema=lane.output_schema(),
             prompt=prompt,
             run_dir=run_dir,
             deadline_seconds=deadline_seconds,
+            workdir=workdir,
             validate=lambda raw: validate_output(lane, raw),
         )
         if result.status is RunStatus.VALID:

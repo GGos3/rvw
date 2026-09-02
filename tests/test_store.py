@@ -149,6 +149,8 @@ def test_load_discover_without_attempts_uses_empty_legacy_history(tmp_path: Path
     discovered = RunHandle(run_id="legacy-run", dir=run_dir).load_discover()
 
     assert discovered.coverage[0].runs[0].attempts == []
+    assert discovered.coverage[0].coverage_redispatched is False
+    assert discovered.coverage[0].uncovered == []
 
 
 def test_create_retries_same_target_same_timestamp_collision(

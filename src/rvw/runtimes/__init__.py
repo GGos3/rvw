@@ -104,6 +104,7 @@ class Runtime(Protocol):
         prompt: str,
         run_dir: Path,
         deadline_seconds: int,
+        workdir: Path | None = None,
     ) -> RunResult[RuntimeLaneOutput]: ...
 
     async def execute_raw(

@@ -264,18 +264,30 @@ def _coverage_section(
     lines = [
         "## 커버리지",
         "",
-        "| 레인 | 발사 | 유효 | 발견 |",
-        "| --- | ---: | ---: | ---: |",
+        "| 레인 | 발사 | 유효 | 발견 | 미커버 |",
+        "| --- | ---: | ---: | ---: | ---: |",
     ]
     for item in coverage:
         lane_id = item.lane_id.replace("|", "\\|")
-        lines.append(f"| {lane_id} | {item.dispatched} | {item.valid} | {item.findings} |")
+        lines.append(
+            f"| {lane_id} | {item.dispatched} | {item.valid} | {item.findings} | "
+            f"{len(item.uncovered)} |"
+        )
     lines.append(
         "| 합계 | "
         f"{sum(item.dispatched for item in coverage)} | "
         f"{sum(item.valid for item in coverage)} | "
-        f"{sum(item.findings for item in coverage)} |"
+        f"{sum(item.findings for item in coverage)} | "
+        f"{sum(len(item.uncovered) for item in coverage)} |"
     )
+    uncovered = [item for item in coverage if item.uncovered]
+    if uncovered:
+        lines.extend(["", "미커버 헝크:"])
+        for item in uncovered:
+            lane_id = item.lane_id.replace("`", "\\`")
+            escaped_hunk_ids = [hunk_id.replace("`", "\\`") for hunk_id in item.uncovered]
+            hunk_ids = ", ".join(f"`{hunk_id}`" for hunk_id in escaped_hunk_ids)
+            lines.append(f"- `{lane_id}`: {hunk_ids}")
     if budget is not None:
         excluded = ", ".join(budget.excluded_files) or "없음"
         lines.extend(

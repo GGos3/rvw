@@ -4,7 +4,7 @@
 
 This capability owns the stable vocabulary and the name-indirection boundary between rvw code and the external runtime registry. Normative behavior is in [spec.md](spec.md); the registry itself remains outside this repository at `~/.hermes/review/`.
 
-A planned Run expands across lane, replica, and diff chunk. `rvw plan` derives chunks from the same exclusion and whole-file planner as execution, so its total is `lanes x replicas x chunks`; a one-chunk target retains the historical lane x replica count.
+A planned inline Run expands across lane, replica, and diff chunk. Agentic planning has one logical repository scope per lane and replica and does not consult the inline planner; its optional receipt coverage wave is reactive and excluded from the initial total.
 
 ## Key decisions and measured basis
 

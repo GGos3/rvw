@@ -6,6 +6,7 @@ This capability replaces a prose-and-copy-paste PR gate sequence with one artifa
 
 ## Key decisions and measured basis
 
+- 2026-09-01: The shared checkout verifier extends anchored-head cleanliness checks with explicit base/head commit resolution and a computable `base...head` diff. Provisioned, supplied, ordinary, gate, and stack workspaces use the same fail-closed reasons.
 - Six apifuse dogfood rounds found unbound shell variables, captured-but-unchecked SHAs, count-only disposition checks, missing coverage checks, double review ambiguity, and manual 40-character SHA relay.
 - Target mode performs one review with one discovery replica and three adjudication replicas by default and writes `gate-plan.json`, including both counts and planner-derived chunks. `replicas` retains its discovery meaning, `adjudicate_replicas` records the separate adjudication count, and coverage validation compares only the exact lane x discovery-replica x chunk Cartesian product. When findings need a human decision, `gate-dispositions.yaml` contains the deterministic group keys and resume mode consumes the same run without invoking models again.
 - The repository-admin permission returned by GitHub is the verifiable owner authority for blocker acceptance. rvw records that actor and the human reason but does not decide or publish an approval.
