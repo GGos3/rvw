@@ -6,6 +6,11 @@ This capability defines the machine boundary between rvw and a model runtime. It
 
 ## Key decisions and measured basis
 
+- 2026-09-02: A Docker smoke against bori `5d4d3cb64` proved env-key authentication
+  works without Codex `auth.json`, but nested read-only bubblewrap cannot create its user
+  namespace. Those schema-valid responses retained 108 uncovered lane-hunks. The image
+  therefore selects `danger-full-access` inside a read-only outer container, which then
+  produced 6/6 valid lanes and zero uncovered hunks; host rvw still defaults read-only.
 - 2026-09-01: Lane output adds a required `covered` receipt list. Discovery uses plain structured `codex exec` in the verified checkout; `codex exec review` remains unsuitable because it does not preserve the custom prompt/schema contract.
 - ADR-004 replaced prose parsing with strict JSON and stable hunk enrichment. A prompt that explicitly requested an outside rule still obeyed the API-level enum schema, demonstrating that structured-output enforcement dominates prompt wording.
 - Chunked discovery keeps `r<replica>` as the leaf directory required by the adapter. Multi-chunk runs add an inspectable `c<chunk>` parent, while one-chunk discovery and sampling retain their previous artifact paths.
@@ -59,6 +64,10 @@ This capability defines the machine boundary between rvw and a model runtime. It
   it does not expose a direct per-exec token, turn, or tool-call cap.
 - Component token, turn, and tool-call usage can be absent; reports must not
   substitute zero for unavailable telemetry.
+- `RVW_CODEX_SANDBOX` has a closed `read-only`/`danger-full-access` vocabulary; the
+  latter is the measured project-container fallback, not the host default. The
+  selector is applied at the shared command seam after the typed runtime mode
+  selects its tool controls, so it governs both tool-less and agentic execution.
 
 ## Failure modes
 

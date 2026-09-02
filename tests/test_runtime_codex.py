@@ -268,6 +268,41 @@ async def test_tool_less_runtime_disables_interactive_tools_and_records_mode(
     assert result.usage.tool_calls == 0
 
 
+@pytest.mark.parametrize("mode", list(CodexRuntimeMode))
+async def test_container_can_select_danger_full_access_sandbox_for_each_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mode: CodexRuntimeMode
+) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / mode / "r1"
+    calls = install_spawn(monkeypatch, run_dir=run_dir, payload=valid_payload())
+    monkeypatch.setenv("RVW_CODEX_SANDBOX", "danger-full-access")
+
+    result = await CodexRuntime(mode=mode).execute(
+        lane=lane,
+        prompt="Review this tiny diff.",
+        run_dir=run_dir,
+        deadline_seconds=60,
+    )
+
+    assert result.status is RunStatus.VALID
+    command = calls[0][0]
+    assert command[command.index("--sandbox") + 1] == "danger-full-access"
+
+
+async def test_invalid_sandbox_environment_fails_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    lane = load_lane(FIXTURE)
+    run_dir = tmp_path / "slop-hygiene" / "r1"
+    calls = install_spawn(monkeypatch, run_dir=run_dir, payload=valid_payload())
+    monkeypatch.setenv("RVW_CODEX_SANDBOX", "workspace-write")
+
+    with pytest.raises(ValueError, match="RVW_CODEX_SANDBOX"):
+        await execute_fixture(lane, run_dir)
+
+    assert calls == []
+
+
 async def test_exit_124_is_invalid(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     lane = load_lane(FIXTURE)
     run_dir = tmp_path / "r1"

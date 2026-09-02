@@ -1,0 +1,75 @@
+name: rvw review
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Version-pinned rvw image reference (for example, ghcr.io/soju06/rvw:v0.4.1)
+        required: true
+        type: string
+      codex_base_url:
+        description: Optional non-secret Codex provider URL; CODEX_BASE_URL secret takes precedence
+        required: false
+        type: string
+        default: ""
+    secrets:
+      CODEX_API_KEY:
+        description: Codex provider credential
+        required: true
+      CODEX_BASE_URL:
+        description: Optional secret Codex provider URL
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    name: rvw review
+    runs-on: ubuntu-24.04
+    env:
+      RVW_IMAGE: ${{ inputs.image }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+      CODEX_BASE_URL: ${{ secrets.CODEX_BASE_URL || inputs.codex_base_url }}
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out immutable PR head
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          path: checkout
+          persist-credentials: false
+
+      - name: Fetch recorded base commit
+        working-directory: checkout
+        env:
+          BASE_REPOSITORY: ${{ github.event.pull_request.base.repo.full_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          gh auth setup-git
+          git remote add rvw-base "https://github.com/${BASE_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 rvw-base "$BASE_SHA"
+          git remote remove rvw-base
+
+      - name: Run pinned rvw image
+        run: |
+          docker pull "$RVW_IMAGE"
+          docker run --rm \
+            --read-only \
+            --tmpfs /root:rw,nosuid,nodev,size=64m \
+            --tmpfs /tmp:rw,nosuid,nodev,size=2g \
+            --workdir /workspace \
+            --volume "$GITHUB_WORKSPACE/checkout:/workspace:ro" \
+            --env CODEX_API_KEY \
+            --env CODEX_BASE_URL \
+            --env GITHUB_TOKEN \
+            --env GH_TOKEN \
+            --env GIT_CONFIG_COUNT=1 \
+            --env GIT_CONFIG_KEY_0=safe.directory \
+            --env GIT_CONFIG_VALUE_0=/workspace \
+            "$RVW_IMAGE" auto --target "$PR_NUMBER" --repo-dir /workspace
