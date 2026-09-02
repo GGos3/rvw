@@ -42,10 +42,51 @@ namespace; the fallback completed with full receipt coverage. The outer containe
 and `/workspace` mount remain read-only and are the isolation boundary. Host-installed
 rvw still defaults to `--sandbox read-only`.
 
+## Release publication and immutable pins
+
+Every pushed `v*` release tag automatically builds the tagged source and publishes the
+same image as both `ghcr.io/soju06/rvw:v<version>` and
+`ghcr.io/soju06/rvw:latest`. The release job uses the repository `GITHUB_TOKEN`; the
+build receives no Codex or PyPI credential. Its build contract is equivalent to:
+
+```bash
+docker build \
+  --build-arg CODEX_BASE_URL= \
+  --build-arg RVW_IMAGE_VERSION=0.4.1 \
+  --tag ghcr.io/soju06/rvw:v0.4.1 \
+  .
+```
+
+The `publish-image` job summary records the registry digest after both tags are pushed.
+For byte-for-byte reproducibility, replace the caller's version tag with that digest:
+
+```yaml
+with:
+  image: ghcr.io/soju06/rvw@sha256:<64-hex-digest>
+```
+
+The version tag is the explicit upgrade surface. `ghcr.io/soju06/rvw:latest` is a
+mutable convenience tag and must not be used by a reproducible review caller.
+
+After the first successful publication, an owner must complete this one-time package
+visibility checklist:
+
+1. In the `rvw` GHCR package settings, change visibility to **Public** so target
+   repositories can pull the image anonymously.
+2. If the package already existed or organization policy restricts package writes,
+   grant this repository Actions write access to the package and allow the release
+   job's explicit `packages: write` permission. A newly repository-linked package needs
+   no additional repository setting.
+
+No container registry secret is required. The existing `RELEASE_PLEASE_TOKEN` and PyPI
+trusted-publisher configuration remain release-rail prerequisites, not image-build
+credentials.
+
 ## Target repository caller
 
-Pin both the reusable workflow ref and image tag. The image shown below is the intended
-release shape; this change builds it locally but does not publish it.
+Pin both the reusable workflow ref and image version. The version tag below is published
+automatically by the matching release; use the digest form above when immutable bytes
+matter more than readable version coordination.
 
 ```yaml
 # .github/workflows/rvw.yml

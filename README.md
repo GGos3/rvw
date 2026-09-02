@@ -42,7 +42,8 @@ pip install rvw          # or: uv tool install rvw
 Requires Python 3.12+ and a working [Codex CLI](https://github.com/openai/codex)
 (`codex exec`) as the review runtime.
 
-For systemic pull-request checks with a version-pinned image, see the
+Every release tag automatically publishes versioned and `latest` GHCR images. For
+systemic pull-request checks, pin the image by version tag or digest and follow the
 [containerized GitHub Actions guide](docs/container-ci.md).
 
 ## Quickstart
