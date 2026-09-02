@@ -50,6 +50,9 @@ jobs:
         with:
           terraform_version: "1.15.6"
           terraform_wrapper: false
+      - uses: astral-sh/setup-uv@v10.0.1 # uv build in the wheel-exclusion step (CI exit 127, 2026-09-02)
+        with:
+          python-version: "3.12"
       - name: Typecheck Worker
         working-directory: cloud
         run: npx tsc --noEmit
@@ -67,7 +70,7 @@ jobs:
       - name: Verify Python distributions exclude cloud
         run: |
           uv build
-          python - <<'PY'
+          uv run --no-project python - <<'PY'
           import glob
           import tarfile
           import zipfile
