@@ -117,7 +117,7 @@ class EffectiveRegistry:
         active: list[Layer] = []
         for item in self._by_id.values():
             lane = item.lane
-            if lane.tier in {Tier.BASE, Tier.DYNAMIC, Tier.PROJECT}:
+            if lane.tier in {Tier.BASE, Tier.DYNAMIC}:
                 matches = True
             else:
                 patterns = lane.when.paths if lane.when is not None else None

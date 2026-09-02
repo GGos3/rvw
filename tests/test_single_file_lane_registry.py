@@ -78,3 +78,45 @@ def test_effective_registry_orders_and_activates_new_scope_lane() -> None:
         (layer.tier for layer in layers),
         key=lambda t: (Tier.BASE, Tier.PROJECT, Tier.SCOPE, Tier.DYNAMIC).index(t),
     )
+
+
+def test_effective_registry_project_lane_paths_narrow_activation(tmp_path: Path) -> None:
+    lane_dir = tmp_path / ".rvw" / "lanes"
+    lane_dir.mkdir(parents=True)
+    (lane_dir / "scoped.md").write_text(
+        """---
+lane: local/scoped
+tier: project
+when:
+  paths: ["src/**"]
+---
+# Scoped
+## rule: local/scoped
+Body
+""",
+        encoding="utf-8",
+    )
+    (lane_dir / "unscoped.md").write_text(
+        """---
+lane: local/unscoped
+tier: project
+---
+# Unscoped
+## rule: local/unscoped
+Body
+""",
+        encoding="utf-8",
+    )
+    registry = load_effective_registry(
+        _target(),
+        cwd=tmp_path,
+        external_root=tmp_path / "none",
+        allow_worktree_rules=True,
+    )
+
+    unmatched_ids = {layer.id for layer in registry.activate("owner/repo", ["README.md"])}
+    matched_ids = {layer.id for layer in registry.activate("owner/repo", ["src/app.py"])}
+
+    assert "local/scoped" not in unmatched_ids
+    assert "local/scoped" in matched_ids
+    assert "local/unscoped" in unmatched_ids
