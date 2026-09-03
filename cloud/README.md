@@ -13,6 +13,7 @@ to the Worker yet.
 ```bash
 npm ci
 npx tsc --noEmit
+npm test
 npx wrangler deploy --dry-run --outdir dist --env spike
 npx wrangler deploy --dry-run --outdir dist --env prod
 (cd infra && terraform fmt -check && terraform init -backend=false && terraform validate)
@@ -28,8 +29,48 @@ Python source and is not a valid source build context.
 ## A0 driver
 
 After an owner deploys the `spike` environment, run
-`scripts/drive-spike.sh https://<worker-host>`. It polls for at most 25 minutes,
-fetches result artifacts, and always attempts `/destroy` via an EXIT trap.
+
+```bash
+scripts/drive-spike.sh https://<worker-host> https://github.com/<owner>/<repo> <target-sha> [deadline-seconds]
+```
+
+The optional observer deadline defaults to 1,500 seconds (25 minutes). The
+driver polls until it sees the process completion marker or the deadline,
+fetches available result artifacts, prints a final outcome summary, and always
+attempts `/destroy` via an EXIT trap.
+
+Exit status `0` means the completion marker reported review exit `0`. Usage
+errors exit `2`; transport, API, or malformed-response failures exit `3`; a
+review still running at the observer deadline exits `4`; a terminal process
+without a valid completion marker exits `5`; and a completed review with a
+non-zero process exit exits `6`. A healthy job reaching the observer deadline
+is an observer failure, not evidence that the review itself failed. This bounded
+A0 driver still destroys its sandbox on exit, so production-sized work needs
+the planned durable A1 job lifecycle.
+
+## Rollout readiness and cleanup
+
+Container application rollout is asynchronous. A Worker deployment can finish
+before existing application instances refresh, and a newly requested sandbox
+can briefly run the previous image. Before measuring a new image, inspect the
+container application and its instances, verify the expected image/digest, and
+wait for refreshed instances to become healthy.
+
+Cloudflare retains three independently managed resource classes. Removing a
+Worker does not remove its container application or registry images. For a full
+spike cleanup, inspect targets first and then remove all three explicitly:
+
+```bash
+npx wrangler delete --env spike
+npx wrangler containers list
+npx wrangler containers delete <container-application-id>
+npx wrangler containers images list
+npx wrangler containers images delete <image>:<tag>
+```
+
+Repeat the image deletion command for every spike tag that is no longer needed.
+These commands require Cloudflare credentials and are operator actions, not
+offline checks.
 
 ## Bootstrap and one-time manual steps
 

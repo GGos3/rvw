@@ -56,6 +56,9 @@ jobs:
       - name: Typecheck Worker
         working-directory: cloud
         run: npx tsc --noEmit
+      - name: Test Worker logic
+        working-directory: cloud
+        run: npm test
       - name: Wrangler dry-run (spike)
         working-directory: cloud
         run: npx wrangler deploy --dry-run --outdir dist --env spike
