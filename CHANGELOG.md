@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/Soju06/rvw/compare/v0.8.0...v0.8.1) (2026-09-03)
+
+
+### Bug Fixes
+
+* **cloud:** land A0-measured sandbox defects ([#46](https://github.com/Soju06/rvw/issues/46)) ([2320eab](https://github.com/Soju06/rvw/commit/2320eab520a915c780dfd7b7665aa7e74f74463a))
+
 ## [0.8.0](https://github.com/Soju06/rvw/compare/v0.7.1...v0.8.0) (2026-09-02)
 
 
