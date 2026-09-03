@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -231,8 +232,30 @@ def test_agentic_plan_does_not_consult_inline_diff_budget(
 
 
 def test_head_falls_back_to_local_git_when_no_remote(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    repo = tmp_path / "local-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    (repo / "fixture.txt").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "fixture.txt"], cwd=repo, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=rvw tests",
+            "-c",
+            "user.email=rvw-tests@example.invalid",
+            "commit",
+            "--quiet",
+            "--message",
+            "fixture commit",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    monkeypatch.chdir(repo)
+
     def unavailable_resolver(spec: str, *, cwd: Path) -> ResolvedTarget:
         del cwd
         if spec == "HEAD":
@@ -244,8 +267,9 @@ def test_head_falls_back_to_local_git_when_no_remote(
     resolved = cli_module._resolve_cli_target("HEAD")
 
     assert resolved.kind == "commit"
-    assert resolved.repo == Path.cwd().name
+    assert resolved.repo == "local-repo"
     assert len(resolved.head_sha) == 40
+    assert resolved.changed_paths == ["fixture.txt"]
     assert resolved.diff
 
 

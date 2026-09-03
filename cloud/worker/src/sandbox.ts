@@ -2,11 +2,16 @@ import {ContainerProxy, Sandbox, getSandbox, type Process} from "@cloudflare/san
 
 export {ContainerProxy};
 
-export class RvwSandbox extends Sandbox<Env> {}
+export class RvwSandbox extends Sandbox<Env> {
+  // A0 measured that @cloudflare/containers 0.3.7 defaults this off, so HTTPS
+  // bypasses outboundByHost and the Codex proxy returns 401 unless it is explicit.
+  interceptHttps = true;
+}
 
 const outboundHandler = (request: Request, env: Env) => {
     const authenticated = new Request(request);
     authenticated.headers.set("Authorization", `Bearer ${env.CODEX_API_KEY}`);
+    console.log(JSON.stringify({event: "codex_credential_injected", hostname: new URL(request.url).hostname}));
     return fetch(authenticated);
 };
 
